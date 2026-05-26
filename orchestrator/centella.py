@@ -88,6 +88,20 @@ CATEGORIES = [
     "configuration-build", "documentation",
 ]
 
+# Short abbreviations used in the run_id branch-name prefix (DESIGN §6
+# "The run identifier"). Every entry in CATEGORIES must have an abbrev —
+# enforced by tests/test_run_id.py::test_category_abbrev_coverage.
+CATEGORY_ABBREV = {
+    "feature-implementation": "feat",
+    "bug-fixing": "fix",
+    "refactoring": "refactor",
+    "performance-optimization": "perf",
+    "testing": "test",
+    "dependency-migration": "deps",
+    "configuration-build": "config",
+    "documentation": "docs",
+}
+
 READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch"
 ACT_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit"
 # RUN_TOOLS adds Bash to the read set so the validator can execute criteria
@@ -433,6 +447,263 @@ def _check_claude_cli_version() -> None:
             "(npm/pnpm installs are now an advanced/legacy option per the "
             "Claude Code docs.)"
         )
+
+
+# --- run identifier (DESIGN §6 "The run identifier") --------------------
+#
+# A run_id namespaces a single centella invocation across its branch
+# (`centella/<run-id>`), state directory (`.centella/runs/<run-id>/`),
+# and PR title (`centella: <run-id>`). Built from three deterministic
+# inputs known by the end of Phase 1: short-category abbrev, sanitized
+# task slug, and a 6-hex digest of `started_at`. Two concurrent runs
+# in the same repo produce two different run_ids by construction.
+
+# Limit on the kebab-case task slug embedded in the run_id. 30 chars
+# leaves enough room for short_category (≤7 chars) + slug + shortid (6)
+# + dashes (2) to fit under most filesystems' branch-name length sanity.
+SLUG_MAX_LEN = 30
+
+def _sanitize_slug(task: str, max_len: int = SLUG_MAX_LEN) -> str:
+    """Turn a freeform task description into a kebab-case slug safe for
+    git branch names, filesystem directory names, and JSON keys.
+
+    Rules:
+    - lowercase
+    - replace any non-[a-z0-9-] with '-'
+    - collapse repeated '-'
+    - strip leading/trailing '-' and '.'
+    - reject if the result contains '..' (path-traversal guard)
+    - truncate to `max_len` on a '-' boundary so we never cut a word in half;
+      fall back to a hard truncate if the slug has no dashes within `max_len`
+    - if the result is empty (all-symbols task), return 'task' as a fallback
+
+    Pure function: same input → same output. No I/O.
+    """
+    if not isinstance(task, str):
+        task = "" if task is None else str(task)
+    # Lowercase + non-alphanumeric → '-'. Keep digits, lowercase ASCII, '-'.
+    s = re.sub(r"[^a-z0-9-]+", "-", task.lower())
+    # Collapse repeated dashes.
+    s = re.sub(r"-+", "-", s)
+    # Strip leading/trailing dashes and dots.
+    s = s.strip("-.")
+    # Defensive: reject any residual '..' even after stripping (shouldn't
+    # happen given the substitution, but the cost of the check is zero).
+    if ".." in s:
+        s = s.replace("..", "-")
+        s = re.sub(r"-+", "-", s).strip("-.")
+    if not s:
+        return "task"
+    if len(s) <= max_len:
+        return s
+    # Word-boundary truncate: find the last '-' within the limit so we
+    # don't slice a word mid-character.
+    cut = s.rfind("-", 0, max_len + 1)
+    if cut <= 0:
+        return s[:max_len].rstrip("-.")
+    return s[:cut].rstrip("-.")
+
+
+def compute_run_id(categories: list[str], task: str, started_at: str) -> str:
+    """Compose the deterministic run identifier from a category list, the
+    task description, and the run start timestamp. See DESIGN §6.
+
+    The first entry in `categories` decides the short prefix; it must
+    appear in CATEGORY_ABBREV (i.e., be one of the eight CATEGORIES). If
+    the list is empty or has no recognized category, falls back to 'misc'
+    — this is defensive only; phase_classify already dies before this
+    function is reached when the classifier returns no recognized
+    category, so 'misc' should never appear in a real run.
+
+    `started_at` is hashed with sha1 and truncated to 6 hex chars for the
+    shortid. The hash is a stable function of the microsecond-precision
+    timestamp, so two invocations cannot collide unless they share the
+    same `started_at` to the microsecond — extraordinarily unlikely, and
+    detected at the directory-rename step as a hard preflight failure.
+
+    Pure function: deterministic given the inputs."""
+    short = "misc"
+    for cat in categories or []:
+        if cat in CATEGORY_ABBREV:
+            short = CATEGORY_ABBREV[cat]
+            break
+    slug = _sanitize_slug(task)
+    shortid = hashlib.sha1((started_at or "").encode("utf-8")).hexdigest()[:6]
+    return f"{short}-{slug}-{shortid}"
+
+
+def compute_run_branch(run_id: str) -> str:
+    """The git branch name carrying a run's integrated work.
+    Trivial wrapper, but the single place to change branch-name shape
+    later if needed (e.g., adding a `centella/runs/` prefix)."""
+    return f"centella/{run_id}"
+
+
+# --- run.json sidecar invariants (IMPLEMENTATION.md §8) -----------------
+
+def _validate_run_json(data: dict) -> None:
+    """Enforce the three logical invariants on a `run.json` sidecar.
+
+    1. `pushed_at` and `push_error` are mutually exclusive (at most one
+       is non-null).
+    2. `pr_url` and `pr_error` are mutually exclusive.
+    3. If `pr_url` is set, `pushed_at` must be set (cannot have a PR
+       without a successful push).
+
+    Raises ValueError on any violation. Caller (e.g., `centella --list`)
+    decides whether to die, warn, or render as `status=corrupt-sidecar`."""
+    if not isinstance(data, dict):
+        raise ValueError("run.json must be a JSON object")
+    pushed_at = data.get("pushed_at")
+    push_error = data.get("push_error")
+    pr_url = data.get("pr_url")
+    pr_error = data.get("pr_error")
+    if pushed_at is not None and push_error is not None:
+        raise ValueError(
+            "run.json invariant: pushed_at and push_error are both set; "
+            "exactly one must be null"
+        )
+    if pr_url is not None and pr_error is not None:
+        raise ValueError(
+            "run.json invariant: pr_url and pr_error are both set; "
+            "exactly one must be null"
+        )
+    if pr_url is not None and pushed_at is None:
+        raise ValueError(
+            "run.json invariant: pr_url is set but pushed_at is null; "
+            "PR cannot succeed without a successful push"
+        )
+
+
+# --- PR body composition (DESIGN §6 "Finalization") ---------------------
+
+def compose_pr_body(state: dict, run_id: str) -> str:
+    """Generate the PR body from run state + run_id. Deterministic given
+    the inputs; no I/O. Used by finalize.sh (commit 4) via a small
+    JSON-stdin protocol to avoid passing 4kb of body as a shell argument.
+
+    Missing optional fields render as 'n/a' rather than the literal
+    string 'None' — Python's f-string default would produce 'None' for
+    a missing `finished_at`, which is unhelpful in a PR body."""
+    def _or_na(value) -> str:
+        return "n/a" if value in (None, "") else str(value)
+
+    task = state.get("task", "")
+    categories = state.get("categories") or []
+    first_cat = categories[0] if categories else None
+    answers = state.get("answers") or {}
+    source_of_truth = answers.get("source_of_truth")
+    started_at = state.get("started_at")
+    finished_at = state.get("finished_at")
+    waves = state.get("waves") or []
+    wave_count = len(waves)
+    subtask_count = sum(len(w) for w in waves)
+    worker_count = state.get("worker_count")
+    working_branch = state.get("working_branch")
+    return (
+        "## Task\n"
+        "\n"
+        f"{task}\n"
+        "\n"
+        "## Classification\n"
+        "\n"
+        f"- Category: {_or_na(first_cat)}\n"
+        f"- Source of truth: {_or_na(source_of_truth)}\n"
+        "\n"
+        "## Run summary\n"
+        "\n"
+        f"- Run ID: {run_id}\n"
+        f"- Started: {_or_na(started_at)}\n"
+        f"- Finished: {_or_na(finished_at)}\n"
+        f"- Waves: {wave_count}, subtasks: {subtask_count}\n"
+        f"- Workers: {_or_na(worker_count)}\n"
+        f"- Generated by centella on `{_or_na(working_branch)}`.\n"
+        "\n"
+        f"See `.centella/runs/{run_id}/state.json` for full run state.\n"
+    )
+
+
+# --- run discovery and resolution (DESIGN §6 multi-run resume) ----------
+
+def discover_runs(centella_root: Path) -> list[dict]:
+    """Enumerate `.centella/runs/*/state.json`, returning one summary
+    dict per discovered run. Skip the `_bootstrap-*` directories silently
+    (those are pre-classify, not real runs). Malformed state.json files
+    are skipped with a logged warning, never raising.
+
+    Returned dicts have at least: `run_id` (directory name), `path` (the
+    state.json path), `task`, `started_at`, `finished_at`, `categories`.
+    Other state.json fields are passed through unchanged. Sorted by
+    `started_at` descending (newest first) for stable display in
+    `centella --list`.
+
+    Pure read; no writes. Returns [] if `centella_root/runs` doesn't
+    exist."""
+    runs_dir = centella_root / "runs"
+    if not runs_dir.is_dir():
+        return []
+    out: list[dict] = []
+    for entry in runs_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith("_bootstrap-"):
+            continue
+        state_path = entry / "state.json"
+        if not state_path.is_file():
+            continue
+        try:
+            data = json.loads(state_path.read_text())
+        except (OSError, ValueError) as e:
+            log(f"warning: skipping malformed state.json at {state_path}: {e}")
+            continue
+        if not isinstance(data, dict):
+            log(f"warning: state.json at {state_path} is not a JSON object")
+            continue
+        summary = dict(data)
+        summary["run_id"] = entry.name
+        summary["path"] = str(state_path)
+        out.append(summary)
+    # Newest first. Empty / missing `started_at` sorts last.
+    out.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+    return out
+
+
+def resolve_run_id(centella_root: Path, cli_run_id: str | None) -> str:
+    """Pick the run_id to operate on. Used by `--resume` and `--list`.
+
+    Policy (DESIGN §6 "the run branch is the resume contract"):
+    - If `cli_run_id` is given, it must exactly match an existing run.
+      Otherwise die with the available list (fails closed).
+    - Elif exactly one run exists, use it. Preserves the common case
+      where there's only one run in flight.
+    - Else die: multiple runs and no `--run-id` is ambiguous.
+
+    Never guesses across multiple runs. `--resume` against an ambiguous
+    repo is a hard error, not a heuristic."""
+    runs = discover_runs(centella_root)
+    if cli_run_id is not None:
+        for r in runs:
+            if r["run_id"] == cli_run_id:
+                return cli_run_id
+        available = ", ".join(r["run_id"] for r in runs) or "(none)"
+        die(
+            f"--run-id {cli_run_id!r} does not match any known run. "
+            f"Available: {available}. Use `centella --list` to enumerate."
+        )
+    if not runs:
+        die(
+            "no runs found under .centella/runs/. Start a new run with "
+            "`./centella \"<task>\"`."
+        )
+    if len(runs) == 1:
+        return runs[0]["run_id"]
+    available = "\n  ".join(
+        f"{r['run_id']}  (started {r.get('started_at', '?')})" for r in runs
+    )
+    die(
+        "multiple runs present; pass --run-id <id> to disambiguate:\n  "
+        f"{available}\nUse `centella --list` to see full details."
+    )
 
 
 def _read_toml_key(path: Path, key: str) -> str | None:
