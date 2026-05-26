@@ -128,6 +128,15 @@ SOURCE_OF_TRUTH_FILE = "centella.toml"
 CONFIDENCE_ROUNDS_ENV = "CENTELLA_CONFIDENCE_ROUNDS"
 CONFIDENCE_ROUNDS_FILE = SOURCE_OF_TRUTH_FILE
 
+# --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
+# step at finalize. Resolution order: --no-push CLI flag → CENTELLA_NO_PUSH
+# env → no_push in centella.toml → default False.
+# --no-verify is CLI-only (no env/TOML mirror) to match CLAUDE.md's
+# "never skip hooks unless asked" principle — env/TOML defaults for
+# hook-skipping would dilute the "user explicitly asked" semantics.
+NO_PUSH_ENV = "CENTELLA_NO_PUSH"
+NO_PUSH_FILE = SOURCE_OF_TRUTH_FILE
+
 # Verbosity — see IMPLEMENTATION.md §2 "Verbosity". Four levels with
 # stackable -v/-q shortcuts following the clig.dev / cargo / kubectl
 # convention. Default is `stream` because the user invoking centella
@@ -449,6 +458,35 @@ def _check_claude_cli_version() -> None:
         )
 
 
+def _check_gh_cli(no_push: bool) -> None:
+    """Preflight gate for the push + PR finalize step (DESIGN §6
+    "Finalization"). Short-circuits silently when --no-push is set;
+    otherwise verifies that `gh` is installed, authenticated, and the
+    repo has an `origin` remote — all things finalize.sh + push_and_open_pr
+    will need. Without this, a 40-worker run could complete successfully
+    and then fail at the very last step, leaving the user with merged
+    work but no PR."""
+    if no_push:
+        return
+    if not shutil.which("gh"):
+        die("`gh` CLI not found on PATH. Either install GitHub CLI "
+            "(https://cli.github.com) or pass `--no-push` to skip the "
+            "push and PR step at finalize.")
+    auth = subprocess.run(["gh", "auth", "status"],
+                          capture_output=True, text=True, check=False)
+    if auth.returncode != 0:
+        die("`gh` is installed but not authenticated. Run "
+            "`gh auth login`, or pass `--no-push` to skip the push and "
+            "PR step at finalize.\n"
+            f"gh auth status stderr:\n  {auth.stderr.strip()}")
+    remote = subprocess.run(["git", "remote", "get-url", "origin"],
+                            capture_output=True, text=True, check=False)
+    if remote.returncode != 0:
+        die("this repository has no `origin` remote — finalize cannot "
+            "push the run branch. Either `git remote add origin <url>` "
+            "or pass `--no-push` to skip the push and PR step.")
+
+
 # --- run identifier (DESIGN §6 "The run identifier") --------------------
 #
 # A run_id namespaces a single centella invocation across its branch
@@ -623,6 +661,34 @@ def compose_pr_body(state: dict, run_id: str) -> str:
     )
 
 
+def _write_run_json(run_dir: Path, **fields) -> None:
+    """Merge fields into the run.json sidecar at `run_dir/run.json`,
+    validate the result, and write atomically.
+
+    Reads existing sidecar (if any), applies `fields` on top, validates
+    via `_validate_run_json`, then writes via temp-file rename. Same
+    atomicity pattern as `State.save()`. Fields with value `None` are
+    written through as null (used to clear a previous error / status).
+
+    Designed to be called at every push/PR state transition: run start,
+    finalize success, push success, push failure, PR success, PR
+    failure. Each call is idempotent given the same inputs."""
+    sidecar = run_dir / "run.json"
+    data: dict = {}
+    if sidecar.exists():
+        try:
+            data = json.loads(sidecar.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+    data.update(fields)
+    _validate_run_json(data)
+    tmp = sidecar.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(sidecar)
+
+
 # --- run discovery and resolution (DESIGN §6 multi-run resume) ----------
 
 def discover_runs(centella_root: Path) -> list[dict]:
@@ -781,6 +847,49 @@ def resolve_confidence_rounds(repo_root: Path,
             die(f"{cfg}: confidence_rounds={file_val!r} is not a positive integer")
         return n
     return DEFAULT_CAPS["confidence_rounds"]
+
+
+def _parse_bool_envtoml(value: str) -> bool | None:
+    """Parse a boolean from an env var or TOML scalar. Returns True/False
+    for the conventional spellings; None for the empty string / unset.
+    Raises ValueError on any other input so the caller can die() with a
+    helpful message rather than silently treating typos as False."""
+    v = value.strip().lower()
+    if v == "":
+        return None
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(value)
+
+
+def resolve_no_push(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --no-push preference. Order:
+    --no-push CLI flag (action='store_true', so True if passed) →
+    CENTELLA_NO_PUSH env var → no_push in centella.toml → False.
+    `--no-verify` has no env/TOML mirror (see NO_PUSH_ENV comment)."""
+    if cli_value:
+        return True
+    env = os.environ.get(NO_PUSH_ENV, "").strip()
+    if env:
+        try:
+            parsed = _parse_bool_envtoml(env)
+        except ValueError:
+            die(f"{NO_PUSH_ENV}={env!r} is not a boolean "
+                "(use 1/0, true/false, yes/no, on/off)")
+        if parsed is not None:
+            return parsed
+    cfg = repo_root / NO_PUSH_FILE
+    file_val = _read_toml_key(cfg, "no_push")
+    if file_val is not None:
+        try:
+            parsed = _parse_bool_envtoml(file_val)
+        except ValueError:
+            die(f"{cfg}: no_push={file_val!r} is not a boolean")
+        if parsed is not None:
+            return parsed
+    return False
 
 
 def _positive_int(s: str) -> int:
@@ -975,7 +1084,7 @@ async def run_script(name: str, *args: str) -> subprocess.CompletedProcess:
 # =========================================================================
 
 async def preflight(centella_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
-                    skip_smoke: bool = False) -> None:
+                    skip_smoke: bool = False, no_push: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
 
     # 1. git user identity — missing config causes implementer commits to fail
@@ -1007,7 +1116,14 @@ async def preflight(centella_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     #    'unknown option' that tells the user nothing actionable.
     _check_claude_cli_version()
 
-    # 5. live smoke-test: auth + --output-format stream-json + --json-schema inline.
+    # 5. gh CLI installed + authenticated + origin remote present (DESIGN §6
+    #    "Push + PR"). Short-circuited when --no-push is set; otherwise
+    #    catches the case where a 40-worker run completes and then fails at
+    #    the very last step (no PR opened, user has merged work but no
+    #    review surface).
+    _check_gh_cli(no_push)
+
+    # 6. live smoke-test: auth + --output-format stream-json + --json-schema inline.
     #    Catches auth failures before a 40-worker run starts. Streams so a slow
     #    Opus / heavy-context startup is visible — the previous max_turns=1
     #    failure was invisible in the non-streaming mode until exit.
@@ -2998,7 +3114,88 @@ async def phase_execute(centella_dir: Path, st: State, caps: dict,
         st.save()
 
 
-async def phase_finalize(centella_dir: Path, st: State) -> None:
+async def push_and_open_pr(st: State, no_verify: bool) -> None:
+    """Push the run branch to `origin` and open a PR via `gh pr create`.
+
+    Called from `phase_finalize` after the local merge succeeds, when
+    `--no-push` is NOT in effect. See DESIGN §6 "Finalization — Push and
+    PR" for the failure-handling contract:
+
+    - Push failure: capture stderr, write `push_error` to run.json,
+      log a multi-line message naming both branches and the retry
+      command, exit non-zero (die). Local merge is intact; user can
+      retry the push manually.
+    - PR-creation failure: capture stderr, write `pr_error` to run.json,
+      log a multi-line *warning* with the pushed-branch URL and the
+      retry command, exit success (the run is complete; the PR is a
+      courtesy).
+
+    The body for `gh pr create` is generated deterministically by
+    `compose_pr_body(st.data, st.run_id)`."""
+    run_branch = compute_run_branch(st.run_id)
+    working_branch = (st.run_dir / "working-branch").read_text().strip()
+
+    # ----- step 1: push --------------------------------------------------
+    push_cmd = ["git", "push", "-u", "origin", run_branch]
+    if no_verify:
+        push_cmd.append("--no-verify")
+    log(f"finalize: pushing {run_branch} to origin"
+        f"{' (--no-verify)' if no_verify else ''}")
+    push = subprocess.run(push_cmd, capture_output=True, text=True, check=False)
+    if push.returncode != 0:
+        stderr = (push.stderr or "").strip()
+        _write_run_json(
+            st.run_dir,
+            pushed_at=None, push_error=stderr or "git push failed",
+            pr_url=None, pr_error=None,
+        )
+        die(
+            f"git push failed for branch `{run_branch}`.\n"
+            f"  Local state is intact:\n"
+            f"    - run branch:     {run_branch}     (holds all wave merges)\n"
+            f"    - working branch: {working_branch}      (has the final merge commit)\n"
+            f"  Resolve and retry manually:\n"
+            f"    git push -u origin {run_branch}"
+            f"{' --no-verify' if no_verify else ''}\n"
+            f"  Push stderr was:\n"
+            + "\n".join(f"    {line}" for line in stderr.splitlines())
+        )
+    pushed_at = now()
+    _write_run_json(st.run_dir, pushed_at=pushed_at, push_error=None)
+    log(f"finalize: pushed {run_branch}")
+
+    # ----- step 2: PR creation ------------------------------------------
+    body = compose_pr_body(st.data, st.run_id)
+    title = f"centella: {st.run_id}"
+    pr_cmd = ["gh", "pr", "create",
+              "--base", working_branch,
+              "--head", run_branch,
+              "--title", title,
+              "--body-file", "-"]
+    log(f"finalize: opening PR against {working_branch}")
+    pr = subprocess.run(pr_cmd, input=body, capture_output=True,
+                        text=True, check=False)
+    if pr.returncode != 0:
+        # Non-fatal: the run is complete; only the PR is missing.
+        stderr = (pr.stderr or "").strip()
+        _write_run_json(st.run_dir, pr_url=None, pr_error=stderr or "gh pr create failed")
+        log(
+            f"⚠  `gh pr create` failed; branch was pushed successfully.\n"
+            f"  Pushed branch: {run_branch} (on origin)\n"
+            f"  Open the PR manually:\n"
+            f"    gh pr create --base {working_branch} --head {run_branch}\n"
+            f"  Or via the GitHub web UI for the repo.\n"
+            f"  gh stderr was:\n"
+            + "\n".join(f"    {line}" for line in stderr.splitlines())
+        )
+        return
+    pr_url = (pr.stdout or "").strip()
+    _write_run_json(st.run_dir, pr_url=pr_url or None, pr_error=None)
+    log(f"finalize: opened PR {pr_url}")
+
+
+async def phase_finalize(centella_dir: Path, st: State, no_push: bool,
+                         no_verify: bool) -> None:
     log("phase 6: finalizing")
     proc = await run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
@@ -3029,6 +3226,19 @@ async def phase_finalize(centella_dir: Path, st: State) -> None:
     tel = st.data.get("telemetry", {})
     st.data["finished_at"] = now()
     st.save()
+    # Record finalize success in the run.json sidecar before push/PR.
+    # If push fails, the sidecar still shows the run completed locally;
+    # the user can read run.json's finished_at + push_error to know
+    # exactly where things stand.
+    _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
+
+    if no_push:
+        log(f"skipped push and PR (--no-push); the run branch "
+            f"{compute_run_branch(st.run_id)} and the merged working "
+            "branch are local-only")
+    else:
+        await push_and_open_pr(st, no_verify=no_verify)
+
     log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
         f"{wc} worker invocations. Merged into the working branch.")
     if tel:
@@ -3078,7 +3288,8 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
                    "no_clarify": bool(args.no_clarify)}
         st.save()
         await preflight(centella_dir, verbosity=verbosity,
-                        skip_smoke=args.skip_smoke)
+                        skip_smoke=args.skip_smoke,
+                        no_push=getattr(args, "no_push", False))
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
         await phase_classify(task, st, caps, args.no_clarify, models)
@@ -3099,6 +3310,26 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
             # working dir from st.path.parent, so they automatically
             # pick up the new location.
             centella_dir = st.run_dir
+            # Initialize run.json with the immutable run-identity fields
+            # (run_id, branch, working_branch, started_at, task) so
+            # `centella --list` can enumerate this run from the moment
+            # it has a stable identity — not only after finalize.
+            # working_branch is HEAD-at-classify-time; setup-run.sh
+            # records the same value to .centella/runs/<id>/working-branch
+            # later, but we capture it here so a run that fails
+            # before phase_execute still has a recoverable run.json.
+            head_proc = await run_proc(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            working_branch = (head_proc.stdout.strip()
+                              if head_proc.returncode == 0 else "")
+            _write_run_json(
+                st.run_dir,
+                run_id=final_run_id,
+                branch=compute_run_branch(final_run_id),
+                working_branch=working_branch,
+                started_at=st.data["started_at"],
+                task=task,
+            )
         # gather_answers blocks on input(). That's fine here: no concurrent
         # tasks are scheduled yet, so blocking the loop blocks nothing. Kept
         # on the event loop deliberately — every State mutation runs on the
@@ -3114,7 +3345,9 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
         write_plan(centella_dir, task, st, subtasks, waves)
 
     await phase_execute(centella_dir, st, caps, models)
-    await phase_finalize(centella_dir, st)
+    await phase_finalize(centella_dir, st,
+                        no_push=getattr(args, "no_push", False),
+                        no_verify=getattr(args, "no_verify", False))
 
 
 def main() -> None:
@@ -3131,6 +3364,17 @@ def main() -> None:
                          "intent questions and satisfy the source-of-truth "
                          "from --source-of-truth / CENTELLA_SOURCE_OF_TRUTH / "
                          "centella.toml if set, otherwise default to 'codebase'")
+    ap.add_argument("--no-push", action="store_true",
+                    help="skip the push and PR step at finalize. The run "
+                         "completes with the local merge into the working "
+                         f"branch only. Also {NO_PUSH_ENV} env var or "
+                         "no_push in centella.toml.")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="pass --no-verify to the finalize `git push` "
+                         "(skips pre-push hooks). Worker commits inside "
+                         "worktrees still run all hooks. CLI flag only "
+                         "(no env/TOML mirror — matches CLAUDE.md's "
+                         "explicit-user-request principle for hook-skipping).")
     ap.add_argument("--max-workers", type=int,
                     help="override the total worker-invocation budget")
     ap.add_argument("--max-parallel", type=int,
@@ -3241,6 +3485,12 @@ def main() -> None:
     sot_pref = resolve_source_of_truth(repo_root, args.source_of_truth)
     models = resolve_models(repo_root, args)
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
+
+    # Resolve --no-push: CLI flag → CENTELLA_NO_PUSH env → no_push in
+    # centella.toml → False. Re-attach to args so orchestrate() /
+    # preflight() / phase_finalize() see the resolved value uniformly via
+    # `args.no_push` regardless of where the choice came from.
+    args.no_push = resolve_no_push(repo_root, args.no_push)
 
     try:
         asyncio.run(orchestrate(args, caps, st.run_dir, st,
