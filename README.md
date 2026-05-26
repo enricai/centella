@@ -16,7 +16,8 @@ Centella inverts the relationship. **The model writes code. The program runs eve
 - **Success criteria are locked at implementation time — enforced by the orchestrator, not the worker.** The implementer cannot weaken its own tests to make them pass. The checker and the thing being checked are never the same agent.
 - **Workers must justify confidence with evidence, not feelings.** Before writing code, an implementer clears domain-specific evidence gates — file-and-line citations, reproductions, falsification attempts. A self-reported score without hard artifacts doesn't clear the bar.
 - **Parallel work that's actually safe.** Each implementer gets an isolated git worktree. Parallel writes never collide. Conflicts surface one wave at a time, close to the work that caused them.
-- **Resumable by design.** Interruption (Ctrl-C, reboot, budget cap) loses nothing. The staging branch is the durable record; `--resume` picks up from the last completed wave.
+- **Resumable by design.** Interruption (Ctrl-C, reboot, budget cap) loses nothing. The run branch is the durable record; `--resume` picks up from the last completed wave.
+- **Parallel-safe across runs.** Multiple `./centella` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and `.centella/` state never collide. Launch a fix and a feature in parallel without coordination.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -35,13 +36,14 @@ in real Python: `for` loops, `if` statements, counters. It cannot drift.
 ```
 centella "<task>"
    ├─ Phase 1  Classify into 1..8 categories                    → 1 claude -p
+   │             ↓ derive run_id (category + slug + start-hex)
    ├─ Phase 0  Clarify — intent-only questions, default zero
    ├─ Phase 2  Plan — one planner per category (parallel)        → N claude -p
    ├─ Phase 3  Schedule — global dependency graph → topo waves   (pure Python)
-   ├─ Phase 4  Create centella/staging branch + worktree
+   ├─ Phase 4  Create centella/<run-id> branch + worktree (per-run unique)
    ├─ Phase 5  Per wave: implement (parallel, isolated worktrees) → claude -p each
-   │           integrate into staging; validate staging
-   └─ Phase 6  Merge staging → working branch; cleanup
+   │           integrate into the run branch; validate the run branch
+   └─ Phase 6  Merge run branch → working branch; push + open PR; cleanup
 ```
 
 For the full rationale — why the orchestrator is a script rather than a plugin
@@ -66,8 +68,21 @@ git clone https://github.com/enricai/centella.git
 # From the root of the target git repository:
 /path/to/centella/centella "Fix the login timeout bug and add a regression test"
 
-# Resume an interrupted or budget-capped run:
+# Resume an interrupted or budget-capped run. Auto-picks if exactly one
+# in-flight run exists; otherwise requires --run-id (see `--list`).
 /path/to/centella/centella --resume
+/path/to/centella/centella --resume --run-id fix-login-timeout-bug-b81e90
+
+# List in-flight and completed runs in this repository:
+/path/to/centella/centella --list
+
+# Skip the default push + PR at finalize (run completes with the local
+# merge into the working branch only):
+/path/to/centella/centella "task" --no-push
+
+# Skip pre-push hooks at finalize (the user's explicit override; defaults
+# off). Affects only the final `git push`; worker commits still run hooks.
+/path/to/centella/centella "task" --no-verify
 
 # Skip the clarification phase entirely:
 /path/to/centella/centella "task" --no-clarify
@@ -123,8 +138,12 @@ Complete reference for every CLI flag, environment variable, and
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `task` (positional) | — | The task description. Required unless `--resume` is given. |
-| `--resume` | — | Resume an interrupted run from `.centella/state.json`. |
+| `task` (positional) | — | The task description. Required unless `--resume` or `--list` is given. |
+| `--resume` | — | Resume an interrupted run. Auto-picks if exactly one run exists; requires `--run-id` if multiple. |
+| `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` when multiple runs are in flight). |
+| `--list` | — | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
+| `--no-push` | off | Skip the default push + PR at finalize. The run completes with the local merge only. Overrides `CENTELLA_NO_PUSH` / `centella.toml`. |
+| `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--no-clarify` | off | Skip clarification entirely. Intent questions are dropped; source-of-truth is resolved from `--source-of-truth` / env / file, otherwise defaults to `codebase`. |
 | `--max-workers N` | 40 | Cap on total `claude -p` invocations across the run. |
@@ -147,6 +166,7 @@ Complete reference for every CLI flag, environment variable, and
 | `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `implementer`, `integrator`, `validator`. |
 | `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer, default 8). Overridden by `--confidence-rounds`. |
 | `CENTELLA_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`, default `stream`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. |
+| `CENTELLA_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | — | **Claude Code CLI variable**, not consumed by centella. Set to `70` to backstop worker auto-compaction. |
 
 ### Precedence
@@ -177,9 +197,9 @@ subprocess; there is no in-session agent nesting.
 |--------|---------------|---------------|---------|
 | `classifier` | `prompts/classifier.md` | 1 | category set + intent questions |
 | `planner` | `prompts/planner.md` | one per category (parallel) | subtask list with deps |
-| `implementer` | `prompts/implementer.md` | one per subtask (per wave, parallel) | commits on a `centella/<subtask-id>` branch |
-| `integrator` | `prompts/integrator.md` | on conflict during wave integration | resolved merge commit on `centella/staging` |
-| `validator` | constant `VALIDATOR_SYSTEM` in `centella.py` (not a file) | once per wave | pass/fail on staging |
+| `implementer` | `prompts/implementer.md` | one per subtask (per wave, parallel) | commits on a `centella/<run-id>/<subtask-id>` branch |
+| `integrator` | `prompts/integrator.md` | on conflict during wave integration | resolved merge commit on `centella/<run-id>` |
+| `validator` | constant `VALIDATOR_SYSTEM` in `centella.py` (not a file) | once per wave | pass/fail on the run branch |
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) §7 for the worker contract and
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §3 for the invocation
@@ -188,7 +208,7 @@ surface (flags, timeouts, schema enforcement).
 ## Walkthrough
 
 For a worked end-to-end example — from invocation through clarification,
-wave execution, staging review, and merge — see
+wave execution, run-branch review, and merge — see
 [`docs/USAGE.md`](docs/USAGE.md).
 
 ## Development
@@ -215,11 +235,11 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/planner.md` | System prompt: decompose one category into a subtask plan |
 | `prompts/implementer.md` | System prompt: execute one subtask end to end |
 | `prompts/integrator.md` | System prompt: resolve merge conflicts behaviorally |
-| `scripts/setup-staging.sh` | Create `centella/staging` branch + worktree |
-| `scripts/new-worktree.sh` | Create per-subtask branch + worktree off staging |
-| `scripts/integrate.sh` | Merge a subtask branch into staging |
-| `scripts/finalize.sh` | Merge staging into the working branch |
-| `scripts/cleanup.sh` | Remove worktrees; optionally delete `centella/*` branches |
+| `scripts/setup-run.sh` | Create per-run branch + worktree (`centella/<run-id>`) |
+| `scripts/new-worktree.sh` | Create per-subtask branch + worktree off the run branch |
+| `scripts/integrate.sh` | Merge a subtask branch into the run branch |
+| `scripts/finalize.sh` | Merge the run branch into the working branch; push and open a PR (unless `--no-push`) |
+| `scripts/cleanup.sh` | Remove worktrees / branches for one run (default) or all runs (`--all-runs`); legacy layout cleanup via `--legacy` |
 | `centella` | Executable entry-point wrapper |
 | `commands/centella.md` | Thin plugin skill — reachable as `/centella` from Claude Code |
 | `docs/DESIGN.md` | Full design document and rationale |
@@ -233,13 +253,17 @@ Acting workers use `--dangerously-skip-permissions`. That is a real risk
 surface — it is what makes the run unattended. It is bounded by worktree
 isolation (each worker operates in its own isolated checkout, not your main
 working tree) but not eliminated. **Run on repositories you trust, ideally in
-a container, and review the `centella/staging` branch before relying on the
-result.**
+a container, and review the run branch (`centella/<run-id>`) before relying
+on the result.** Push + PR at finalize is the natural review surface; you
+can also pass `--no-push` to keep finalize fully local.
 
-The run writes only to `.centella/` (auto-excluded from git via
-`.git/info/exclude`) and to `centella/*` branches until Phase 6, when it merges
-into your working branch. After a run, `centella/*` branches are kept as an
-audit trail. Remove them with `scripts/cleanup.sh --branches`.
+The run writes only to `.centella/runs/<run-id>/` (auto-excluded from git
+via `.git/info/exclude`) and to `centella/<run-id>` plus
+`centella/<run-id>/<subtask-id>` branches until Phase 6, when it merges into
+your working branch and (unless `--no-push`) pushes the run branch to
+`origin`. After a run, the run branches are kept as an audit trail. Remove
+them with `scripts/cleanup.sh --run-id <id> --branches` (or `--all-runs
+--branches` for an audit cleanup across every past run).
 
 ## Troubleshooting
 
@@ -264,9 +288,16 @@ audit trail. Remove them with `scripts/cleanup.sh --branches`.
   upstream cause, then resume. See [`docs/DESIGN.md`](docs/DESIGN.md) §8
   for the evidence-gated loop.
 
-- **Staging / worktree conflicts on a re-run** — `scripts/cleanup.sh --branches`
-  removes worktrees and deletes the `centella/*` branches so a fresh run
-  has a clean slate. Then re-invoke as normal.
+- **Worktree or branch conflicts on a re-run** — `scripts/cleanup.sh --run-id <id> --branches`
+  removes that run's worktrees and deletes its branches so a fresh run
+  with the same task starts clean. For a global sweep across every past
+  run, use `--all-runs --branches`. Then re-invoke as normal.
+
+- **Push or PR failed at finalize** — the run completed locally. Check
+  `centella --list` for the run's status (`push-failed` / `pr-failed`)
+  and read `.centella/runs/<run-id>/run.json` for the captured stderr.
+  The error message at finalize names the exact retry command. Local
+  commits are intact on the run branch.
 
 ## FAQ
 
@@ -276,9 +307,11 @@ subscription. The orchestrator shells out to `claude -p` workers; no API
 key is read or sent.
 
 **Can I run multiple Centella instances in the same repository?**
-No. The `.centella/` state directory and the `centella/staging` branch
-are single-instance. Run separate tasks sequentially, or use separate
-clones for parallel work.
+Yes. Each invocation derives a unique `run_id` and namespaces all of its
+state under `.centella/runs/<run-id>/` and its branches under
+`centella/<run-id>` — so parallel runs in the same clone never collide.
+Use `--list` to see what's in flight and `--resume --run-id <id>` to
+resume a specific one.
 
 **Does Centella work outside a git repository?**
 No. Per-subtask isolation is provided by `git worktree`; the worktree
@@ -290,10 +323,10 @@ The validator falls back to a worker-driven correctness check. See
 and what happens when nothing is detected.
 
 **Can I see what each worker did?**
-Yes. Every worker commits to its own `centella/<subtask-id>` branch and
-those branches survive the run. `git log centella/<subtask-id>` is your
-per-worker audit trail; `scripts/cleanup.sh --branches` removes them when
-you no longer need them.
+Yes. Every worker commits to its own `centella/<run-id>/<subtask-id>`
+branch and those branches survive the run. `git log centella/<run-id>/<subtask-id>`
+is your per-worker audit trail; `scripts/cleanup.sh --run-id <id> --branches`
+removes one run's branches, `--all-runs --branches` removes all of them.
 
 **Why not use the Claude Code SDK or the in-session Agent tool?**
 Two platform constraints make subprocess workers the right shape. See

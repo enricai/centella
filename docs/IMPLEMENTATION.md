@@ -28,11 +28,11 @@ centella/
 │    `orchestrator/centella.py`, not a file — it is short and has no
 │    behavioral tuning that would benefit from out-of-tree editing)
 ├── scripts/
-│   ├── setup-staging.sh           create staging branch + worktree (idempotent)
-│   ├── new-worktree.sh            create/reuse a per-subtask worktree
-│   ├── integrate.sh               merge a subtask branch into staging
-│   ├── finalize.sh                merge staging into the working branch
-│   └── cleanup.sh                 remove worktrees (and optionally branches)
+│   ├── setup-run.sh               create per-run branch + worktree (idempotent)
+│   ├── new-worktree.sh            create/reuse a per-subtask worktree (per-run scoped)
+│   ├── integrate.sh               merge a subtask branch into the per-run branch
+│   ├── finalize.sh                merge run branch into working branch; push; open PR
+│   └── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 ├── commands/centella.md            thin plugin skill — launches the orchestrator
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
@@ -51,8 +51,23 @@ Maps to `DESIGN.md`: §3 (architecture / phases), §2 (why a program, not a skil
 # From the root of the target git repository:
 /path/to/centella/centella "Fix the login timeout bug and add a regression test"
 
-# Resume an interrupted run:
+# Resume an interrupted run. Auto-picks if exactly one in-flight run exists;
+# requires --run-id otherwise (see `centella --list` to enumerate).
 /path/to/centella/centella --resume
+/path/to/centella/centella --resume --run-id fix-login-timeout-bug-b81e90
+
+# List in-flight and completed runs in this repository:
+/path/to/centella/centella --list
+
+# Skip the default push + PR at finalize (run completes with the local merge
+# into the working branch only):
+/path/to/centella/centella "task" --no-push
+export CENTELLA_NO_PUSH=1
+
+# Skip pre-push hooks at finalize (the user's explicit override; defaults off).
+# Affects only the final `git push`; worker `git commit` operations inside
+# worktrees continue to run all hooks normally.
+/path/to/centella/centella "task" --no-verify
 
 # Skip clarification entirely (DESIGN §11). Intent questions from the
 # classifier are dropped; the source-of-truth question is satisfied from
@@ -298,9 +313,9 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 0 Clarify | `gather_answers` | if questions and interactive: collect; non-interactive: write `pending-questions.json`, exit code 10; `--no-clarify` skips clarification entirely per DESIGN §11 — intent questions dropped, source-of-truth resolved from preference or defaulted to `codebase` with a warning |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `centella.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
-| 4 Setup | `phase_execute` head → `setup-staging.sh` | create staging branch + worktree |
+| 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `centella/<run-id>` and its worktree (per-run, isolated from any other run) |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then re-validate. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume` |
-| 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh` | merge staging into working branch; post-merge sanity checks |
+| 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh` | merge run branch into working branch; post-merge sanity checks; push the run branch and open a PR (unless `--no-push`); record push / PR outcome in `run.json` |
 
 `phase_classify` runs before `gather_answers` because the question set depends
 on the classification.
@@ -327,12 +342,15 @@ All in `centella.py`, in execution order. This is the concrete catalogue behind
 | `resolve_models()` at startup | invalid model alias in `centella.toml`, any `CENTELLA_MODEL[_*]` env var, or any `--model[-*]` CLI flag — caught before any worker spawns |
 | `git user.email` / `user.name` set | commits would fail silently without identity |
 | working tree clean | dirty tree → ambiguous diffs, corrupt merge history |
-| no stale `centella/*` branches | name collisions with this run |
-| no stale worktrees | branch checkout failures |
+| no `centella/<run-id>` branch already exists | this run's id collides with a prior or in-flight run — use `--resume --run-id <id>` instead |
+| no `.centella/runs/<run-id>/` already exists | same as above, but caught on the filesystem side |
 | `claude --version` ≥ `MIN_CLAUDE_CLI` (currently `(2, 1, 22)`) | CLI too old for `--json-schema` (introduced for `claude -p` in v2.1.22) — replaces the cryptic "unknown option" message a stale CLI used to produce |
+| `_check_gh_cli(no_push)` — `gh` installed, `gh auth status` ok, `origin` remote present | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
 | live `claude -p` smoke test | auth failure or network problem |
 
-`--skip-smoke` bypasses only the live smoke test (used by the test harness); the CLI version check still runs because it is local and read-only, and skipping it would let a stale CLI through to every worker.
+The preflight runs against `_bootstrap-<6hex>/` until classify completes; once `run_id` is known, the bootstrap directory is atomically renamed to `.centella/runs/<run-id>/`. The `<run-id>` collision checks happen after classify but before the rename, with the same failure message and exit code as if they'd run earlier.
+
+`--skip-smoke` bypasses only the live smoke test (used by the test harness); the CLI version check, the `gh` check, and the run-id collision checks all still run because they are local and read-only, and skipping any of them would defer a confusing failure to mid-run.
 
 ### Phase 1 checks — `phase_classify`
 | Check | Catches |
@@ -381,12 +399,12 @@ judgment reads `state.json["criteria_revisions"]` after the run.
 |-------|---------|
 | `check_criteria_files_exist()` | missing criteria files, before spending validation workers |
 | test-runner short-circuit | a passing deterministic runner (pytest/npm/go/cargo/make) skips the LLM validator |
-| `scan_conflict_markers()` | unresolved `<<<<<<<` markers in staging after integration |
+| `scan_conflict_markers()` | unresolved `<<<<<<<` markers in the run-branch worktree after integration |
 
 On a re-validation failure round, the orchestrator re-runs `settle_subtask`
 for each failing subtask (which may produce additional fixing commits) and
-then `integrate.sh` to re-merge the delta into staging, before the next
-round of validation. The cap on this loop is `wave_revalidation_rounds`
+then `integrate.sh` to re-merge the delta into the run branch, before the
+next round of validation. The cap on this loop is `wave_revalidation_rounds`
 (5) — exceeding it aborts the run with the failing subtask ids.
 
 ### Post-integrator checks (after an integrator handles a conflict)
@@ -401,7 +419,7 @@ orchestrator only checks the outcome.
 |-------|---------|
 | `check_merge_committed()` | integrator returned `resolved` but left the worktree mid-merge (`MERGE_HEAD` present) or with staged-uncommitted changes — **terminal**: merge aborted, run stops |
 | `check_integrator_commit()` | integrator merge commit touched `.centella/` files — non-fatal warning, recorded to `state.json` |
-| integrator status `design-conflict` / `failed` | unresolvable conflict — **terminal**: in-progress merge aborted, staging left clean at last good wave, diagnosis saved, run stops |
+| integrator status `design-conflict` / `failed` | unresolvable conflict — **terminal**: in-progress merge aborted, the run branch left clean at the last good wave, diagnosis saved, run stops |
 
 ### Post-finalize checks
 Both are **non-fatal warnings** (logged, not `die()`) — the user is told to
@@ -410,12 +428,12 @@ verify manually; the run does not abort.
 | Check | Catches | On failure |
 |-------|---------|-----------|
 | most-recent merge subject contains `'centella:'` (read from `git log --merges -1 --format=%s HEAD`) | finalize merged to the wrong branch | non-fatal warning |
-| `git diff --stat centella/staging..HEAD` empty | merge silently dropped changes | non-fatal warning |
+| `git diff --stat centella/<run-id>..HEAD` empty | merge silently dropped changes | non-fatal warning |
 
 ### Resume integrity — `validate_resume_state()`
-Enforces (one half of) DESIGN §6's "staging is the resume contract"
+Enforces (one half of) DESIGN §6's "the run branch is the resume contract"
 invariant — state.json's `waves`/`completed_waves` say *which* wave to
-resume; the never-reset `centella/staging` branch holds *the work* every
+resume; the never-reset `centella/<run-id>` branch holds *the work* every
 prior wave produced. Both must be coherent for resume to be safe.
 
 On `--resume`: asserts `task` is present and non-empty; asserts `waves`,
@@ -529,16 +547,17 @@ first occurrence.
 
 ## 7. Git worktree mechanics (`scripts/*.sh`)
 
+Every script takes a `RUN_ID` as its first positional argument (after any flags) so the per-run namespacing is explicit at the shell boundary, not implicit through `cwd`.
+
 | Script | Behavior |
 |--------|----------|
-| `setup-staging.sh` | Creates `centella/staging` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch to `.centella/working-branch` on first run only. Adds the staging worktree if missing. Idempotent — safe on `--resume`. |
-| `new-worktree.sh <id>` | Creates `centella/<id>` worktree branched off the current `centella/staging` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. |
-| `integrate.sh <id>` | From repo root, inside the staging worktree: `git merge --no-ff centella/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (staging worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
-| `finalize.sh` | Checks out the working branch (recorded by `setup-staging.sh`), merges `centella/staging` into it. On conflict: `git merge --abort`, restore the working branch clean, exit non-zero with manual-merge instructions; staging left intact. |
-| `cleanup.sh [--branches]` | Removes all `.centella/worktrees/*`, prunes worktree metadata. Keeps `centella/*` branches as an audit trail unless `--branches` is passed. |
+| `setup-run.sh <run-id>` | Creates `centella/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `.centella/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `.centella/runs/<run-id>/worktrees/staging` if missing. Appends `.centella/` to the repo's `.git/info/exclude` (idempotent). Safe on `--resume`. |
+| `new-worktree.sh <id> <run-id>` | Creates `centella/<run-id>/<id>` worktree at `.centella/runs/<run-id>/worktrees/<id>` branched off the current `centella/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. |
+| `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.centella/runs/<run-id>/worktrees/staging`): `git merge --no-ff centella/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
+| `finalize.sh <run-id> [--no-push] [--no-verify]` | Checks out the working branch (recorded by `setup-run.sh`), merges `centella/<run-id>` into it. On conflict: `git merge --abort`, restore the working branch clean, exit non-zero with manual-merge instructions; run branch left intact. On success and unless `--no-push`: `git push -u origin centella/<run-id>` (appending `--no-verify` to the push if the flag was set), then `gh pr create --base <working-branch> --head centella/<run-id> --title <title> --body-file -`. Push failure exits non-zero with a multi-line message naming both branches, the captured stderr, and the exact retry command; updates `.centella/runs/<run-id>/run.json` with `push_error`. PR-creation failure is *non-fatal*: logs a warning with the pushed-branch URL and the retry command; updates `run.json` with `pr_error` but exits 0. |
+| `cleanup.sh [--run-id <id>] [--all-runs] [--legacy] [--branches]` | Default (no flag): scans `.centella/runs/*/state.json` and picks the most recent run *without* a `finished_at`, confirms before deletion, removes only that run's worktrees and branches (`centella/<run-id>` and `centella/<run-id>/*`). `--run-id <id>` is an explicit single-run cleanup. `--all-runs` removes every run's artifacts (audit cleanup). `--legacy` removes the pre-per-run layout (`.centella/state.json`, `.centella/worktrees/`, `centella/staging` branch). `--branches` (with `--run-id` or `--all-runs`) additionally deletes the matching run branches; without it, branches are kept as an audit trail. |
 
-`centella/staging` is never reset once created — this is the invariant `--resume`
-depends on. See `DESIGN.md` §6 ("staging is the resume contract").
+A run branch `centella/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
 Maps to `DESIGN.md`: §6.
 
@@ -547,30 +566,67 @@ Maps to `DESIGN.md`: §6.
 ## 8. Coordination directory layout (`.centella/`)
 
 Created in the main repository (not in any worktree — worktrees are disposable).
-`setup-staging.sh` git-excludes `.centella/` by appending it to the target
+`setup-run.sh` git-excludes `.centella/` by appending it to the target
 repo's `.git/info/exclude` rather than to the user's tracked `.gitignore`
 (we deliberately do not modify files the user has committed).
 
+Every run's artifacts live under `.centella/runs/<run-id>/`. The parent
+`.centella/` directory is otherwise empty of run data; it only hosts the
+`runs/` directory. Two concurrent runs in the same repository share no
+coordination state.
+
 ```
 .centella/
-├── state.json              run state — see field table below
-├── working-branch          the branch finalize.sh returns to
-├── plan.json               merged planner output
-├── subtasks/<id>.json      per-subtask spec handed to each implementer
-├── criteria/<id>.md        frozen success criteria, sha256-locked
-├── checkpoints/<id>.md     handoff checkpoints (7-section schema)
-├── logs/<sid>.log          per-worker raw stream-json event log (one file
-│                           per claude_p invocation by sid; always written
-│                           regardless of verbosity; append-only across
-│                           handoffs / clarifications)
-├── worktrees/staging       the staging worktree
-├── worktrees/<id>          per-subtask worktrees
-├── pending-questions.json  written when clarification needs a non-interactive relay
-├── pending-clarifications.json  written when an implementer hits a §11
-│                                mid-execution clarification (non-interactive)
-└── answers.json            written by the plugin skill when relaying
-                            clarification answers; passed back via --answers
+└── runs/
+    └── <run-id>/                    (or _bootstrap-<6hex> pre-classify)
+        ├── state.json               run state — see field table below
+        ├── run.json                 sidecar — see field table below
+        ├── working-branch           the branch finalize.sh returns to (HEAD-at-run-start)
+        ├── plan.json                merged planner output
+        ├── subtasks/<id>.json       per-subtask spec handed to each implementer
+        ├── criteria/<id>.md         frozen success criteria, sha256-locked
+        ├── checkpoints/<id>.md      handoff checkpoints (7-section schema)
+        ├── logs/<sid>.log           per-worker raw stream-json event log (one file
+        │                            per claude_p invocation by sid; always written
+        │                            regardless of verbosity; append-only across
+        │                            handoffs / clarifications)
+        ├── worktrees/staging        the run-branch worktree
+        ├── worktrees/<id>           per-subtask worktrees
+        ├── pending-questions.json   written when clarification needs a non-interactive relay
+        ├── pending-clarifications.json  written when an implementer hits a §11
+        │                                mid-execution clarification (non-interactive)
+        └── answers.json             written by the plugin skill when relaying
+                                     clarification answers; passed back via --answers
 ```
+
+The bootstrap directory `_bootstrap-<6hex>` is the same shape; on Phase-1
+completion, the orchestrator atomically renames it to the final
+`<run-id>` directory once `run_id` is derived from the classifier output.
+Open file handles (per-worker logs in particular) survive the rename
+because POSIX file handles reference inodes, not paths.
+
+`run.json` fields (a minimal sidecar enabling `centella --list` and resume
+discovery without parsing the full `state.json`):
+
+| Field | Shape | Notes |
+|-------|-------|-------|
+| `run_id` | str | the run identifier (matches the directory name and the branch suffix) |
+| `branch` | str | the run branch — always `centella/<run_id>` |
+| `working_branch` | str | the branch HEAD-at-run-start; the PR base and the finalize merge target |
+| `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
+| `finished_at` | ISO-8601 str \| null | wall-clock end time, set at finalize success |
+| `task` | str | the task description (mirrored from `state.json`) |
+| `pushed_at` | ISO-8601 str \| null | when the run branch was pushed to `origin`; null until push runs |
+| `push_error` | str \| null | captured `git push` stderr if the push failed; mutually exclusive with `pushed_at` being set |
+| `pr_url` | str \| null | the PR URL `gh` returned; null until PR creation succeeds |
+| `pr_error` | str \| null | captured `gh` stderr if PR creation failed; logical invariant — `pr_error` can be set only after `pushed_at` is set |
+
+`_validate_run_json(data)` enforces three invariants on read:
+- `pushed_at` and `push_error` are mutually exclusive (at most one is non-null).
+- `pr_url` and `pr_error` are mutually exclusive.
+- If `pr_url` is set, `pushed_at` must be set (cannot have a PR without a push).
+
+A corrupt sidecar is flagged but does not block the rest of the system; `centella --list` will render that run with `status=corrupt-sidecar` and the user can inspect or delete the file.
 
 `state.json` fields. This table is canonical: every field the orchestrator
 writes to `st.data` must appear here, and every field listed here must be

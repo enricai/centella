@@ -76,15 +76,17 @@ context and a defined input/output contract.
 Orchestrator (deterministic — owns all control flow, caps, state)
 │
 ├─ Phase 1   Classify the task into 1..8 categories          → 1 worker
+│              ↓ derive the run identifier from category + task + start time
 ├─ Phase 0   Clarify — intent-only questions, only if needed
 ├─ Phase 2   Plan — one planner per matched category         → N workers (parallel)
 ├─ Phase 3   Schedule — merge plans, build global DAG, sort into waves
-├─ Phase 4   Set up the staging branch and worktree
+├─ Phase 4   Set up the run branch and worktree (per-run unique)
 ├─ Phase 5   For each wave, in sequence:
 │   ├─ Implement — one implementer per subtask               → workers (parallel)
-│   ├─ Integrate each result into staging; on conflict       → 1 integrator worker
-│   └─ Validate the integrated staging result
-└─ Phase 6   Merge staging into the working branch; clean up
+│   ├─ Integrate each result into the run branch; on conflict → 1 integrator worker
+│   └─ Validate the integrated run branch result
+└─ Phase 6   Merge the run branch into the working branch;
+             push the run branch and open a PR; clean up
 ```
 
 **Why classification precedes clarification.** Phase 1 runs before Phase 0
@@ -213,37 +215,71 @@ repository. Parallel writes land in separate working directories and never
 collide. This is what makes "a wave of parallel implementers" safe even when
 two of them touch the same file.
 
-### Staging as an integration buffer
+### The run identifier
 
-Integration does not happen on the user's working branch. A dedicated **staging
-branch** receives every subtask's work; the user's branch is untouched until
-the run finishes and succeeds. A failed or messy integration therefore never
-lands on the branch the user cares about.
+Every run has a unique identifier `run_id`, derived deterministically from
+three inputs known by the end of Phase 1:
+
+- the first classified category (a short abbreviation — `feat`, `fix`,
+  `refactor`, etc.),
+- a sanitized kebab-case slug of the task description (≤30 chars, word-
+  boundary truncated),
+- a 6-character hex digest of the run's start timestamp (microsecond
+  precision).
+
+The result looks like `feat-add-telemetry-skills-a3f7c2`. It is the same
+string in three places: the run branch name (`centella/<run-id>`), the
+per-run state directory (`.centella/runs/<run-id>/`), and the title of the
+PR opened at finalize. A user looking at any of the three can grep for the
+others.
+
+A run identifier is *per-run*, not per-repository. Two concurrent invocations
+in the same repository produce two different `run_id`s — their branches,
+state directories, worktrees, and PRs are disjoint by construction. There
+is no shared "staging" namespace that two runs could collide on.
+
+### The run branch as an integration buffer
+
+Integration does not happen on the user's working branch. Each run has its
+own **run branch** (`centella/<run-id>`) that receives every subtask's work;
+the user's branch is untouched until the run finishes and succeeds. A failed
+or messy integration therefore never lands on the branch the user cares
+about. Multiple runs in the same repository each have their own run branch
+and integrate independently.
 
 Integration is **incremental, one wave at a time**. Each wave's results are
-merged into staging and the merged result is validated before the next wave
-starts. Conflicts surface one wave at a time, close to the work that caused
-them — not all at once at the end, where they are far harder to untangle.
+merged into the run branch and the merged result is validated before the
+next wave starts. Conflicts surface one wave at a time, close to the work
+that caused them — not all at once at the end, where they are far harder to
+untangle.
 
-### Staging is the resume contract
+### The run branch is the resume contract
 
-The staging branch is also the durable record of everything completed so far:
+The run branch is also the durable record of everything completed so far:
 every integrated wave is a commit on it. This is what `--resume` is built on.
-Run state records *which wave* to resume from; the staging branch holds *the
+Run state records *which wave* to resume from; the run branch holds *the
 work* every prior wave produced. The two together are the entire resume
 contract.
 
-This places one hard requirement on the design: **staging, once created, is
-never reset.** Setup creates the staging branch only if it does not already
-exist. On a resume the branch already carries the completed waves' commits, and
-resetting it would silently discard them while the wave loop resumed past them
-— delivering a final result that is missing everything before the interruption.
-"Create if absent, never reset" is not an implementation nicety; it is the
-invariant the resume guarantee depends on.
+This places one hard requirement on the design: **a run branch, once
+created, is never reset.** Setup creates it only if it does not already
+exist (and a `run_id` collision against an existing branch is a preflight
+failure, not a silent overwrite). On a resume the branch already carries
+the completed waves' commits, and resetting it would silently discard them
+while the wave loop resumed past them — delivering a final result that is
+missing everything before the interruption. "Create if absent, never reset"
+is not an implementation nicety; it is the invariant the resume guarantee
+depends on.
+
+When more than one run is in flight in the same repository, `--resume`
+needs to know *which* run to resume. The orchestrator auto-picks when
+exactly one run exists, and requires an explicit `--run-id` otherwise; the
+discovery scans `.centella/runs/*/state.json`. Resume never guesses across
+multiple runs.
 
 ### Why merge, not cherry-pick
 
-Subtask branches are integrated into staging by merging, not by cherry-picking.
+Subtask branches are integrated into the run branch by merging, not by cherry-picking.
 A merge records ancestry, which gives the integrator a real common base for
 three-way conflict resolution: far more auto-resolves, and only genuine
 conflicts surface. Cherry-pick copies commits without ancestry, so it has a
@@ -268,8 +304,8 @@ can avoid that.
 
 The behavioral re-check that *catches* a merge gone wrong happens immediately
 after, at the wave level: once the integrator commits the merge, the
-orchestrator re-runs every wave subtask's frozen criteria against integrated
-staging (the same validator pass that runs at the end of every wave, whether
+orchestrator re-runs every wave subtask's frozen criteria against the
+integrated run branch (the same validator pass that runs at the end of every wave, whether
 an integrator was needed or not). A merge that satisfied git but broke an
 already-validated subtask is caught there, not in the integrator itself.
 Keeping the re-check in one place — the wave-level validator — means there
@@ -287,20 +323,59 @@ Two outcomes are not failures of the integrator but facts about the work:
 - **Genuinely irreconcilable intents are a design conflict.** If two subtasks
   want contradictory things, no merge can satisfy both — that is a problem with
   the decomposition or the task, not a merge to be papered over. The
-  orchestrator stops the run, leaves the staging branch intact at the last
+  orchestrator stops the run, leaves the run branch intact at the last
   fully-integrated wave, and reports the conflict for a human to resolve. An
-  unresolved conflict never proceeds silently onto a corrupt staging state.
+  unresolved conflict never proceeds silently onto a corrupt run-branch state.
 
 ### Finalization
 
-The final step merges the staging branch into the user's working branch. This
-is the one and only point at which the working branch changes. If the working
-branch received commits *during* the run it may have diverged from where
-staging started, and this final merge can itself conflict. If it does, the
+The final step merges the run branch into the user's working branch and then
+optionally shares the result with the world.
+
+**Local merge.** The run branch is merged into the working branch — the one
+and only point at which the working branch changes. If the working branch
+received commits *during* the run it may have diverged from where the run
+branch started, and this final merge can itself conflict. If it does, the
 merge is aborted cleanly — the working branch is restored, not left in a
-half-merged state — and the run reports the situation with the staging branch
-preserved for a manual merge. The principle is consistent throughout: the user's
-own branch is never left broken by Centella.
+half-merged state — and the run reports the situation with the run branch
+preserved for a manual merge. The principle is consistent throughout: the
+user's own branch is never left broken by Centella.
+
+**Push and PR.** After a successful local merge, the run branch is pushed
+to `origin` and a pull request is opened via `gh pr create` against the
+working branch (the branch HEAD-at-run-start). The PR title is the run id;
+the body is generated deterministically from the run state — task, category,
+source-of-truth, wave count, worker count, run timestamps. This is the
+single point at which Centella reaches the network; everything before is
+local. Two flags control it:
+
+- `--no-push` skips both the push and the PR; the run completes with the
+  local merge only.
+- `--no-verify` passes `--no-verify` to `git push`, skipping pre-push hooks.
+  Worker commits inside worktrees continue to run all hooks normally — only
+  the push gate is affected. This is the per-invocation explicit user
+  override called out by the project's "never skip hooks unless asked"
+  principle; defaults to off.
+
+**Push and PR are honest about failure.** A push or PR step that fails does
+not pretend the run failed: the local work is intact and reachable on the
+run branch. The orchestrator records what was attempted and what failed in
+a per-run sidecar (`run.json` — `pushed_at`, `push_error`, `pr_url`,
+`pr_error`). Push failure exits non-zero with a multi-line message that
+names both branches (run branch and working branch), shows the captured
+stderr, and gives the exact retry command. PR-creation failure is treated
+as non-fatal: the push has already succeeded, so the user receives a
+warning with the GitHub URL of the pushed branch and the exact `gh pr
+create` command to retry. The principle is that the user always knows
+exactly what state things are in and exactly which branch holds the work
+to be resolved.
+
+**Why push by default.** When centella is invoked in CI or any unattended
+context, a successful run that leaves work only on a local branch is a
+silent failure mode — the work exists but the user has no signal that it
+needs to be reviewed. Defaulting to push + PR turns every run into a
+reviewable artifact. `--no-push` exists for users running centella offline
+or in repositories without a GitHub remote.
 
 ---
 
@@ -468,6 +543,14 @@ a coordination directory in the main repository, never inside a subtask's
 worktree. A worktree is disposable — it is removed at cleanup — so a checkpoint
 stored inside it would vanish exactly when a successor worker needs to read it.
 Coordination state must outlive the worktree that produced it.
+
+Coordination state is **per-run**, rooted at `.centella/runs/<run-id>/`.
+State, plan, criteria, checkpoints, logs, the worktrees themselves, and the
+PR-result sidecar all live under that directory. Two runs in the same
+repository share no coordination state — each has its own subtree, and
+neither can clobber the other's `state.json`, log files, or worktrees by
+collision. The parent `.centella/` is otherwise empty of run data; it only
+hosts the `runs/` directory.
 
 ---
 
@@ -680,7 +763,7 @@ what the architecture can guarantee.
   rejected: it still prompts on shell commands, which would stall an unattended
   run the first time a worker needs to run one. The blast radius is bounded by
   worktree isolation, not eliminated. Centella should be run on repositories the
-  user trusts, ideally inside a container, and the staging result reviewed
+  user trusts, ideally inside a container, and the run branch reviewed
   before it is relied on.
 - **A worker that exhausts its turn limit without checkpointing loses its
   work.** Handoff depends on the worker writing a checkpoint before it stops. A
@@ -704,6 +787,24 @@ what the architecture can guarantee.
 - **Headless usage is metered.** Subscription-based headless usage draws on a
   finite pool, and a large multi-wave run consumes a meaningful amount of it.
   Cost scales with worker count.
+- **Parallelism is single-clone.** Multiple concurrent runs in the same git
+  clone are explicitly supported via the per-run state and branch design.
+  Multiple clones running concurrently are also fine — they are independent
+  by construction — but the per-run namespacing applies only within one
+  clone; centella does nothing to coordinate across clones (it has no need
+  to).
+- **Push assumes a remote named `origin`.** Finalize pushes to `origin` and
+  opens the PR against the same remote's GitHub repo. A fork pattern where
+  the user's write-access remote is named something else (e.g., `mine`
+  pushing to a personal fork, `origin` reading from upstream) is not
+  supported today; the workaround is `--no-push` plus a manual push. A
+  follow-up `--remote <name>` flag is possible but outside the current
+  design.
+- **System-wide worker concurrency scales with run count.** Each run obeys
+  its own `max_parallel` cap; with N concurrent runs the total active
+  worker count can be N × max_parallel. The blast radius is bounded per
+  run but not globally; users running many concurrent centella invocations
+  should be aware of the headless-usage cost implication.
 
 ---
 
@@ -714,7 +815,7 @@ A design document should be honest about how much of the system has been
 the first thing anyone running Centella needs.
 
 **Demonstrated.** The deterministic scaffolding has been exercised. The git
-worktree mechanics — staging setup, per-subtask worktrees, wave-to-wave
+worktree mechanics — branch setup, per-subtask worktrees, wave-to-wave
 dependency layering, conflict detection, finalization, cleanup — have been run
 against real repositories. The orchestrator's control flow — classification,
 planning, scheduling, wave execution, integration, validation, finalize, and
@@ -728,6 +829,16 @@ the workers — whether the evidence gates, the handoff, and the conflict
 resolution actually work as intended — cannot be known until the prompts run
 against a live model. The deterministic surface is sound by construction and
 by test; the worker behavior is the unverified surface.
+
+Two parts of the surface described in this document are *new* and have not
+yet been exercised end-to-end: the per-run namespacing (run-id derivation,
+`.centella/runs/<run-id>/` layout, parallel-run coexistence, multi-run
+resume), and the push-and-PR finalization step (`gh pr create`, run.json
+sidecar with `pushed_at`/`pr_url`/error fields, `--no-push` and
+`--no-verify`). The single-run, local-finalize design described in earlier
+revisions of this document has been exercised; the broader design here
+becomes verified only after the corresponding code lands and a first run
+exercises it.
 
 **Recommended first step.** Run Centella once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.
