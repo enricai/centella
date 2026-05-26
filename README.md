@@ -39,6 +39,7 @@ centella "<task>"
    │             ↓ derive run_id (category + slug + start-hex)
    ├─ Phase 0  Clarify — intent-only questions, default zero
    ├─ Phase 2  Plan — one planner per category (parallel)        → N claude -p
+   │             ↓ reconcile cross-domain capability tags          → 0 or 1 claude -p
    ├─ Phase 3  Schedule — global dependency graph → topo waves   (pure Python)
    ├─ Phase 4  Create centella/<run-id> branch + worktree (per-run unique)
    ├─ Phase 5  Per wave: implement (parallel, isolated worktrees) → claude -p each
@@ -152,7 +153,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
 | `--source-of-truth VALUE` | — | `codebase` / `research` / `both` / `ask`. Overrides `CENTELLA_SOURCE_OF_TRUTH` and `centella.toml`. |
 | `--model ALIAS` | `sonnet` | `sonnet` / `opus` / `haiku`. Model for every worker this run. |
-| `--model-<worker> ALIAS` | inherits `--model` | Per-worker override. `<worker>` is one of `classifier`, `planner`, `implementer`, `integrator`, `validator`. |
+| `--model-<worker> ALIAS` | inherits `--model` | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
 | `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.centella/logs/<sid>.log`. |
 | `-v` / `-vv` | — | Shortcuts: `-v` = `stream` (default), `-vv` = `debug`. |
 | `-q` / `-qq` | — | Shortcuts: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. |
@@ -163,7 +164,7 @@ Complete reference for every CLI flag, environment variable, and
 |---------|---------------------|-------------|
 | `CENTELLA_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both` / `ask`). Overridden by `--source-of-truth`. |
 | `CENTELLA_MODEL` | `model` | Default model alias for all workers. Overridden by `--model`. |
-| `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `implementer`, `integrator`, `validator`. |
+| `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
 | `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer, default 8). Overridden by `--confidence-rounds`. |
 | `CENTELLA_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`, default `stream`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. |
 | `CENTELLA_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. |
@@ -190,16 +191,25 @@ rationale behind these orders and the full validation contract.
 
 ## Worker types
 
-Centella spawns five kinds of `claude -p` worker. Each is a separate
+Centella spawns six kinds of `claude -p` worker. Each is a separate
 subprocess; there is no in-session agent nesting.
 
-| Worker | Prompt source | Runs per task | Returns |
-|--------|---------------|---------------|---------|
-| `classifier` | `prompts/classifier.md` | 1 | category set + intent questions |
-| `planner` | `prompts/planner.md` | one per category (parallel) | subtask list with deps |
-| `implementer` | `prompts/implementer.md` | one per subtask (per wave, parallel) | commits on a `centella/<run-id>/<subtask-id>` branch |
-| `integrator` | `prompts/integrator.md` | on conflict during wave integration | resolved merge commit on `centella/<run-id>` |
-| `validator` | constant `VALIDATOR_SYSTEM` in `centella.py` (not a file) | once per wave | pass/fail on the run branch |
+| Worker | Prompt source | Default model | Runs per task | Returns |
+|--------|---------------|---------------|---------------|---------|
+| `classifier` | `prompts/classifier.md` | opus | 1 | category set + intent questions |
+| `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
+| `reconciler` | `prompts/reconciler.md` | opus | 0 or 1 (spawned only when planners' capability tags don't align) | renames / added_provides / added_subtasks / unresolvable |
+| `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `centella/<run-id>/<subtask-id>` branch |
+| `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `centella/<run-id>` |
+| `validator` | constant `VALIDATOR_SYSTEM` in `centella.py` (not a file) | opus | once per wave | pass/fail on the run branch |
+
+**Per-worker model defaults:** judgment workers (classifier, planner,
+reconciler, integrator, validator) default to Opus; only the implementer
+defaults to Sonnet — its job is concrete subtask execution where
+throughput matters more than broad-context judgment. To revert to the
+all-Sonnet pattern of earlier versions, set `CENTELLA_MODEL=sonnet` or
+pass `--model sonnet`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2
+*Model selection* for the full precedence table.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) §7 for the worker contract and
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §3 for the invocation
@@ -233,6 +243,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `orchestrator/centella.py` | The orchestrator — all phases, waves, caps, retries |
 | `prompts/classifier.md` | System prompt: classify task + surface intent questions |
 | `prompts/planner.md` | System prompt: decompose one category into a subtask plan |
+| `prompts/reconciler.md` | System prompt: reconcile cross-domain capability-tag drift between planner outputs |
 | `prompts/implementer.md` | System prompt: execute one subtask end to end |
 | `prompts/integrator.md` | System prompt: resolve merge conflicts behaviorally |
 | `scripts/setup-run.sh` | Create per-run branch + worktree (`centella/<run-id>`) |

@@ -22,6 +22,8 @@ centella/
 ├── prompts/
 │   ├── classifier.md              Phase 1 worker system prompt
 │   ├── planner.md                 Phase 2 worker system prompt
+│   ├── reconciler.md              Phase 2½ worker — resolve cross-domain
+│   │                              capability-tag drift between planners
 │   ├── implementer.md             Phase 5 implementer worker system prompt
 │   └── integrator.md              conflict-resolution worker system prompt
 │   (the validator's system prompt is the `VALIDATOR_SYSTEM` constant in
@@ -218,9 +220,28 @@ can dial up or down at resume time without editing state.
 
 Every worker shells out to `claude -p`. The model passed via `--model` to that
 subprocess is resolved per worker type, so the same run can use `opus` for
-heavy work and `haiku` for cheap work. Valid values: `sonnet` | `opus` |
-`haiku` (aliases — the `claude` CLI resolves them to the current model
-version). Default: `sonnet`.
+judgment work and `sonnet` for high-throughput implementation. Valid values:
+`sonnet` | `opus` | `haiku` (aliases — the `claude` CLI resolves them to the
+current model version).
+
+**Per-worker defaults: Opus for judgment, Sonnet for implementation.**
+Workers that exercise broad-context judgment (classify the task, decompose
+into subtasks, reconcile cross-domain coupling, resolve merge conflicts
+behaviorally, check criteria) default to Opus. The implementer — which
+executes a single concrete subtask end-to-end — defaults to Sonnet for
+throughput.
+
+| Worker      | Default | Why |
+|-------------|---------|-----|
+| classifier  | opus    | global judgment over the task description |
+| planner     | opus    | decomposition is the load-bearing judgment step |
+| reconciler  | opus    | cross-domain tag equivalence is judgment |
+| integrator  | opus    | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
+| validator   | opus    | per-criterion judgment in the LLM-fallback path; false-pass/false-fail is expensive |
+| implementer | sonnet  | concrete subtask execution; Sonnet's throughput is the right tradeoff |
+
+`MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
+overrides it for specific workers (only `implementer = sonnet` today).
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -230,15 +251,17 @@ Resolution order for each worker type `W` (highest priority first):
 4. **`CENTELLA_MODEL`** env var (sets the global default)
 5. **`model_<w>`** key in `centella.toml`
 6. **`model`** key in `centella.toml`
-7. **Default `sonnet`**.
+7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER` (only `implementer = sonnet` today)
+8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Five worker types, each independently overridable:
+Six worker types, each independently overridable:
 
 | Worker      | env var                       | CLI flag                | TOML key            |
 |-------------|-------------------------------|-------------------------|---------------------|
 | (global)    | `CENTELLA_MODEL`              | `--model`               | `model`             |
 | classifier  | `CENTELLA_MODEL_CLASSIFIER`   | `--model-classifier`    | `model_classifier`  |
 | planner     | `CENTELLA_MODEL_PLANNER`      | `--model-planner`       | `model_planner`     |
+| reconciler  | `CENTELLA_MODEL_RECONCILER`   | `--model-reconciler`    | `model_reconciler`  |
 | implementer | `CENTELLA_MODEL_IMPLEMENTER`  | `--model-implementer`   | `model_implementer` |
 | integrator  | `CENTELLA_MODEL_INTEGRATOR`   | `--model-integrator`    | `model_integrator`  |
 | validator   | `CENTELLA_MODEL_VALIDATOR`    | `--model-validator`     | `model_validator`   |
@@ -246,6 +269,11 @@ Five worker types, each independently overridable:
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=` and rejected with the standard
 argparse error.
+
+**Cost note:** Opus is materially more expensive than Sonnet. A user who
+wants the old all-Sonnet behavior sets `CENTELLA_MODEL=sonnet` (or
+`--model sonnet`). Per-worker overrides (`--model-planner sonnet`) let
+users selectively de-escalate individual workers.
 
 Models are not persisted in `.centella/state.json`. On `--resume`, models are
 re-resolved from the current environment, so changing `CENTELLA_MODEL` between
@@ -274,8 +302,8 @@ Each worker is one `claude -p` headless process. Flags used:
 | `-p` | non-interactive single-shot |
 | `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.centella/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
-| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/implementer/integrator, or the `VALIDATOR_SYSTEM` constant in `centella.py` for the validator |
-| `--allowedTools` | tool allowlist; three buckets — **read-only** (`READ_TOOLS`: Read/Grep/Glob/WebSearch/WebFetch) for classifier and planner; **acting** (`ACT_TOOLS`: read-set + Bash/Write/Edit) for implementer and integrator; **run-and-read** (`RUN_TOOLS`: read-set + Bash) for the validator — Bash to execute criteria, no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
+| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/implementer/integrator, or the `VALIDATOR_SYSTEM` constant in `centella.py` for the validator |
+| `--allowedTools` | tool allowlist; three buckets — **read-only** (`READ_TOOLS`: Read/Grep/Glob/WebSearch/WebFetch) for classifier, planner, and reconciler; **acting** (`ACT_TOOLS`: read-set + Bash/Write/Edit) for implementer and integrator; **run-and-read** (`RUN_TOOLS`: read-set + Bash) for the validator — Bash to execute criteria, no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
 | `--dangerously-skip-permissions` | acting *and* run-and-read workers (implementer, integrator, validator) — suppresses all permission prompts for unattended Bash and file writes |
@@ -294,8 +322,9 @@ quoted into the prompt; a second failure raises `WorkerError`.
 ("salvage if there is something to salvage; abort cleanly otherwise"):
 - **implementer** — `run_implementer()` catches it, converts to an
   `incomplete-handoff` result; a fresh implementer continues from the checkpoint.
-- **classifier, planner, integrator, validator** — not caught locally;
-  propagates to `main()`, which aborts with state saved for `--resume`.
+- **classifier, planner, reconciler, integrator, validator** — not caught
+  locally; propagates to `main()`, which aborts with state saved for
+  `--resume`.
 
 `claude_p()` logs a non-fatal warning when the envelope `terminal_reason` is not
 `"completed"` (e.g. `"max_turns"`).
@@ -312,6 +341,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 8-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
 | 0 Clarify | `gather_answers` | if questions and interactive: collect; non-interactive: write `pending-questions.json`, exit code 10; `--no-clarify` skips clarification entirely per DESIGN §11 — intent questions dropped, source-of-truth resolved from preference or defaulted to `codebase` with a warning |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `centella.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
+| 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5, §14). |
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
 | 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `centella/<run-id>` and its worktree (per-run, isolated from any other run) |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then re-validate. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume` |
@@ -362,6 +392,13 @@ The bootstrap directory `.centella/runs/_bootstrap-<6hex>/` is used until classi
 |-------|---------|
 | classifier-returned categories filtered against the 8-name whitelist `CATEGORIES` (mirrors DESIGN §4) | classifier hallucinating a category outside the eight |
 | `die()` if no category survives the filter | a run with no valid domain for any planner |
+
+### Phase 2½ checks — `phase_reconcile`
+| Check | Catches |
+|-------|---------|
+| reconciler's `unresolvable` array non-empty → `die()` with the worker's diagnosis | genuine gaps where no planner produced a needed capability and no plausible connector subtask can be inferred |
+| reconciler output validated against `SCHEMAS["reconciler"]` | malformed reconciler response (caught by `claude_p`'s schema gate; structurally invalid output is retried once, then escalated) |
+| after applying reconciler output, the unresolved-requires set is recomputed; non-empty → `die()` | the reconciler's renames/added_subtasks/added_provides didn't actually close every gap (e.g., a new subtask itself has unresolved `requires`) — fail-loud rather than progress to `validate_plan` with a still-broken graph |
 
 ### Plan validation — `validate_plan` (after scheduling, before persisting the plan)
 | Check | Catches |

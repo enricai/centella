@@ -79,6 +79,7 @@ Orchestrator (deterministic — owns all control flow, caps, state)
 │              ↓ derive the run identifier from category + task + start time
 ├─ Phase 0   Clarify — intent-only questions, only if needed
 ├─ Phase 2   Plan — one planner per matched category         → N workers (parallel)
+│              ↓ reconcile cross-domain capability tags       → 0 or 1 worker
 ├─ Phase 3   Schedule — merge plans, build global DAG, sort into waves
 ├─ Phase 4   Set up the run branch and worktree (per-run unique)
 ├─ Phase 5   For each wave, in sequence:
@@ -175,7 +176,7 @@ cross domains: a testing subtask may depend on the feature subtask it tests.
 That coupling has to be reconciled somewhere, and it cannot be reconciled
 inside a planner that cannot see the other planners.
 
-It is reconciled by the orchestrator, deterministically, with two mechanisms:
+It is reconciled by the orchestrator with three mechanisms:
 
 - **Intra-domain ordering** — within its own domain a planner declares which
   subtasks must precede which, because it owns and can see those subtasks.
@@ -184,6 +185,22 @@ It is reconciled by the orchestrator, deterministically, with two mechanisms:
   it *produces* and the capabilities it *requires*, as abstract tags. The
   orchestrator matches every "requires" against every domain's "provides" and
   adds a dependency edge from producer to consumer.
+- **Reconciler worker** — capability tags are a shared vocabulary with no
+  enforced dictionary. Two planners can name the same capability with
+  different words (`slm-capture-shim` vs. `capture-slm-call-implemented`),
+  and a literal-string match would miss the equivalence. After all planners
+  finish, the orchestrator computes the set of `requires` tags that no
+  `provides` claims, and if that set is non-empty, spawns a single
+  *reconciler* worker. The reconciler reads the full task plus every
+  subtask and emits one of four actions per unresolved tag: a *rename* (two
+  tags mean the same thing — rewrite one to match the other), an
+  *added provides* (an existing subtask actually produces the capability
+  but didn't declare it — add the tag), an *added subtask* (a genuine gap —
+  propose a new subtask to fill it), or *unresolvable* (no plausible
+  resolution — abort the run with the reconciler's diagnosis). All judgment
+  about tag equivalence lives in the reconciler worker; the orchestrator
+  computes the unresolved set mechanically and applies the worker's output
+  mechanically.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
@@ -191,9 +208,11 @@ independent and run in parallel; waves run in sequence. A dependency cycle is
 unsatisfiable and aborts the run rather than being silently broken.
 
 Cross-domain dependencies are reconciled by the orchestrator from capability
-tags and enforced as wave ordering. Planners can therefore run in parallel
-without coordination: the coupling between their outputs is recovered globally
-by the scheduler.
+tags (with the reconciler bridging vocabulary drift) and enforced as wave
+ordering. Planners can therefore run in parallel without coordination: the
+coupling between their outputs is recovered globally by the scheduler, and
+vocabulary mismatches that would have produced silent missing-edges are
+caught by the reconciler before they reach the scheduler.
 
 ### Why waves are sequential
 
@@ -814,10 +833,15 @@ what the architecture can guarantee.
   the confidence score to artifacts is a large improvement over a self-reported
   number, but a worker can still misjudge the strength of evidence it did
   gather.
-- **Cross-domain dependency detection depends on tag discipline.** The scheduler
-  wires cross-domain edges by matching capability tags. If two planners describe
-  the same capability with different words, a real dependency is silently
-  missed. The tags are a shared vocabulary with no enforced dictionary.
+- **Cross-domain dependency detection now goes through a reconciler worker.**
+  The scheduler wires cross-domain edges by matching capability tags. If two
+  planners describe the same capability with different words, the literal-
+  string match would miss the equivalence. A reconciler worker (DESIGN §5)
+  catches these mismatches before the scheduler runs: it proposes renames,
+  added `provides` declarations, or new connector subtasks. Genuinely
+  unresolvable gaps (no plausible match and no reasonable connector) abort
+  the run with the reconciler's diagnosis — fail-loud rather than the
+  silent-edge-drop the v1 design accepted.
 - **Headless usage is metered.** Subscription-based headless usage draws on a
   finite pool, and a large multi-wave run consumes a meaningful amount of it.
   Cost scales with worker count.
@@ -916,9 +940,10 @@ design:
 - **Subtask-level resume.** Resume is currently wave-granular: work done since
   the last fully-completed wave is re-run. Finer-grained resume would re-run
   less.
-- **A dependency-graph sanity pass.** A review step after scheduling that looks
-  for capability tags that *probably* should have matched but did not — a
-  mitigation for the tag-discipline limitation in §14.
+- ~~A dependency-graph sanity pass~~ — implemented as the reconciler worker
+  (DESIGN §5 and §14). After all planners finish, a reconciler worker
+  resolves vocabulary drift between domains' capability tags before the
+  scheduler builds its DAG.
 - **Per-domain implementer specialization.** One generic implementer serves all
   eight domains today. Eight domain-specialized implementers would allow richer
   per-domain guidance, at the cost of more to maintain.
