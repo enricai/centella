@@ -8,8 +8,7 @@ the regression ships unnoticed. That's exactly the shape of the P5-1
 bug — the documented `--resume --answers` flow was broken because
 nobody had pinned the `gather_answers` call to the resume path.
 
-Pattern mirrors `test_validator_tools.py::test_validate_wave_call_site_uses_run_tools`
-and `test_state_fields.py`'s code-vs-spec coupling.
+Pattern mirrors `test_state_fields.py`'s code-vs-spec coupling.
 """
 from __future__ import annotations
 

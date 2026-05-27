@@ -37,29 +37,25 @@ clarification answers, and this subtask's `success_criteria_seed`,
 
 ## The loop
 
-### 1. Define success criteria — then freeze them
+### 1. Write a success-criteria note (informational)
 
-Turn `success_criteria_seed` into a complete, concrete, checkable criteria set.
-Prefer **automated tests**; where a test is impossible, write a precise,
-observable, documented check. Cover both the **explicit success condition** and
-**regression guards** — adjacent behavior that must not change.
+Turn `success_criteria_seed` into a brief criteria file describing what
+success looks like for this subtask — the explicit success condition plus
+any regression guards (adjacent behavior that must not change) worth
+naming. Write it to `CENTELLA_DIR/criteria/<id>.md`.
 
-Write the criteria to `CENTELLA_DIR/criteria/<id>.md`. **Once you begin step 4,
-these criteria are frozen.** You may not rewrite the file yourself — the
-orchestrator hashes it and will reject your result if it changes. A
-self-revising checker lowers its own bar; that is the failure mode this rule
-prevents.
+The criteria file is **informational**, not a gate. The orchestrator does
+not check whether each criterion is satisfied; the §8 confidence
+self-gate on `root_cause` and `solution` is what determines whether the
+subtask is complete. Use the file as your own working memory and as
+context for the conformance phase (DESIGN §9) and for human reviewers.
 
-If you find strong evidence the criteria were genuinely wrong, return a
-`criteria_revision_proposal` object alongside your normal result:
-`{"proposed_text": "<full new criteria file body>", "evidence": "<why the
-current criteria are wrong, with file:line citations to real artifacts>"}`.
-The orchestrator will approve proposals that meet a structural minimum
-(non-empty fields; evidence cites at least one real path in the worktree) —
-writing the new criteria file and re-locking it — and reject the rest.
-Every decision is logged to `state.json["criteria_revisions"]`. If your
-result was `failed` and the proposal is approved, you get one retry against
-the new criteria.
+You may update the file freely as your understanding evolves — there is
+no lock and no proposal channel. If the seed turns out to be wrong,
+just rewrite the file. The discipline that prevents a stuck model from
+lowering its own bar is the §8 evidence-anchored confidence gate
+(falsification + reconciliation + gap-surfacing), not a hash on this
+file.
 
 ### 2. Investigate and plan
 
@@ -167,13 +163,18 @@ and the subtask's `investigation_notes`. Commit your work to the branch with a
 clear message. Commit only code and project files — never the `.centella/`
 directory.
 
-### 5. Validate against the frozen criteria
+### 5. Self-check against your criteria (informational)
 
-Run every criterion. Tests must actually execute and pass; documented checks
-must be verified observably. **100% of criteria must be met.** If any fail,
-return to step 4 and fix the implementation — not the criteria — for at most
-**5 iterations**. If you hit the cap with criteria still unmet, return status
-`failed` with a precise diagnosis.
+Walk your criteria file and record what you observed for each item in
+`criteria_results` (criterion text, `met: true|false`, brief evidence).
+This is for telemetry and conformance-phase context only — the
+orchestrator does not gate on it. Whether the subtask is complete is
+determined by your §8 confidence gate: `root_cause` and `solution`
+both ≥ 9.0 with real falsifier evidence behind each. Best-effort
+signals like "tests pass" or "lint clean" belong in conformance-phase
+warnings, not as gates here. If your work landed and your confidence
+is anchored, return `complete` even with a few `met: false` items —
+they will surface as warnings on the result.
 
 ### 6. Suspending across a worker boundary
 
@@ -282,12 +283,14 @@ Return **only** this JSON object as your final message — no prose, no fences:
   "checkpoint_path": null,
   "blocker": null,
   "summary": "What changed and how it was verified, in two or three sentences.",
-  "clarification_question": null,
-  "criteria_revision_proposal": null
+  "clarification_question": null
 }
 ```
 
-- `complete` requires every criterion met with evidence.
+- `complete` means your §8 confidence gate cleared: both `root_cause`
+  and `solution` ≥ 9.0 with falsifier evidence. `criteria_results` is
+  recorded but not gating — `met: false` entries become warnings, not
+  failures.
 - `incomplete-handoff` requires `checkpoint_path` set.
 - `blocked` requires `blocker` set with the precise missing evidence/input.
 - `failed` requires a diagnosis in `summary`.

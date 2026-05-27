@@ -12,8 +12,8 @@ Per-worker precedence (highest first):
 
 The judgment-vs-implementation default split was introduced when the
 reconciler worker landed: classifier / planner / reconciler / integrator
-/ validator all default to opus, implementer defaults to sonnet (cost
-mitigation for the worker that runs most often).
+all default to opus, implementer / conformer default to sonnet (cost
+mitigation for workers that run most often).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import pytest
 
 
 WORKERS = ("classifier", "planner", "reconciler", "implementer",
-           "integrator", "validator", "conformer")
+           "integrator", "conformer")
 
 # The expected default per worker, with no overrides.
 DEFAULTS = {
@@ -31,7 +31,6 @@ DEFAULTS = {
     "planner":    "opus",
     "reconciler": "opus",
     "integrator": "opus",
-    "validator":  "opus",
     "implementer": "sonnet",
     "conformer":  "sonnet",
 }
@@ -96,11 +95,11 @@ def test_global_toml_applies_to_every_worker(centella, repo_root):
 
 def test_per_worker_toml_overrides_global_toml(centella, repo_root):
     (repo_root / "centella.toml").write_text(
-        "model = opus\nmodel_validator = haiku\n")
+        "model = opus\nmodel_integrator = haiku\n")
     models = centella.resolve_models(repo_root, ns())
-    assert models["validator"] == "haiku"
+    assert models["integrator"] == "haiku"
     for w in WORKERS:
-        if w != "validator":
+        if w != "integrator":
             assert models[w] == "opus"
 
 

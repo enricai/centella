@@ -1,103 +1,64 @@
 """Tests for validate_result() — cross-field invariant checks on
 worker results.
 
-Returns an error string when the result is self-contradictory, None
-when the result is consistent. Tests cover each status enum branch
-plus the criteria-file existence side-check.
+Returns an error string when the result is missing a required
+mechanical-precondition field for its status branch, None otherwise.
+Per DESIGN §8 the criteria file is informational and the
+`complete` branch no longer gates on `criteria_results` shape or
+content — those tests cover that loosening.
 """
 from __future__ import annotations
 
 
 # --- complete status -------------------------------------------------------
+# Per DESIGN §8 the §8 confidence gate is the only load-bearing signal;
+# the criteria file is informational (DESIGN §9). `complete` is accepted
+# regardless of what `criteria_results` carries.
 
-def test_complete_with_empty_criteria_results_returns_error(centella):
-    err = centella.validate_result({"status": "complete", "criteria_results": []})
-    assert err is not None
-    assert "criteria_results is empty" in err
-
-
-def test_complete_with_missing_criteria_results_returns_error(centella):
-    err = centella.validate_result({"status": "complete"})
-    assert err is not None
-    assert "criteria_results is empty" in err
+def test_complete_with_empty_criteria_results_returns_none(centella):
+    """Empty criteria_results no longer rejects `complete`."""
+    assert centella.validate_result(
+        {"status": "complete", "criteria_results": []}) is None
 
 
-def test_complete_with_all_met_criteria_returns_none(centella, tmp_path):
-    """When criteria_results show every criterion met, and no centella_dir
-    is passed, validate_result returns None."""
-    result = {
+def test_complete_with_missing_criteria_results_returns_none(centella):
+    """Missing criteria_results no longer rejects `complete`."""
+    assert centella.validate_result({"status": "complete"}) is None
+
+
+def test_complete_with_all_met_criteria_returns_none(centella):
+    assert centella.validate_result({
         "status": "complete",
         "criteria_results": [
             {"criterion": "tests pass", "met": True, "evidence": "ran them"},
             {"criterion": "no regressions", "met": True, "evidence": "verified"},
         ],
-    }
-    assert centella.validate_result(result) is None
+    }) is None
 
 
-def test_complete_with_one_failing_criterion_returns_error(centella):
-    result = {
+def test_complete_with_failing_criteria_returns_none(centella):
+    """`met:false` entries are recorded as warnings but do not reject
+    `complete` (DESIGN §8 — confidence gate is the only load-bearing
+    signal)."""
+    assert centella.validate_result({
         "status": "complete",
         "criteria_results": [
             {"criterion": "tests pass", "met": True, "evidence": "ok"},
             {"criterion": "no regressions", "met": False, "evidence": "broke X"},
         ],
-    }
-    err = centella.validate_result(result)
-    assert err is not None
-    assert "1 criterion/criteria unmet" in err
-    assert "no regressions" in err
+    }) is None
 
 
-def test_complete_with_many_failing_truncates_sample(centella):
-    """When more than 3 criteria fail, the error names only the first 3."""
-    result = {
-        "status": "complete",
-        "criteria_results": [
-            {"criterion": f"crit-{i}", "met": False} for i in range(5)
-        ],
-    }
-    err = centella.validate_result(result)
-    assert err is not None
-    assert "5 criterion/criteria unmet" in err
-    assert "…" in err  # truncation indicator
-
-
-def test_complete_missing_met_field_treated_as_failing(centella):
-    """A criteria_results entry without an explicit met field is treated
-    as not-met (criteria must affirmatively report success)."""
-    result = {
-        "status": "complete",
-        "criteria_results": [{"criterion": "vague"}],  # no 'met' key
-    }
-    err = centella.validate_result(result)
-    assert err is not None
-    assert "criterion/criteria unmet" in err
-
-
-def test_complete_missing_criteria_file_returns_error(centella, tmp_path):
-    """When centella_dir is passed but the criteria file is absent,
-    validate_result rejects (catches fabricated criteria_results)."""
+def test_complete_missing_criteria_file_returns_none(centella, tmp_path):
+    """`centella_dir` is accepted for backwards compatibility but no
+    longer consulted — a missing criteria file does not reject
+    `complete`."""
     (tmp_path / "criteria").mkdir()
-    result = {
+    assert centella.validate_result({
         "status": "complete",
         "subtask_id": "feat-001",
         "criteria_results": [{"criterion": "x", "met": True}],
-    }
-    err = centella.validate_result(result, centella_dir=tmp_path)
-    assert err is not None
-    assert "criteria file does not exist" in err
-
-
-def test_complete_with_criteria_file_present_returns_none(centella, tmp_path):
-    (tmp_path / "criteria").mkdir()
-    (tmp_path / "criteria" / "feat-001.md").write_text("the criteria\n")
-    result = {
-        "status": "complete",
-        "subtask_id": "feat-001",
-        "criteria_results": [{"criterion": "x", "met": True}],
-    }
-    assert centella.validate_result(result, centella_dir=tmp_path) is None
+    }, centella_dir=tmp_path) is None
 
 
 # --- incomplete-handoff status ---------------------------------------------

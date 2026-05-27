@@ -81,7 +81,6 @@ DEFAULT_CAPS = {
     # Exhausting this cap is a *warning*, not a failure — the phase is
     # advisory and never produces a `failed` / `blocked` subtask status.
     "conformance_rounds": 2,
-    "wave_revalidation_rounds": 5,  # staging re-validation attempts per wave
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
     # Worker-internal evidence-gate iterations for planner and implementer
     # (DESIGN §8 + §13). User-tunable via --confidence-rounds /
@@ -152,10 +151,6 @@ INSPECT_TOOLS = (
     "Bash(git status),Bash(git branch:*),Bash(git ls-files:*)"
 )
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
-# RUN_TOOLS adds Bash to the read set so the validator can execute criteria
-# (pytest, shell checks) without gaining Write/Edit. Mechanical enforcement of
-# VALIDATOR_SYSTEM's "you do not modify code" rule, per DESIGN §12.
-RUN_TOOLS = f"{_READ_BASE},Bash"
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
 # workers (classifier, planner, reconciler) read access to via the
@@ -243,7 +238,7 @@ MODEL_DEFAULT_PER_WORKER = {
 MODEL_ENV = "CENTELLA_MODEL"
 MODEL_FILE = "centella.toml"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "implementer",
-                "integrator", "validator", "conformer")
+                "integrator", "conformer")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -294,30 +289,14 @@ HEAL_MAX_ROUNDS_FILE = "centella.toml"
 HEAL_SUCCESS_THRESHOLD_FILE = "centella.toml"
 
 
-VALIDATOR_SYSTEM = (
-    "You verify whether an integrated set of changes satisfies a list of "
-    "frozen success-criteria files. You run the criteria — execute the tests "
-    "they describe, perform the documented checks — against the current "
-    "working directory. You do not modify code. Your final result is delivered "
-    "as structured output conforming to the JSON schema you were given: for "
-    "each subtask, its id, whether all its criteria were met, and a list of "
-    "any failing criteria with the reason each failed."
-)
-
-# Stable location hint for the validator's embedded constant — referenced by
-# resolve_prompt() so the heal loop can describe a patch in anchor-replacement
-# form without special-casing the constant/file asymmetry.
-_VALIDATOR_LOCATION_HINT = "orchestrator/centella.py:VALIDATOR_SYSTEM"
 
 
 def resolve_prompt(call_type: str) -> tuple[str, str, str]:
     """Return (source_kind, content, location_hint) for a worker call_type.
 
-    source_kind is 'file' for the five file-backed workers and 'constant'
-    for the validator. location_hint is a stable pointer the heal loop uses
-    to describe where to apply a patch — either a relative path like
-    'prompts/classifier.md' or the literal
-    'orchestrator/centella.py:VALIDATOR_SYSTEM'.
+    source_kind is always 'file' — every worker's system prompt lives at
+    `prompts/<call_type>.md`. location_hint is the stable relative path the
+    heal loop uses to describe where to apply a patch.
 
     Raises ValueError for an unknown call_type.
     """
@@ -325,8 +304,6 @@ def resolve_prompt(call_type: str) -> tuple[str, str, str]:
         raise ValueError(
             f"unknown call_type {call_type!r}; valid types: {WORKER_TYPES}"
         )
-    if call_type == "validator":
-        return ("constant", VALIDATOR_SYSTEM, _VALIDATOR_LOCATION_HINT)
     hint = f"prompts/{call_type}.md"
     content = (PROMPTS / f"{call_type}.md").read_text()
     return ("file", content, hint)
@@ -608,19 +585,6 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "required": ["id", "question", "why_underivable"],
             },
-            # DESIGN §9: proposal-only revision channel. An implementer
-            # that believes its criteria are wrong submits a proposal here;
-            # the orchestrator (not the implementer) decides whether to
-            # apply it. See _proposal_structurally_valid /
-            # apply_criteria_revision / record_criteria_revision below.
-            "criteria_revision_proposal": {
-                "type": ["object", "null"],
-                "properties": {
-                    "proposed_text": {"type": "string"},
-                    "evidence": {"type": "string"},
-                },
-                "required": ["proposed_text", "evidence"],
-            },
         },
     },
     "integrator": {
@@ -634,24 +598,6 @@ SCHEMAS: dict[str, dict] = {
             },
             "resolution_summary": {"type": "string"},
             "diagnosis": {"type": ["string", "null"]},
-        },
-    },
-    "validator": {
-        "type": "object",
-        "required": ["results"],
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["subtask_id", "all_criteria_met"],
-                    "properties": {
-                        "subtask_id": {"type": "string"},
-                        "all_criteria_met": {"type": "boolean"},
-                        "failing": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
         },
     },
     "judge": {
@@ -2074,125 +2020,6 @@ def detect_test_runner() -> list[str] | None:
     return None
 
 
-# --- criteria locking --------------------------------------------------------
-
-def _hash_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-
-def lock_criteria(sid: str, centella_dir: Path, st: State) -> None:
-    """Hash the criteria file and store it — called after first write.
-    Idempotent: does nothing if no file exists or a lock is already stored."""
-    path = centella_dir / "criteria" / f"{sid}.md"
-    if not path.exists():
-        return
-    locks = st.data.setdefault("criteria_locks", {})
-    if sid not in locks:
-        locks[sid] = _hash_file(path)
-        st.save()
-
-
-def verify_criteria_lock(sid: str, centella_dir: Path, st: State) -> None:
-    """Raise WorkerError if the criteria file changed after locking.
-    A changed hash means the implementer silently lowered its own bar."""
-    path = centella_dir / "criteria" / f"{sid}.md"
-    locks = st.data.get("criteria_locks", {})
-    if sid not in locks or not path.exists():
-        return
-    current = _hash_file(path)
-    if current != locks[sid]:
-        raise WorkerError(
-            f"{sid}: criteria file was modified after being locked "
-            f"(stored={locks[sid][:8]}, current={current[:8]}). "
-            "Implementer may have lowered its own bar — escalating.")
-
-
-# --- proposal-only criteria revision (DESIGN §9) -----------------------------
-# The implementer cannot apply its own revision — the lock prevents it.
-# Instead it returns a `criteria_revision_proposal` and the orchestrator
-# decides. The decision is a structural-minimum check: code can verify a
-# proposal is well-formed and points at real artifacts, but cannot judge
-# its semantic merit (per DESIGN §12 — orchestrator does only what can be
-# checked mechanically). Every proposal, approved or rejected, is logged.
-
-def _proposal_structurally_valid(proposal: dict, worktree: str) -> str | None:
-    """Return None if the proposal passes the structural minimum, else an
-    error string. The minimum: both fields non-empty after strip, and the
-    evidence references at least one path that actually exists in the
-    worktree (file:line citations, test names that map to a real file).
-    Cannot judge the proposal's semantic merit — see module-level comment."""
-    proposed_text = (proposal.get("proposed_text") or "").strip()
-    if not proposed_text:
-        return "proposed_text is empty"
-    evidence = (proposal.get("evidence") or "").strip()
-    if not evidence:
-        return "evidence is empty"
-    # The evidence must reference at least one real artifact in the worktree.
-    # Scan tokens that look like paths (contain "/") or look like file:line
-    # citations, and require at least one to resolve to an existing path.
-    candidates: list[str] = []
-    for tok in evidence.replace(",", " ").split():
-        # strip common surrounding punctuation
-        cleaned = tok.strip("`'\"()[]{}.,;:")
-        if not cleaned:
-            continue
-        # file:line → take the file part
-        if ":" in cleaned:
-            cleaned = cleaned.split(":", 1)[0]
-        if "/" in cleaned or cleaned.endswith((".py", ".md", ".sh",
-                                                ".js", ".ts", ".go",
-                                                ".rs", ".java", ".rb",
-                                                ".cpp", ".c", ".h",
-                                                ".json", ".yaml", ".yml",
-                                                ".toml")):
-            candidates.append(cleaned)
-    wt = Path(worktree)
-    for c in candidates:
-        # try both absolute and relative-to-worktree
-        if Path(c).exists() or (wt / c).exists():
-            return None
-    return ("evidence cites no path that exists in the worktree — "
-            f"checked candidates: {candidates[:5] or '(none found)'}")
-
-
-def record_criteria_revision(sid: str, st: State, evidence: str, status: str,
-                              old_hash: str | None, new_hash: str | None,
-                              rejection_reason: str | None = None) -> None:
-    """Append one entry to state.data['criteria_revisions']. Append-only;
-    every proposal (approved or rejected) is logged for audit per DESIGN §9
-    'every approved revision is logged with its justification' — extended to
-    also log rejections so a reader can see what was tried."""
-    entry = {
-        "sid": sid, "timestamp": now(), "status": status,
-        "evidence": evidence,
-    }
-    if old_hash is not None:
-        entry["old_hash"] = old_hash
-    if new_hash is not None:
-        entry["new_hash"] = new_hash
-    if rejection_reason is not None:
-        entry["rejection_reason"] = rejection_reason
-    st.data.setdefault("criteria_revisions", []).append(entry)
-    st.save()
-
-
-def apply_criteria_revision(sid: str, centella_dir: Path, st: State,
-                             proposed_text: str) -> tuple[str, str]:
-    """Write the new criteria file and update the lock hash to match.
-    Returns (old_hash, new_hash). Caller must have already validated the
-    proposal — this function does not re-check; it just commits the change."""
-    path = centella_dir / "criteria" / f"{sid}.md"
-    old_hash = _hash_file(path) if path.exists() else ""
-    path.write_text(proposed_text)
-    new_hash = _hash_file(path)
-    # Update the lock to the new hash so verify_criteria_lock does not fire
-    # on the next loop. Without this the orchestrator would immediately
-    # reject the file *it just wrote*.
-    st.data.setdefault("criteria_locks", {})[sid] = new_hash
-    st.save()
-    return old_hash, new_hash
-
-
 # --- checkpoint validation ---------------------------------------------------
 
 _CHECKPOINT_SECTIONS = [
@@ -2354,30 +2181,22 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
 def validate_result(result: dict,
                     centella_dir: Path | None = None) -> str | None:
     """Cross-field invariant checks that JSON Schema cannot express.
-    Returns an error string if the result is self-contradictory, None if ok."""
+    Returns an error string if the result is self-contradictory, None if ok.
+
+    Per DESIGN §8, the §8 confidence gate is the only load-bearing
+    discipline; the criteria file is informational (DESIGN §9). A
+    `complete` status is accepted regardless of what `criteria_results`
+    carries — empty, missing, or with `met:false` entries are all
+    valid. The unmet entries are recorded on the result for telemetry
+    and surface as conformance warnings, but do not affect terminal
+    status. The other branches (handoff, blocked, failed, clarification)
+    still enforce the mechanical-precondition fields their next-step
+    consumers require.
+
+    `centella_dir` is accepted for backwards compatibility with callers
+    that still pass it; it is no longer consulted."""
     status = result.get("status")
-    if status == "complete":
-        cr = result.get("criteria_results") or []
-        if not cr:
-            return ("status='complete' but criteria_results is empty — "
-                    "no verification evidence provided")
-        failing = [c.get("criterion", "?") for c in cr
-                   if not c.get("met", False)]
-        if failing:
-            n = len(failing)
-            sample = failing[:3]
-            return (f"status='complete' but {n} criterion/criteria unmet: "
-                    f"{sample}{'…' if n > 3 else ''}")
-        # criteria file must exist — a missing file means criteria_results
-        # was fabricated without ever writing the lock-able file
-        if centella_dir is not None:
-            sid = result.get("subtask_id")
-            if sid:
-                cf = centella_dir / "criteria" / f"{sid}.md"
-                if not cf.exists():
-                    return (f"status='complete' but criteria file does not exist: "
-                            f"{cf} — criteria_results may have been fabricated")
-    elif status == "incomplete-handoff":
+    if status == "incomplete-handoff":
         cp = result.get("checkpoint_path")
         if not cp:
             return "status='incomplete-handoff' but checkpoint_path is null"
@@ -2559,21 +2378,6 @@ async def scan_conflict_markers(staging: Path) -> str | None:
         tail = "…" if len(files) > 5 else ""
         return (f"conflict markers in {len(files)} file(s) after integration: "
                 f"{sample}{tail}")
-    return None
-
-
-# --- pre-validator criteria existence check ----------------------------------
-
-def check_criteria_files_exist(wave: list[str],
-                                centella_dir: Path) -> str | None:
-    """Return error if any subtask in the wave is missing its criteria file.
-    A missing file means validation would fail with no useful diagnosis —
-    catch it before spending a worker invocation."""
-    missing = [sid for sid in wave
-               if not (centella_dir / "criteria" / f"{sid}.md").exists()]
-    if missing:
-        return (f"criteria files missing for: {', '.join(missing)} — "
-                "validation cannot proceed without them")
     return None
 
 
@@ -2995,7 +2799,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 
     `sid` is the worker identifier used in inline log tags and the
     per-worker log filename (e.g. `bugfix-001`, `classifier`,
-    `planner-bug-fixing`, `integrator-feat-001`, `validator-wave-2`).
+    `planner-bug-fixing`, `integrator-feat-001`, `conformer-feat-003`).
 
     `add_dirs` are extra paths forwarded to the CLI as `--add-dir` entries.
     Used by the inspect bucket (classifier, planner, reconciler) so the
@@ -3314,7 +3118,7 @@ async def judge_capture(record: dict, models: dict[str, str],
         "Judge this call on the three dimensions and return your verdict."
     )
     # Judge workers are stateless observers — read-only tools only.
-    model = models.get("judge", models.get("validator", MODEL_DEFAULT))
+    model = models.get("judge", MODEL_DEFAULT)
     st.bump_workers(caps)
     return await claude_p(
         user_prompt=user_prompt,
@@ -4818,9 +4622,9 @@ async def run_conformer(sid: str, centella_dir: Path, worktree: str,
     ) or "(none)"
     up = [f"Run the post-work conformance phase for subtask `{sid}`.",
           f"CENTELLA_DIR is {centella_dir} (absolute). Your subtask spec "
-          f"is at {centella_dir}/subtasks/{sid}.json and the FROZEN "
-          f"criteria are at {centella_dir}/criteria/{sid}.md — both "
-          "read-only.",
+          f"is at {centella_dir}/subtasks/{sid}.json and the implementer's "
+          f"success-criteria notes are at {centella_dir}/criteria/{sid}.md "
+          "— both read-only inputs.",
           "Your current working directory IS the subtask's worktree. Make "
           "and commit any fixes here. Every commit subject must start "
           "with `conformer:`.",
@@ -4930,22 +4734,6 @@ async def _run_conformance_phase(sid: str, centella_dir: Path,
                             f"violation reverted ({scope_err})")
             break
 
-        # Criteria lock invariance — the conformer is forbidden from
-        # touching the criteria file. Roll back if it did.
-        try:
-            verify_criteria_lock(sid, centella_dir, st)
-        except WorkerError as e:
-            discarded = await _uncommitted_paths(worktree)
-            if discarded:
-                warnings.append(
-                    f"conformer round {c_round}: discarding "
-                    f"{len(discarded)} uncommitted file(s) during rollback: "
-                    f"{[line[3:] for line in discarded]}")
-            await rollback_conformer_commits(worktree, before_sha)
-            warnings.append(f"conformer round {c_round}: criteria lock "
-                            f"violated; commits reverted ({e})")
-            break
-
         # Dirty-worktree check: the conformer should commit, not leave
         # uncommitted changes that integration would lose.
         dirty = await _uncommitted_paths(worktree)
@@ -4987,7 +4775,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
     result."""
     continuations = 0
     retries = 0
-    revision_retries = 0   # DESIGN §9: at most one revision-driven retry per subtask
     note = ""
     continuation = False
     worktree = str(centella_dir / "worktrees" / sid)
@@ -5002,7 +4789,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
         res = {"subtask_id": sid, "status": "failed", "summary": reason}
         st.data.setdefault("subtask_status", {})[sid] = "failed"
         st.save()
-        lock_criteria(sid, centella_dir, st)
         if not _retryable_failure(reason):
             log(f"  {sid}: non-retryable failure — terminating: {reason}")
             return res
@@ -5015,14 +4801,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
         return None
 
     while True:
-        # Before re-invoking the implementer (whether this is a corrective
-        # retry or a subtask continuation — handoff or clarification),
-        # verify the criteria file has not
-        # been altered since it was locked. A retried implementer is a stuck
-        # model — exactly the case the lock guards against. No-op on the first
-        # iteration, when no lock exists yet.
-        verify_criteria_lock(sid, centella_dir, st)
-
         res = await run_implementer(sid, centella_dir, caps, st, models,
                                     continuation=continuation, note=note)
 
@@ -5040,35 +4818,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
         status = res.get("status")
         st.data.setdefault("subtask_status", {})[sid] = status
         st.save()
-
-        # DESIGN §9: proposal-only criteria revision. If the implementer
-        # included a proposal alongside its result, the orchestrator decides
-        # whether to apply it (structural-minimum check) and logs every
-        # decision. Approved proposals overwrite the criteria file and the
-        # lock; if the implementer originally returned `failed` against the
-        # old criteria, it gets one retry against the new ones.
-        proposal = res.get("criteria_revision_proposal")
-        if proposal:
-            err = _proposal_structurally_valid(proposal, worktree)
-            if err:
-                record_criteria_revision(sid, st, proposal.get("evidence", ""),
-                                         "rejected", None, None,
-                                         rejection_reason=err)
-                log(f"  {sid}: criteria revision rejected: {err}")
-            else:
-                old_hash, new_hash = apply_criteria_revision(
-                    sid, centella_dir, st, proposal["proposed_text"])
-                record_criteria_revision(sid, st, proposal["evidence"],
-                                         "approved", old_hash, new_hash)
-                log(f"  {sid}: criteria revision approved "
-                    f"(old={old_hash[:8] or '(new file)'}, new={new_hash[:8]})")
-                if status == "failed" and revision_retries == 0:
-                    revision_retries += 1
-                    log(f"  {sid}: retrying once against revised criteria")
-                    continuation = False
-                    note = ("Criteria were revised based on your proposal — "
-                            "retry against the new criteria.")
-                    continue
 
         if status == "complete":
             # a 'complete' claim with no commits is a retryable mistake —
@@ -5092,7 +4841,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
                 if done is not None:
                     return done
                 continue
-            lock_criteria(sid, centella_dir, st)
             # protected-path violation — the worker wrote to .git/ etc.: it is
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
             scope_err = await check_diff_scope(sid, worktree, subtask, st)
@@ -5152,7 +4900,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": f"checkpoint invalid: {cp_err}",
                         "summary": cp_err}
-            lock_criteria(sid, centella_dir, st)
             continuations += 1
             if continuations > caps["subtask_continuations"]:
                 return {"subtask_id": sid, "status": "blocked",
@@ -5179,7 +4926,6 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": f"checkpoint invalid: {cp_err}",
                         "summary": cp_err}
-            lock_criteria(sid, centella_dir, st)
             continuations += 1
             if continuations > caps["subtask_continuations"]:
                 return {"subtask_id": sid, "status": "blocked",
@@ -5312,55 +5058,6 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     return integrated
 
 
-async def validate_wave(wave: list[str], centella_dir: Path, caps: dict,
-                        st: State, models: dict[str, str],
-                        wave_idx: int) -> dict:
-    """Re-run every wave subtask's frozen criteria against integrated staging.
-    Tries the deterministic test runner first; falls back to LLM only on
-    failure or when no runner was detected. `wave_idx` is the 0-based
-    index used in the worker's log file name (`validator-wave-N`)."""
-    staging = (centella_dir / "worktrees" / "staging").resolve()
-
-    # criteria files must exist before we spend any validation workers
-    missing_err = check_criteria_files_exist(wave, centella_dir)
-    if missing_err:
-        die(f"pre-validation check failed: {missing_err}")
-
-    # fast path: deterministic test suite — no worker invocation, no quota
-    runner = st.data.get("test_runner")
-    if runner:
-        log(f"  running deterministic test suite: {' '.join(runner)}")
-        try:
-            r = await run_proc(runner, cwd=str(staging), timeout=600)
-        except subprocess.TimeoutExpired:
-            log("  deterministic test suite exceeded 600s — "
-                "falling through to LLM validator for diagnosis")
-        else:
-            if r.returncode == 0:
-                log("  staging tests pass — skipping LLM validator")
-                return {"results": [
-                    {"subtask_id": sid, "all_criteria_met": True, "failing": []}
-                    for sid in wave
-                ]}
-            log(f"  tests failed (exit {r.returncode}) — "
-                "falling through to LLM validator for diagnosis")
-
-    # LLM validator: runs criteria that aren't captured by the test suite,
-    # or diagnoses why the test suite failed
-    criteria = [f"{centella_dir}/criteria/{sid}.md" for sid in wave]
-    up = ("Verify the current working directory against these frozen "
-          "success-criteria files. Run every criterion.\n" +
-          "\n".join(f"- subtask {sid}: {path}"
-                    for sid, path in zip(wave, criteria)))
-    st.bump_workers(caps)
-    return await claude_p(user_prompt=up, system_prompt=VALIDATOR_SYSTEM,
-                          schema_key="validator", cwd=str(staging),
-                          allowed_tools=RUN_TOOLS, max_turns=40,
-                          autonomous=True, caps=caps, st=st,
-                          model=models["validator"],
-                          sid=f"validator-wave-{wave_idx + 1}")
-
-
 async def phase_execute(centella_dir: Path, st: State, caps: dict,
                         models: dict[str, str]) -> None:
     """Phases 4-5: create staging, then run waves sequentially; within a wave,
@@ -5398,30 +5095,16 @@ async def phase_execute(centella_dir: Path, st: State, caps: dict,
 
         await integrate_wave(wave, results, centella_dir, caps, st, models)
 
-        # deterministic: scan staging for unresolved conflict markers before
-        # spending any validation workers — a marker means integration is broken
+        # Deterministic post-integration safety net: an unresolved
+        # conflict marker means integration broke the tree. Per-subtask
+        # quality is the implementer's §8 confidence gate — there is no
+        # LLM wave-level re-validation (see DESIGN §8, §9).
         staging_path = centella_dir / "worktrees" / "staging"
         marker_err = await scan_conflict_markers(staging_path)
         if marker_err:
             die(f"wave {wi + 1}: {marker_err}\n"
                 f"Resolve manually in {staging_path}, commit, "
                 "then re-run with --resume.")
-
-        # re-validate integrated staging; re-spawn failing implementers
-        for attempt in range(caps["wave_revalidation_rounds"]):
-            v = await validate_wave(wave, centella_dir, caps, st, models, wi)
-            failing = [r["subtask_id"] for r in v.get("results", [])
-                       if not r.get("all_criteria_met", False)]
-            if not failing:
-                break
-            log(f"  staging re-validation failed for: {', '.join(failing)} "
-                f"(round {attempt + 1})")
-            if attempt == caps["wave_revalidation_rounds"] - 1:
-                die(f"wave {wi + 1} fails staging validation after "
-                    f"{caps['wave_revalidation_rounds']} rounds: {failing}")
-            for sid in failing:
-                await settle_subtask(sid, centella_dir, caps, st, models)
-                await run_script("integrate.sh", sid, st.run_id)   # re-merge the delta
 
         st.data["completed_waves"] = wi + 1
         st.save()

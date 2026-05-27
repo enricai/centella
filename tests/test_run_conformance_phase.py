@@ -76,14 +76,10 @@ def env(centella, tmp_path):
     subtask = {"id": sid, "files_likely_touched": ["src.py"]}
     (run_dir / "subtasks" / f"{sid}.json").write_text(json.dumps(subtask))
 
-    # Build a real State and lock the criteria so verify_criteria_lock
-    # exercises real code paths.
     State = centella.State
     st = State(centella_root, run_id)
-    st.data = {"task": "x", "answers": {"source_of_truth": "codebase"},
-               "criteria_locks": {}}
+    st.data = {"task": "x", "answers": {"source_of_truth": "codebase"}}
     st.save()
-    centella.lock_criteria(sid, run_dir, st)
 
     caps = dict(centella.DEFAULT_CAPS)
     models = {w: "sonnet" for w in centella.WORKER_TYPES}
@@ -211,45 +207,6 @@ def test_protected_path_commit_is_rolled_back(env):
     assert head_after == head_before, "rollback didn't reset HEAD"
     assert any("protected-path" in w for w in warnings)
     assert state["i"] == 1  # loop broke after rollback
-
-
-# --- criteria lock: conformer touching the criteria file is rolled back ---
-
-def test_criteria_lock_violation_is_rolled_back(env):
-    c = env["centella"]
-
-    def _touch_criteria(wt: Path):
-        """Simulate a conformer that modified the criteria file inside
-        the centella dir. The lock comparison happens against the
-        centella_dir-resident criteria file, so we mutate it directly."""
-        # The criteria file is in run_dir, not in the worktree — but the
-        # conformer is forbidden from touching it. Simulate the violation
-        # by mutating it externally, then committing some innocuous
-        # change in the worktree so there *is* something to roll back.
-        (env["run_dir"] / "criteria" / f"{env['sid']}.md").write_text(
-            "# Criteria\n- LOWERED BAR\n")
-        (wt / "docs.txt").write_text("doc\n")
-        _run(["git", "add", "-A"], cwd=wt)
-        _run(["git", "commit", "-q", "-m",
-              "conformer: lowered the bar"], cwd=wt)
-
-    state = _stub_run_conformer(c, [_clean_result()],
-                                commits={0: _touch_criteria})
-    head_before = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=env["worktree"],
-        capture_output=True, text=True).stdout.strip()
-
-    res, warnings = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
-
-    head_after = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=env["worktree"],
-        capture_output=True, text=True).stdout.strip()
-    assert head_after == head_before, \
-        "criteria-lock violation should roll back conformer commits"
-    assert any("criteria lock" in w for w in warnings)
-    assert state["i"] == 1
 
 
 # --- rounds cap is respected ----------------------------------------------
