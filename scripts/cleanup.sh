@@ -73,22 +73,17 @@ clean_one_run() {
                  "refs/heads/centella/subtasks/${run_id}/"); do
         git branch -D "$b" 2>/dev/null || true
       done
-      echo "cleanup: removed worktrees + branches for run ${run_id} "\
-"(state dir kept as audit trail at ${run_dir}; rm -rf manually if no longer needed)"
+      echo "cleanup: removed worktrees + branches for run ${run_id} (state dir kept as audit trail at ${run_dir}; rm -rf manually if no longer needed)"
       ;;
     2)  # --subtask-branches: delete subtask branches only
       for b in $(git for-each-ref --format='%(refname:short)' \
                  "refs/heads/centella/subtasks/${run_id}/"); do
         git branch -D "$b" 2>/dev/null || true
       done
-      echo "cleanup: removed worktrees + subtask branches for run ${run_id} "\
-"(run branch centella/runs/${run_id} and state dir kept; "\
-"pass --branches to delete the run branch too)"
+      echo "cleanup: removed worktrees + subtask branches for run ${run_id} (run branch centella/runs/${run_id} and state dir kept; pass --branches to delete the run branch too)"
       ;;
     *)  # default: keep both
-      echo "cleanup: removed worktrees for run ${run_id} "\
-"(branches centella/runs/${run_id} + centella/subtasks/${run_id}/* and state dir kept; "\
-"pass --subtask-branches or --branches to delete branches too)"
+      echo "cleanup: removed worktrees for run ${run_id} (branches centella/runs/${run_id} + centella/subtasks/${run_id}/* and state dir kept; pass --subtask-branches or --branches to delete branches too)"
       ;;
   esac
 }
