@@ -316,6 +316,14 @@ weaker base and produces more spurious conflicts. Recorded ancestry also makes
 re-integration idempotent and the run's history a true audit trail rather than
 a set of duplicated commits.
 
+On the success path a subtask branch may contain commits from two distinct
+workers: the implementer's code change and any conformer fixes (§9 *Post-work
+conformance*) that landed before integration. Both flow through the same
+merge — the integrator does not need to know which worker authored which
+commit. Conformer commits are conventionally prefixed `conformer:` in their
+subject so a reviewer can identify them in `git log`, and the orchestrator
+emits a non-blocking warning for any conformer commit that lacks the prefix.
+
 ### Conflict resolution is behavioral, not textual
 
 When two subtasks' branches conflict, resolving the conflict to git's
@@ -578,6 +586,72 @@ This is enforced structurally — the orchestrator detects after the fact whethe
 a criteria set changed between worker invocations and rejects the subtask if it
 did — so a worker that ignores the rule is caught, not trusted.
 
+### Post-work conformance
+
+Frozen criteria say whether the code does what it was assigned to do. They do
+not say whether the *change* is in good standing with the repo it lives in:
+whether documentation that describes the touched surface is still accurate,
+whether tests for the touched code were updated, whether the change still
+honors whatever rules the repo declares for itself (CLAUDE.md, AGENTS.md,
+`.cursorrules`, a section of the README, a `docs/` file — the location is
+repo-specific, and some repos declare nothing). These are real obligations of
+a finished change, but they are not part of the assigned criteria and would be
+the wrong thing to bake into them: criteria are scoped to the subtask, and the
+repo's rules are an environmental fact that survives across subtasks.
+
+So a separate phase runs once a subtask's criteria-bound work has settled:
+the **conformer**. It triggers only on the success path — implementer reports
+`status: "complete"`, commits are present, the worktree is clean, the criteria
+lock is intact, no protected path was written. None of the other terminal
+statuses (handoff, clarification, failed, blocked) invoke it. The conformer
+reads the diff the subtask just produced, reads whatever rules files the
+orchestrator located in the repo, and is empowered to commit fixes to the same
+worktree branch — updating documentation, adding or amending tests, repairing
+a rule violation it spotted.
+
+Where the rule files live varies, so the location is not the worker's problem.
+The orchestrator does discovery in code: a fixed, capped allowlist of paths
+in the repo root and `docs/` is checked for existence, and the surviving paths
+are handed to the conformer as inputs. The worker reads only what it was
+given; "what counts as a rules file" is not a judgment call. If discovery
+finds nothing, the phase still runs — the conformer focuses on whether the
+diff touched a surface the README or a `docs/` file describes, and whether
+tests for the touched code were updated — and silently skips the
+rule-conformance axis. A repo with no docs and no tests gets a near-no-op.
+
+Two further disciplines apply, and they sit at the §12 axis:
+
+- **Highest effort, never required.** Building, linting, and the test suite
+  passing are *desired* outcomes of the phase but never gating ones. The
+  conformer is told to attempt them and to report what it found, honestly,
+  in structured output: each of build, lint, and tests resolves to *ran and
+  passed*, *ran and failed*, or *not applicable*. A failure surfaces as an
+  advisory warning on the subtask result; it never escalates the subtask to
+  `failed` or `blocked`. The reason is the same failure mode §9 guards
+  against from the other side: making "tests pass" a hard requirement of
+  this phase invites the conformer to weaken a test, comment out an
+  assertion, or skip a lint rule to clear the bar. Keeping the phase
+  advisory removes that incentive while still surfacing the residual to the
+  human and to telemetry.
+- **No backsliding.** The conformer can add commits but must not undo what
+  the implementer just did. The criteria file is the codified statement of
+  what the subtask had to achieve; the orchestrator re-verifies the criteria
+  lock after the conformer's commits and rolls them back if the lock changed.
+  And the diff-scope check — no writes to `.centella/`, `.git/`, `.claude/` —
+  is re-run against the conformer's commits as well, on the same protected
+  paths and with the same terminality.
+
+The phase is bounded by a separate cap from the evidence loop: the conformer
+gets a small number of orchestrator-level rounds (default 2) in which to
+detect and fix drift. Exhausting the cap with residuals still present does
+*not* fail the subtask — the residuals become warnings, the subtask still
+returns `complete`, and the work moves on to integration. This is consistent
+with the rest of §12: what cannot be guaranteed in code (a model genuinely
+catching every documentation drift) is not promoted to a hard guarantee by
+prompt; what *can* be guaranteed (the criteria stayed frozen, protected
+paths stayed untouched, the worker's structured output is well-formed) is
+enforced in code.
+
 ---
 
 ## 10. Context management — handoff, not compaction
@@ -791,6 +865,15 @@ wave, and a per-worker time and turn limit. These are real counters in real
 code. When one is hit, the orchestrator takes a defined action — block the
 subtask, abort the run with state saved, throttle. Because the orchestrator
 owns the counter, the cap is a genuine guarantee.
+
+The post-work conformance cap (`conformance_rounds`, §9) is also code-enforced
+but its escalation is *advisory*, not blocking: when the cap is hit, residual
+findings surface as `conformance_warnings` on the subtask result and the
+subtask still returns `complete`. The cap bounds work, the warnings make the
+unfinished work observable, and the subtask never escalates to `failed` or
+`blocked`. This is the §12 principle applied to a phase that is itself
+advisory: the count is real, the action it triggers is to record, not to
+block.
 
 ### Worker-internal caps
 

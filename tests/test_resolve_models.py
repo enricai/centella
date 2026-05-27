@@ -23,7 +23,7 @@ import pytest
 
 
 WORKERS = ("classifier", "planner", "reconciler", "implementer",
-           "integrator", "validator")
+           "integrator", "validator", "conformer")
 
 # The expected default per worker, with no overrides.
 DEFAULTS = {
@@ -33,6 +33,7 @@ DEFAULTS = {
     "integrator": "opus",
     "validator":  "opus",
     "implementer": "sonnet",
+    "conformer":  "sonnet",
 }
 
 

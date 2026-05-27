@@ -40,8 +40,9 @@ export CENTELLA_SOURCE_OF_TRUTH=codebase
 /path/to/centella/centella --source-of-truth codebase "Add a --dry-run flag …"
 
 # Same idea for the model — judgment workers default to `opus` and the
-# implementer defaults to `sonnet`; `--model <alias>` sets every worker.
-# Per-worker overrides exist (e.g. --model-implementer opus).
+# acting workers (implementer, conformer) default to `sonnet`; `--model
+# <alias>` sets every worker. Per-worker overrides exist
+# (e.g. --model-implementer opus).
 /path/to/centella/centella --model opus "Add a --dry-run flag …"
 ```
 
@@ -208,10 +209,11 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
 - `--model sonnet|opus|haiku` — model for every worker this run.
   Without any override the per-worker defaults apply: judgment workers
   (classifier, planner, reconciler, integrator, validator) run on
-  `opus`; the implementer runs on `sonnet`. Per-worker
-  `--model-classifier`, `--model-planner`, `--model-reconciler`,
-  `--model-implementer`, `--model-integrator`, `--model-validator`
-  flags override the global default. Env-var equivalents are
+  `opus`; the acting workers (implementer, conformer) run on `sonnet`.
+  Per-worker `--model-classifier`, `--model-planner`,
+  `--model-reconciler`, `--model-implementer`, `--model-integrator`,
+  `--model-validator`, `--model-conformer` flags override the global
+  default. Env-var equivalents are
   `CENTELLA_MODEL` (and `CENTELLA_MODEL_<WORKER>` for the per-worker
   overrides); TOML keys are `model` / `model_<worker>` in
   `centella.toml`. Full precedence table in
@@ -219,7 +221,14 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
   the pre-0.3 all-sonnet behavior in one knob, set `--model sonnet` or
   `CENTELLA_MODEL=sonnet`.
 - `--max-workers N` — cap total `claude -p` subprocess count over the
-  run. Default: `40` (`DEFAULT_CAPS["max_total_workers"]`).
+  run. Default: `40` (`DEFAULT_CAPS["max_total_workers"]`). Note that
+  the post-work conformance phase (DESIGN §9) spawns up to
+  `conformance_rounds` additional workers per *successful* subtask (default
+  2), roughly doubling per-subtask worker usage. For large runs you may
+  want to raise this proportionally — a cap-hit during the conformance
+  phase surfaces as an advisory `conformance_warnings` entry, never as
+  a subtask failure, but earlier subtasks would have hit it first and
+  aborted the run.
 - `--max-parallel N` — cap concurrent implementers per wave. Default:
   `4` (`DEFAULT_CAPS["max_parallel"]`).
 - `--clarify` — opt into surfacing intent questions to the user

@@ -12,7 +12,8 @@ import pytest
 
 
 @pytest.mark.parametrize("call_type", [
-    "classifier", "planner", "reconciler", "implementer", "integrator", "validator",
+    "classifier", "planner", "reconciler", "implementer", "integrator",
+    "validator", "conformer",
 ])
 def test_resolve_prompt_returns_valid_triple(centella, call_type):
     kind, content, hint = centella.resolve_prompt(call_type)
@@ -38,6 +39,7 @@ def test_resolve_prompt_validator_is_constant(centella):
 
 @pytest.mark.parametrize("call_type", [
     "classifier", "planner", "reconciler", "implementer", "integrator",
+    "conformer",
 ])
 def test_resolve_prompt_file_workers_return_file_kind(centella, call_type):
     kind, content, hint = centella.resolve_prompt(call_type)

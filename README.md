@@ -118,8 +118,9 @@ export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both
 
 # Choose the model. Without overrides, judgment workers (classifier /
 # planner / reconciler / integrator / validator) default to opus and
-# the implementer defaults to sonnet — see docs/IMPLEMENTATION.md §2
-# "Model selection" for the full env-var / CLI-flag / TOML-key table.
+# the acting workers (implementer, conformer) default to sonnet — see
+# docs/IMPLEMENTATION.md §2 "Model selection" for the full env-var /
+# CLI-flag / TOML-key table.
 # Set CENTELLA_MODEL=sonnet (or --model sonnet) to restore the
 # pre-0.3 all-sonnet behavior in one knob.
 export CENTELLA_MODEL=sonnet                # or: opus, haiku
@@ -206,9 +207,9 @@ Complete reference for every CLI flag, environment variable, and
 - **Model** (per worker, highest first): `--model-<worker>` →
   `--model` → `CENTELLA_MODEL_<WORKER>` → `CENTELLA_MODEL` →
   `model_<worker>` in `centella.toml` → `model` in `centella.toml` →
-  per-worker default (`implementer` → `sonnet`; everything else →
-  `opus`). The judgment-vs-implementation split keeps the
-  most-frequently-invoked worker on the lower-cost model while
+  per-worker default (`implementer`, `conformer` → `sonnet`; everything
+  else → `opus`). The judgment-vs-acting split keeps the
+  most-frequently-invoked workers on the lower-cost model while
   every judgment step gets Opus-grade reasoning. To restore the
   pre-0.3 all-sonnet behavior in one knob, set `CENTELLA_MODEL=sonnet`
   or pass `--model sonnet`.
@@ -234,13 +235,15 @@ subprocess; there is no in-session agent nesting.
 | `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
 | `reconciler` | `prompts/reconciler.md` | opus | 0 or 1 (spawned only when planners' capability tags don't align) | renames / added_provides / added_subtasks / unresolvable |
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `centella/subtasks/<run-id>/<subtask-id>` branch |
+| `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
 | `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `centella/runs/<run-id>` |
 | `validator` | constant `VALIDATOR_SYSTEM` in `centella.py` (not a file) | opus | once per wave | pass/fail on the run branch |
 
 **Per-worker model defaults:** judgment workers (classifier, planner,
-reconciler, integrator, validator) default to Opus; only the implementer
-defaults to Sonnet — its job is concrete subtask execution where
-throughput matters more than broad-context judgment. To revert to the
+reconciler, integrator, validator) default to Opus; the acting workers
+(implementer, conformer) default to Sonnet — their job is concrete
+subtask execution where throughput matters more than broad-context
+judgment. To revert to the
 all-Sonnet pattern of earlier versions, set `CENTELLA_MODEL=sonnet` or
 pass `--model sonnet`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2
 *Model selection* for the full precedence table.

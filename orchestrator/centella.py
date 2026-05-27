@@ -75,6 +75,12 @@ DEFAULT_CAPS = {
     # mid-execution clarification subsection.
     "subtask_continuations": 3,
     "failed_retries": 1,            # re-spawns of a failed implementer
+    # Orchestrator-level conformer re-runs per subtask (DESIGN §9 *Post-
+    # work conformance*). Bounds the loop in `settle_subtask` that re-spawns
+    # the conformer when its output is malformed or residuals remain.
+    # Exhausting this cap is a *warning*, not a failure — the phase is
+    # advisory and never produces a `failed` / `blocked` subtask status.
+    "conformance_rounds": 2,
     "wave_revalidation_rounds": 5,  # staging re-validation attempts per wave
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
     # Worker-internal evidence-gate iterations for planner and implementer
@@ -101,6 +107,7 @@ STATE_FIELDS = (
     "verbosity", "inspect_dirs",
     "test_runner",
     "integrator_failure", "integrator_warnings", "scope_warnings",
+    "conformance",
 )
 
 CATEGORIES = [
@@ -229,13 +236,14 @@ MODEL_DEFAULT = "opus"
 # different default from MODEL_DEFAULT appear here.
 MODEL_DEFAULT_PER_WORKER = {
     "implementer": "sonnet",
+    "conformer": "sonnet",
     "judge": "sonnet",
     "heal": "sonnet",
 }
 MODEL_ENV = "CENTELLA_MODEL"
 MODEL_FILE = "centella.toml"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "implementer",
-                "integrator", "validator")
+                "integrator", "validator", "conformer")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -330,6 +338,21 @@ def resolve_prompt(call_type: str) -> tuple[str, str, str]:
 # object as `structured_output` in the JSON envelope. NOTE: --json-schema
 # only accepts an INLINE schema string; a file path is silently ignored
 # (verified against Claude Code 2.1.143), so these are embedded here.
+
+# Shared shape for the conformer's build/lint/tests fields — three objects
+# with the same {ran, passed, command, summary} schema. Pulled out to keep
+# the conformer schema readable.
+_CONFORMER_BLT_PROP = {
+    "type": "object",
+    "required": ["ran", "passed", "command", "summary"],
+    "properties": {
+        "ran": {"type": "boolean"},
+        "passed": {"type": "boolean"},
+        "command": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+}
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
@@ -652,6 +675,88 @@ SCHEMAS: dict[str, dict] = {
             },
             "rationale": {"type": "string"},
             "suggested_fixes": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "conformer": {
+        # DESIGN §9 *Post-work conformance*: an advisory worker that runs
+        # after the implementer's success path. Schema requires the
+        # build/lint/tests objects so a worker that skipped the honesty
+        # discipline fails its own JSON gate before the orchestrator reads
+        # it; cross-field invariants (residuals require non-empty
+        # rules_files_read, fixed-violations cite a rule, updates cite a
+        # path) are enforced by validate_conformance_result().
+        "type": "object",
+        "required": [
+            "subtask_id", "rules_files_read",
+            "rule_violations_fixed", "rule_violations_residual",
+            "docs_updates", "tests_updates",
+            "build", "lint", "tests", "summary",
+        ],
+        "properties": {
+            "subtask_id": {"type": "string"},
+            "rules_files_read": {
+                "type": "array", "items": {"type": "string"}},
+            "rule_violations_fixed": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["rule", "fix", "evidence"],
+                    "properties": {
+                        "rule": {"type": "string"},
+                        "fix": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
+            "rule_violations_residual": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["rule", "why_not_fixed"],
+                    "properties": {
+                        "rule": {"type": "string"},
+                        "why_not_fixed": {"type": "string"},
+                    },
+                },
+            },
+            "docs_updates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["path", "reason"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "tests_updates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["path", "reason"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "build": _CONFORMER_BLT_PROP,
+            "lint": _CONFORMER_BLT_PROP,
+            "tests": _CONFORMER_BLT_PROP,
+            "summary": {"type": "string"},
+            "confidence": {
+                "type": "object",
+                "properties": {
+                    "conformance": {"type": "number"},
+                    "basis": {"type": "string"},
+                    "falsifiers_tested": {
+                        "type": "array", "items": {"type": "string"}},
+                    "contradictions_reconciled": {
+                        "type": "array", "items": {"type": "string"}},
+                    "gap_to_close": {"type": "object"},
+                },
+            },
         },
     },
     "patch_generator": {
@@ -4495,6 +4600,377 @@ def _retryable_failure(reason: str) -> bool:
     return any(m in reason for m in retryable_markers)
 
 
+# --- post-work conformance phase (DESIGN §9 *Post-work conformance*) -------
+# Runs after the implementer's success-path settlement checks pass, before
+# `settle_subtask` returns. The phase is advisory: nothing it does or fails
+# to do can produce a `failed` / `blocked` subtask status. The code-enforced
+# guarantees are narrow — rule-file discovery is deterministic, the worker's
+# output is schema-validated, the criteria lock is re-verified after any
+# conformer commits, and the same diff-scope check that gates the implementer
+# is re-applied to the conformer's commits. Everything else (which rule was
+# violated, whether build/lint/tests passed, whether docs are actually
+# stale) is the worker's judgment, surfaced as warnings.
+
+# Fixed, capped allowlist of rule-file paths the discovery function checks.
+# Order is the priority order the conformer reads in. Adding to this list
+# is a design change (DESIGN §9) — the worker is told these are
+# authoritative and only these.
+_RULES_FILE_CANDIDATES = (
+    "CLAUDE.md", "AGENTS.md", ".agent.md",
+    ".cursorrules", ".windsurfrules",
+    "docs/CLAUDE.md", "docs/AGENTS.md",
+    "docs/CONVENTIONS.md", "docs/STYLE.md",
+    "README.md", "CONTRIBUTING.md",
+    "docs/DESIGN.md", "docs/IMPLEMENTATION.md",
+)
+
+
+def discover_rules_files(repo_root: Path) -> list[Path]:
+    """Return existing rule-file paths from `_RULES_FILE_CANDIDATES`, in
+    declaration order, capped at the candidate-list length. Never raises;
+    never recurses; returns [] cleanly when nothing matches."""
+    out: list[Path] = []
+    for rel in _RULES_FILE_CANDIDATES:
+        p = repo_root / rel
+        try:
+            if p.is_file():
+                out.append(p)
+        except OSError:
+            continue
+    return out
+
+
+def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
+    """Best-effort guess at the repo's build / lint / test commands. Returns
+    a dict with keys 'build', 'lint', 'test' — empty string when no command
+    could be inferred for that axis. The conformer is told an empty string
+    means "not applicable; report ran=false." This is a *suggestion* the
+    worker may override based on what it sees in the repo."""
+    out = {"build": "", "lint": "", "test": ""}
+    if (repo_root / "Makefile").is_file():
+        # Don't assume specific targets — the conformer reads the Makefile
+        # and picks. We just signal "a Makefile exists."
+        out["build"] = "make"
+    if (repo_root / "package.json").is_file():
+        # npm has both build and test conventions; lint varies. The
+        # conformer reads scripts and picks.
+        out["build"] = out["build"] or "npm run build"
+        out["test"] = out["test"] or "npm test"
+    if (repo_root / "pyproject.toml").is_file() or \
+       (repo_root / "pytest.ini").is_file() or \
+       (repo_root / "setup.cfg").is_file():
+        out["test"] = out["test"] or "pytest"
+    if (repo_root / "Cargo.toml").is_file():
+        out["build"] = out["build"] or "cargo build"
+        out["test"] = out["test"] or "cargo test"
+    if (repo_root / "go.mod").is_file():
+        out["build"] = out["build"] or "go build ./..."
+        out["test"] = out["test"] or "go test ./..."
+    if (repo_root / ".eslintrc").is_file() or \
+       (repo_root / ".eslintrc.json").is_file() or \
+       (repo_root / ".eslintrc.js").is_file() or \
+       (repo_root / ".eslintrc.cjs").is_file() or \
+       (repo_root / ".eslintrc.yaml").is_file() or \
+       (repo_root / ".eslintrc.yml").is_file():
+        out["lint"] = out["lint"] or "npx eslint ."
+    if (repo_root / ".ruff.toml").is_file() or \
+       (repo_root / "ruff.toml").is_file():
+        out["lint"] = out["lint"] or "ruff check ."
+    return out
+
+
+def validate_conformance_result(result: dict, worktree: str) -> str | None:
+    """Cross-field invariants for the conformer's structured output.
+    Returns None when valid, else a one-line error string.
+
+    The JSON schema already enforces the *shape* (required fields, their
+    types). This function enforces the cross-field rules the schema can't:
+    residuals require a non-empty `rules_files_read`, every fixed violation
+    cites a non-empty `rule`, every docs/tests update cites a path that
+    actually exists in the worktree.
+
+    Per DESIGN §12 this is the code-enforced honesty check; the worker's
+    own judgment is not second-guessed beyond these structural minimums."""
+    if not isinstance(result, dict):
+        return "conformer result is not an object"
+
+    files_read = result.get("rules_files_read") or []
+    residuals = result.get("rule_violations_residual") or []
+    if residuals and not files_read:
+        return ("rule_violations_residual non-empty but rules_files_read "
+                "is empty — a violation cannot exist without a rule")
+
+    fixed = result.get("rule_violations_fixed") or []
+    for i, item in enumerate(fixed):
+        if not (item.get("rule") or "").strip():
+            return f"rule_violations_fixed[{i}] has empty 'rule'"
+
+    # Resolve the worktree once for path-traversal checking. Paths must
+    # both exist AND resolve inside the worktree — a `path` like
+    # "../../etc/passwd" or "/etc/passwd" is an honesty failure (the
+    # conformer claims to have updated a doc inside the subtask, but the
+    # path it cites escapes the worktree).
+    try:
+        wt_resolved = Path(worktree).resolve()
+    except OSError:
+        return f"worktree path {worktree!r} could not be resolved"
+    for kind in ("docs_updates", "tests_updates"):
+        for i, item in enumerate(result.get(kind) or []):
+            rel = (item.get("path") or "").strip()
+            if not rel:
+                return f"{kind}[{i}] has empty 'path'"
+            try:
+                resolved = (wt_resolved / rel).resolve()
+            except OSError:
+                return (f"{kind}[{i}] path {rel!r} could not be resolved")
+            # Path.is_relative_to was added in 3.9; we target 3.10+ (see
+            # CLAUDE.md tech-stack note) so this is safe.
+            if not resolved.is_relative_to(wt_resolved):
+                return (f"{kind}[{i}] path {rel!r} escapes the worktree "
+                        f"(resolves to {resolved}); paths must stay inside "
+                        f"the subtask's worktree")
+            if not resolved.exists():
+                return (f"{kind}[{i}] cites path {rel!r} which does not "
+                        f"exist in the worktree")
+    return None
+
+
+async def _branch_head_sha(worktree: str) -> str:
+    """HEAD sha in the worktree, or empty string on failure. Used as the
+    rollback target before the conformer adds commits."""
+    r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+async def rollback_conformer_commits(worktree: str, before_sha: str) -> None:
+    """Hard-reset the subtask branch back to `before_sha`. Used when the
+    conformer wrote to a protected path or modified the criteria file —
+    the implementer's commits are preserved, the conformer's are dropped.
+    Safe to call when no new commits were made: it's a no-op reset.
+
+    Note: `git reset --hard` also discards uncommitted changes. Callers
+    that want to warn about discarded scribbles should call
+    `_uncommitted_paths` first."""
+    if not before_sha:
+        return
+    await run_proc(["git", "reset", "--hard", before_sha], cwd=worktree)
+
+
+async def _uncommitted_paths(worktree: str) -> list[str]:
+    """Return tracked-file paths with uncommitted changes in the worktree,
+    or [] if the check fails. Untracked files are excluded — the rollback
+    only touches tracked state. Used as a pre-rollback observability
+    helper: when the conformer leaves uncommitted scribbles alongside a
+    commit that triggers rollback, those scribbles get silently discarded
+    by `git reset --hard`. This lets the caller surface what was lost."""
+    try:
+        r = await run_proc(["git", "status", "--porcelain"], cwd=worktree)
+    except OSError:
+        return []
+    if r.returncode != 0:
+        return []
+    return [line for line in r.stdout.splitlines()
+            if line and not line.startswith("??")]
+
+
+async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
+                                        prefix: str = "conformer:"
+                                        ) -> list[str]:
+    """Return subject lines of commits between before_sha..HEAD whose
+    subjects do not start with `prefix`. Empty list when there are no new
+    commits, when every new commit is correctly prefixed, or when the git
+    invocation fails (the caller treats a missing answer as no warning).
+
+    This is the code-side honesty check for the prompt-level rule
+    "conformer commits must start with `conformer:`" (DESIGN §9
+    Post-work conformance + §12 prompts-are-advisory). The check is
+    *observability*, not enforcement — unprefixed commits surface as
+    `conformance_warnings`, never trigger rollback."""
+    if not before_sha:
+        return []
+    r = await run_proc(
+        ["git", "log", "--format=%s", f"{before_sha}..HEAD"],
+        cwd=worktree,
+    )
+    if r.returncode != 0:
+        return []
+    return [line for line in r.stdout.splitlines()
+            if line and not line.startswith(prefix)]
+
+
+async def run_conformer(sid: str, centella_dir: Path, worktree: str,
+                        caps: dict, st: State, models: dict[str, str],
+                        rules_files: list[Path],
+                        blt_commands: dict[str, str],
+                        diff_base: str) -> dict | None:
+    """Spawn one conformer for one subtask in its existing worktree.
+    Returns the worker's structured output, or None on WorkerError (which
+    is recorded as a warning by the caller — DESIGN §9: the phase is
+    advisory)."""
+    sys_prompt = load_prompt("conformer")
+    repo_root = st.centella_root.parent
+    rules_paths_str = ", ".join(
+        str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
+        else str(p)
+        for p in rules_files
+    ) or "(none)"
+    up = [f"Run the post-work conformance phase for subtask `{sid}`.",
+          f"CENTELLA_DIR is {centella_dir} (absolute). Your subtask spec "
+          f"is at {centella_dir}/subtasks/{sid}.json and the FROZEN "
+          f"criteria are at {centella_dir}/criteria/{sid}.md — both "
+          "read-only.",
+          "Your current working directory IS the subtask's worktree. Make "
+          "and commit any fixes here. Every commit subject must start "
+          "with `conformer:`.",
+          f"RULES_FILES: {rules_paths_str}",
+          f"BUILD_CMD: {blt_commands.get('build') or '(none)'}",
+          f"LINT_CMD: {blt_commands.get('lint') or '(none)'}",
+          f"TEST_CMD: {blt_commands.get('test') or '(none)'}",
+          f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
+
+    # bump_workers is inside the try block on purpose: it raises
+    # WorkerError when max_total_workers is exhausted, and the conformance
+    # phase must NEVER escalate that into a failed/blocked subtask
+    # (DESIGN §9 Post-work conformance — the phase is advisory only). The
+    # implementer at run_implementer() places bump_workers outside its try
+    # because for the implementer the budget-exhausted error IS meant to
+    # abort the run.
+    try:
+        st.bump_workers(caps)
+        return await claude_p(user_prompt="\n".join(up),
+                              system_prompt=sys_prompt,
+                              schema_key="conformer", cwd=worktree,
+                              allowed_tools=ACT_TOOLS, max_turns=60,
+                              autonomous=True, caps=caps, st=st,
+                              model=models["conformer"], sid=f"{sid}-conformer")
+    except WorkerError as e:
+        log(f"  {sid}: conformer crashed: {e}")
+        return None
+
+
+def _summarize_residuals(conf_res: dict) -> list[str]:
+    """One advisory string per residual / failing build-lint-test axis.
+    Empty list when the conformer reports a fully clean pass."""
+    out: list[str] = []
+    for item in conf_res.get("rule_violations_residual") or []:
+        rule = (item.get("rule") or "").strip()
+        why = (item.get("why_not_fixed") or "").strip()
+        out.append(f"rule-residual: {rule!r} not fixed — {why}")
+    for axis in ("build", "lint", "tests"):
+        a = conf_res.get(axis) or {}
+        if a.get("ran") and not a.get("passed"):
+            summary = (a.get("summary") or "").strip() or "(no summary)"
+            out.append(f"{axis}-failed: {a.get('command', '')!r}: {summary}")
+    return out
+
+
+def _conformance_clean(conf_res: dict) -> bool:
+    """True when the conformer reports no residuals and every axis is
+    either passed or not applicable. Used to short-circuit the
+    orchestrator-level conformer loop."""
+    if conf_res.get("rule_violations_residual"):
+        return False
+    for axis in ("build", "lint", "tests"):
+        a = conf_res.get(axis) or {}
+        if a.get("ran") and not a.get("passed"):
+            return False
+    return True
+
+
+async def _run_conformance_phase(sid: str, centella_dir: Path,
+                                 worktree: str, subtask: dict, caps: dict,
+                                 st: State, models: dict[str, str]
+                                 ) -> tuple[dict | None, list[str]]:
+    """Drive the orchestrator-level conformer loop for one subtask.
+    Returns `(last_conformer_result, warnings)`. Never raises a workflow
+    error: all failure modes — malformed output, WorkerError, gate
+    violations on conformer commits, exhausted rounds — surface as
+    entries in `warnings`. The subtask still returns `complete`."""
+    warnings: list[str] = []
+    repo_root = st.centella_root.parent
+    rules_files = discover_rules_files(repo_root)
+    blt = _infer_build_lint_test(repo_root)
+    run_branch = compute_run_branch(st.run_id)
+    last_res: dict | None = None
+
+    for c_round in range(caps["conformance_rounds"]):
+        before_sha = await _branch_head_sha(worktree)
+        last_res = await run_conformer(
+            sid, centella_dir, worktree, caps, st, models,
+            rules_files=rules_files, blt_commands=blt, diff_base=run_branch)
+
+        if last_res is None:
+            warnings.append(f"conformer round {c_round}: worker crashed; "
+                            "phase surfaced as advisory")
+            break
+
+        err = validate_conformance_result(last_res, worktree)
+        if err:
+            warnings.append(f"conformer round {c_round}: malformed result: {err}")
+            break
+
+        # Re-apply the implementer gates against any new conformer commits.
+        # Empty diff (worker added no commits) is fine and common: a
+        # well-formed result with no fixes is a legitimate "nothing to do."
+        # check_diff_scope returns a string ONLY for a protected-path
+        # violation (.centella/.git/.claude/) — the scope-volume warning
+        # is logged side-channel and does not surface here.
+        scope_err = await check_diff_scope(sid, worktree, subtask, st)
+        if scope_err:
+            discarded = await _uncommitted_paths(worktree)
+            if discarded:
+                warnings.append(
+                    f"conformer round {c_round}: discarding "
+                    f"{len(discarded)} uncommitted file(s) during rollback: "
+                    f"{[line[3:] for line in discarded]}")
+            await rollback_conformer_commits(worktree, before_sha)
+            warnings.append(f"conformer round {c_round}: protected-path "
+                            f"violation reverted ({scope_err})")
+            break
+
+        # Criteria lock invariance — the conformer is forbidden from
+        # touching the criteria file. Roll back if it did.
+        try:
+            verify_criteria_lock(sid, centella_dir, st)
+        except WorkerError as e:
+            discarded = await _uncommitted_paths(worktree)
+            if discarded:
+                warnings.append(
+                    f"conformer round {c_round}: discarding "
+                    f"{len(discarded)} uncommitted file(s) during rollback: "
+                    f"{[line[3:] for line in discarded]}")
+            await rollback_conformer_commits(worktree, before_sha)
+            warnings.append(f"conformer round {c_round}: criteria lock "
+                            f"violated; commits reverted ({e})")
+            break
+
+        # Dirty-worktree check: the conformer should commit, not leave
+        # uncommitted changes that integration would lose.
+        dirty = await _uncommitted_paths(worktree)
+        if dirty:
+            warnings.append(f"conformer round {c_round}: left "
+                            f"{len(dirty)} uncommitted change(s) — not "
+                            "rolled back, but surfaced as advisory")
+
+        # Commit-prefix observability: surface (but don't roll back) any
+        # conformer commits whose subject doesn't start with `conformer:`.
+        # The prefix lets reviewers identify conformer commits in git log;
+        # missing prefixes are a discipline lapse, not a correctness issue.
+        unprefixed = await _unprefixed_conformer_commits(worktree, before_sha)
+        for subject in unprefixed:
+            warnings.append(f"conformer round {c_round}: commit subject "
+                            f"missing `conformer:` prefix: {subject!r}")
+
+        if _conformance_clean(last_res):
+            break
+
+    if last_res is not None:
+        warnings.extend(_summarize_residuals(last_res))
+    return last_res, warnings
+
+
 async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
                          models: dict[str, str]) -> dict:
     """Drive one subtask to a terminal state.
@@ -4625,6 +5101,41 @@ async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State,
                 if done is not None:
                     return done
                 continue
+
+            # DESIGN §9 *Post-work conformance*: advisory phase. Runs only on
+            # the success path (every check above has passed), never produces
+            # a `failed` / `blocked` status, attaches its result and any
+            # warnings to `res` and to st.data["conformance"].
+            #
+            # The broad try/except is load-bearing: the phase is documented
+            # as "Never raises a workflow error," but `_run_conformance_phase`
+            # calls `run_proc` which calls `asyncio.create_subprocess_exec`,
+            # which raises `FileNotFoundError` when `cwd` is missing. The
+            # worktree could disappear mid-phase (operator action or a racy
+            # external cleanup), and an unhandled exception would escalate
+            # a `complete` subtask to a crash. Catching everything here
+            # preserves the advisory framing: any failure mode reduces to a
+            # warning. Specific exception types are logged.
+            conf_res: dict | None = None
+            conf_warnings: list[str] = []
+            try:
+                conf_res, conf_warnings = await _run_conformance_phase(
+                    sid, centella_dir, worktree, subtask, caps, st, models)
+            except Exception as e:
+                conf_warnings.append(
+                    f"conformance phase raised {type(e).__name__}: {e} — "
+                    "surfaced as advisory, subtask still complete")
+            if conf_res is not None:
+                res["conformance"] = conf_res
+            if conf_warnings:
+                res["conformance_warnings"] = conf_warnings
+                for w in conf_warnings:
+                    log(f"  {sid}: conformance: {w}")
+            st.data.setdefault("conformance", {})[sid] = {
+                "result": conf_res,
+                "warnings": conf_warnings,
+            }
+            st.save()
             return res
 
         if status == "incomplete-handoff":

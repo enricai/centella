@@ -120,10 +120,11 @@ export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both
 /path/to/centella/centella "task" --source-of-truth codebase
 
 # Choose the model. Without overrides: judgment workers (classifier,
-# planner, reconciler, integrator, validator) default to opus;
-# implementer defaults to sonnet. Use the env var for a sticky
-# preference, the CLI flag for a one-off, or centella.toml for the
-# committed repo default. Per-worker overrides also exist — see §2.
+# planner, reconciler, integrator, validator) default to opus; acting
+# workers (implementer, conformer) default to sonnet. Use the env var
+# for a sticky preference, the CLI flag for a one-off, or centella.toml
+# for the committed repo default. Per-worker overrides also exist —
+# see §2.
 export CENTELLA_MODEL=sonnet                # or: opus, haiku
 /path/to/centella/centella "task" --model opus
 /path/to/centella/centella "task" --model-implementer opus --model-classifier haiku
@@ -451,12 +452,13 @@ heal workers — which execute concrete tasks with high throughput requirements
 | integrator   | opus    | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
 | validator    | opus    | per-criterion judgment in the LLM-fallback path; false-pass/false-fail is expensive |
 | implementer  | sonnet  | concrete subtask execution; Sonnet's throughput is the right tradeoff |
+| conformer    | sonnet  | reads a diff and runs commands; same throughput-first profile as implementer; the phase is advisory so a borderline judgment call costs at most a warning |
 | judge        | sonnet  | scoring a batch of captured calls; throughput matters more than broad judgment |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
-overrides it for specific workers (`implementer`, `judge`, and `heal` all
-default to `sonnet`).
+overrides it for specific workers (`implementer`, `conformer`, `judge`, and
+`heal` all default to `sonnet`).
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -469,7 +471,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Eight worker types, each independently overridable:
+Nine worker types, each independently overridable:
 
 | Worker       | env var                       | CLI flag                | TOML key            |
 |--------------|-------------------------------|-------------------------|---------------------|
@@ -480,6 +482,7 @@ Eight worker types, each independently overridable:
 | implementer  | `CENTELLA_MODEL_IMPLEMENTER`  | `--model-implementer`   | `model_implementer` |
 | integrator   | `CENTELLA_MODEL_INTEGRATOR`   | `--model-integrator`    | `model_integrator`  |
 | validator    | `CENTELLA_MODEL_VALIDATOR`    | `--model-validator`     | `model_validator`   |
+| conformer    | `CENTELLA_MODEL_CONFORMER`    | `--model-conformer`     | `model_conformer`   |
 | judge        | `CENTELLA_MODEL_JUDGE`        | `--judge-model`         | `model_judge`       |
 | heal         | `CENTELLA_MODEL_HEAL`         | `--heal-model`          | `model_heal`        |
 
@@ -524,12 +527,12 @@ Each worker is one `claude -p` headless process. Flags used:
 | `-p` | non-interactive single-shot |
 | `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.centella/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
-| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/implementer/integrator, or the `VALIDATOR_SYSTEM` constant in `centella.py` for the validator |
-| `--allowedTools` | tool allowlist; three buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, and reconciler; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer and integrator; **run-and-read** (`RUN_TOOLS`: read set + Bash) for the validator. The acting and run-and-read buckets keep Bash unrestricted because their workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
+| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/implementer/integrator/conformer, or the `VALIDATOR_SYSTEM` constant in `centella.py` for the validator |
+| `--allowedTools` | tool allowlist; three buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, and reconciler; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer, integrator, and conformer; **run-and-read** (`RUN_TOOLS`: read set + Bash) for the validator. The acting and run-and-read buckets keep Bash unrestricted because their workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
 | `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
-| `--dangerously-skip-permissions` | acting *and* run-and-read workers (implementer, integrator, validator) — suppresses all permission prompts for unattended Bash and file writes. **Not** applied to inspect workers — they run in the real repo cwd (no worktree isolation), so the blast-radius assumption that justifies skip-permissions doesn't hold. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
+| `--dangerously-skip-permissions` | acting *and* run-and-read workers (implementer, integrator, validator, conformer) — suppresses all permission prompts for unattended Bash and file writes. **Not** applied to inspect workers — they run in the real repo cwd (no worktree isolation), so the blast-radius assumption that justifies skip-permissions doesn't hold. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
 
 `claude_p()` is `async`; every caller awaits it. Internally it awaits
 `_invoke()`, which spawns the worker via the `run_proc` helper
@@ -545,6 +548,10 @@ quoted into the prompt; a second failure raises `WorkerError`.
 ("salvage if there is something to salvage; abort cleanly otherwise"):
 - **implementer** — `run_implementer()` catches it, converts to an
   `incomplete-handoff` result; a fresh implementer continues from the checkpoint.
+- **conformer** — `run_conformer()` catches it and returns `None`;
+  `settle_subtask` records a `conformer crashed` entry in
+  `conformance_warnings` and the subtask still returns `complete` (DESIGN §9
+  *Post-work conformance*: the phase is advisory and never fails the subtask).
 - **classifier, planner, reconciler, integrator, validator** — not caught
   locally; propagates to `main()`, which aborts with state saved for
   `--resume`.
@@ -567,7 +574,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5, §14). |
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
 | 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `centella/runs/<run-id>` and its worktree (per-run, isolated from any other run) |
-| 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then re-validate. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume` |
+| 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then re-validate. `settle_subtask` runs the **post-work conformance phase** (DESIGN §9 *Post-work conformance*) on the success path before returning — `discover_rules_files` → `run_conformer` loop (≤ `conformance_rounds`) → re-run the same per-subtask gates (`check_branch_has_commits`, dirty-worktree, `check_diff_scope`, `verify_criteria_lock`) against the conformer's commits → attach `conformance_warnings` to the result. The phase is advisory: residuals, build/lint/test failures, gate violations on conformer commits, and `WorkerError` all surface as warnings, never as `failed`/`blocked`. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume` |
 | 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh` | verify the run branch is non-empty; push the run branch and open a PR (unless `--no-push`); record push / PR outcome in `run.json`; delete the per-subtask branches `centella/subtasks/<run-id>/*` (the run branch is **kept** as the PR head; state dir is kept as audit). The working branch is **not** modified locally — the PR is the proposed integration. |
 | Post-run Judge | `phase_judge`, `judge_capture` | standalone post-run phase (not part of main orchestrate flow): reads `calls.ndjson`, runs one `judge_capture()` per record in parallel under `asyncio.Semaphore(max_parallel)`, writes per-record verdicts to `<judge-dir>/<call_id>.json` and a summary `INDEX.json`; uses `prompts/judge.md` rubric |
 | Post-run Heal | `HealState`, `heal_baseline`, `heal_apply_patch`, `heal_replay_patched`, `request_patch`, `phase_heal` | heal-loop phases: `HealState` persists failing_samples / baseline / history / best_so_far at `<heal-dir>/<call_type>/state.json`; `heal_baseline(call_type, failing_records, n, heal_dir, caps, st, models)` runs n unpatched replays per record + judge, writes baseline verdicts + state; `heal_apply_patch(call_type, iter_n, patch_text, anchor_match, heal_dir, failing_records)` materialises patched prompts under `iter-<N>/patched-prompts/`; `heal_replay_patched(call_type, iter_n, n, heal_dir, caps, st, models)` runs n patched replays per record + judge, appends iteration record to state.history; `request_patch(state, iter_n, st, caps, models)` invokes the `patch_generator` worker (schema `SCHEMAS["patch_generator"]`, SID `heal-patch-<call_type>-iter<N>`, prompt from `prompts/patch_generator.md`) and returns `(anchor, replacement)` — raises `ValueError` if the returned anchor is not a literal substring of the resolved prompt body (code-enforced per the prompts-are-advisory principle); `phase_heal(call_type, failing_records, heal_dir, caps, st, models, request_patch_fn=None, n, config)` drives the full baseline→loop→report cycle; `request_patch_fn` defaults to the real `request_patch` when `None`, or accepts a sync/async 2-arg stub for testing |
@@ -661,6 +668,34 @@ judgment reads `state.json["criteria_revisions"]` after the run.
 | `validate_checkpoint()` — on `incomplete-handoff` | required section missing; required section empty/whitespace; required section contains only a placeholder token (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing `.`/`!`/`?`/`…` ignored and repeated `?` collapsed); a path listed under `## Files touched` no longer exists in the worktree and is not flagged `[deleted]` | returns `blocked` |
 | `_retryable_failure(summary)` — on `status='failed'` returned by the worker itself | worker self-report of failure | routed through the retry policy using the worker's `summary` as the reason; because `summary` is freeform text it almost never matches a retryable marker, so in practice a self-reported `failed` is **terminal** on first occurrence |
 
+### Per-subtask post-work conformance — in `settle_subtask`, success path only
+
+Triggered only when an implementer's `status: "complete"` has already cleared
+every check above (commits present, worktree clean, criteria lock recorded,
+no protected path written). None of the other terminal statuses
+(`incomplete-handoff`, `needs-clarification`, `blocked`, `failed`) invoke
+the conformer. Implements DESIGN §9 *Post-work conformance*.
+
+| Step | Function | Behavior |
+|------|----------|----------|
+| Discover rules files | `discover_rules_files(repo_root)` | Returns existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises. Empty list when nothing matches. |
+| Run conformer | `run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Catches `WorkerError` and returns `None` (surfaced as a warning). |
+| Validate output | `validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
+| Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope`, `verify_criteria_lock` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation or criteria-lock mismatch triggers `rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
+| Loop bound | `caps["conformance_rounds"]` (default 2) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
+| Attach result | — | `res["conformance"]` (worker output blob) and `res["conformance_warnings"]` (list of strings) are added to the implementer's result. The subtask still returns `complete`. |
+
+The phase is advisory: **no path through the conformance phase produces a
+`failed` or `blocked` subtask status.** Build/lint/test failures, malformed
+conformer output, conformer crashes, gate violations on conformer commits,
+and exhausted rounds all surface as entries in `conformance_warnings` and as
+non-fatal log lines. This is the §12 enforcement boundary for the new phase:
+*discovery* of rule files, *schema validity* of the conformer's output, the
+*criteria-lock invariance* across conformer commits, and the *protected-path
+invariance* across conformer commits are code-enforced; whether the
+conformer made the right docs/tests/rule-violation calls is left to the
+worker and not second-guessed.
+
 ### Wave-level checks (after integration, before validation)
 | Check | Catches |
 |-------|---------|
@@ -737,6 +772,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 |------|-----|--------|
 | subtask continuations (re-spawns of an implementer for the same subtask — both context-exhaustion handoffs *and* mid-execution clarifications consume from the same budget) | 3 (`subtask_continuations`) | return `blocked`; fatal at wave boundary |
 | corrective retries of a *retryable* failure per subtask (`failed_retries`) | 1 | return `failed` |
+| orchestrator-level conformer rounds per subtask (`conformance_rounds`) | 2 | exit the conformance loop; any residuals become `conformance_warnings` on the subtask result — never `failed` / `blocked` (DESIGN §9 *Post-work conformance*) |
 | wave re-validation rounds | 5 | abort run, name failing subtasks |
 | total worker invocations per run | 40 (`--max-workers`) | abort, state saved for `--resume` |
 | concurrent workers within a wave | 4 (`--max-parallel`) | throughput throttle |
@@ -744,8 +780,11 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
 
 `--max-turns` by worker: classifier 20, planner 40, validator 40, integrator
-60, implementer 120. For the implementer, 120 turns and 90 minutes both apply —
-whichever trips first.
+60, implementer 120, conformer 60. For the implementer, 120 turns and 90 minutes both apply —
+whichever trips first. The conformer cap is lower than the implementer's
+because its scope is narrower (read a diff, read a small set of rules files,
+update docs/tests, run build/lint/test) and the phase is advisory — running
+out of turns becomes a warning, not a failure.
 
 A seventh cap, `revision_retries`, is hardcoded to **1** (not in
 `DEFAULT_CAPS`): an implementer that returns `failed` and proposes an
@@ -955,6 +994,7 @@ written somewhere in `orchestrator/centella.py`. The coupling test in
 | `integrator_failure` | dict | unresolvable conflict from `integrate_wave` (non-fatal signal log) |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
+| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log) — keys are subtask ids, values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. Populated only on subtasks whose implementer reached `status: "complete"`. See DESIGN §9 *Post-work conformance* |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/centella.md`):
@@ -1061,6 +1101,31 @@ type. Required fields, current shape:
   `design-conflict` / `failed`). Optional: `resolution_summary`,
   `diagnosis` (read as a fallback for `resolution_summary` when
   diagnosing a non-`resolved` outcome).
+- **conformer** — required: `subtask_id`, `rules_files_read` (array of
+  strings — paths the conformer was handed by `discover_rules_files`; empty
+  list when none were found), `rule_violations_fixed` (array of
+  `{rule, fix, evidence}` — `rule` is the verbatim line from a rules file
+  that was being honored, `fix` describes the change made, `evidence` cites
+  the file/lines touched), `rule_violations_residual` (array of
+  `{rule, why_not_fixed}` — violations the conformer spotted but did not
+  resolve, with the reason), `docs_updates` (array of `{path, reason}` —
+  documentation files updated to reflect the diff), `tests_updates` (array
+  of `{path, reason}` — tests added or amended to cover the diff), `build`,
+  `lint`, `tests` (each an object `{ran (bool), passed (bool), command
+  (string), summary (string)}` — `ran: false` when the tool is not
+  applicable to the repo; `passed` is irrelevant when `ran: false`),
+  `summary` (string — one-line description of what the conformance pass
+  did). Optional: `confidence` (worker-internal self-gate, not consumed by
+  the orchestrator: `{conformance: number 1–10, basis: string,
+  falsifiers_tested: array, contradictions_reconciled: array, gap_to_close:
+  object}`). The schema enforces the structural part of DESIGN §9
+  *Post-work conformance*: a conformer that skipped its own honesty
+  discipline (e.g. wrote `passed: true` without a `command`) fails the
+  schema before the orchestrator reads it. The cross-field invariants —
+  residuals require a non-empty `rules_files_read`, every
+  `rule_violations_fixed` item cites a non-empty `rule`, every
+  `docs_updates` / `tests_updates` `path` exists in the worktree — are
+  enforced by `validate_conformance_result()`.
 - **validator** — required: `results` (array of `{subtask_id,
   all_criteria_met (both required), failing?}`). `failing` is optional in the
   schema; when omitted, the orchestrator treats it as an empty list.
@@ -1104,7 +1169,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `.centella/runs/` |
-| `call_type` | str | one of `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator` |
+| `call_type` | str | one of `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`, `conformer` |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -1145,13 +1210,14 @@ a system prompt, and no system prompt is shared between call types.
 | `implementer`  | `prompts/implementer.md` | read from disk |
 | `integrator`   | `prompts/integrator.md` | read from disk |
 | `validator`    | `VALIDATOR_SYSTEM` constant in `orchestrator/centella.py` | **not a file** — the validator prompt is short (two sentences) and has no behavioral tuning that would benefit from out-of-tree editing; it is the `VALIDATOR_SYSTEM` string constant embedded in `centella.py` |
+| `conformer`    | `prompts/conformer.md` | read from disk |
 
 `VALIDATOR_SYSTEM` is the single exception to the "prompts in `prompts/`"
 rule. It is called out explicitly here because the judge skill needs to
 know *where to find the system prompt for each call_type* when it builds
 the replay context for self-healing — it reads `prompts/<call_type>.md`
-for five of the six types, and reads `VALIDATOR_SYSTEM` directly from
-`centella.py` for the sixth.
+for six of the seven types, and reads `VALIDATOR_SYSTEM` directly from
+`centella.py` for the seventh.
 
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` centralises
 this asymmetry: given any member of `WORKER_TYPES`, it returns
@@ -1214,6 +1280,7 @@ enforcement functions:
 | `test_inspect_tools.py` | `INSPECT_TOOLS` composition and the three inspect-callsite wirings (classifier, planner, reconciler) — pins that the inspect bucket grants `Bash(<verb>:*)` patterns but never `Write`/`Edit` or bare `Bash`, the same DESIGN §12 enforcement applied to workers that don't get `--dangerously-skip-permissions` |
 | `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 | `test_resolve_prompt.py` | `resolve_prompt()` — every `WORKER_TYPES` member returns a valid triple; parity/coupling test; validator returns `("constant", …, "orchestrator/centella.py:VALIDATOR_SYSTEM")`; unknown call_type raises |
+| `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`), and `_infer_build_lint_test` across the supported package-manager families |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
