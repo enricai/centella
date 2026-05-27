@@ -114,6 +114,17 @@ export CENTELLA_MODEL=sonnet                # or: opus, haiku
 /path/to/centella/centella "task" --model opus
 /path/to/centella/centella "task" --model-implementer opus --model-classifier haiku
 
+# Telemetry: on by default; disable with --no-telemetry or env var:
+/path/to/centella/centella "task" --no-telemetry
+export CENTELLA_TELEMETRY=0
+# Override output subdirectory (default: <run-dir>/events/):
+/path/to/centella/centella "task" --telemetry-dir my-events
+export CENTELLA_TELEMETRY_DIR=my-events
+# Override judge/heal output subdirectories:
+/path/to/centella/centella "task" --judge-dir my-judge --heal-dir my-heal
+export CENTELLA_JUDGE_DIR=my-judge
+export CENTELLA_HEAL_DIR=my-heal
+
 # Recommended backstop for worker auto-compaction
 # (Claude Code CLI variable — not consumed by centella itself):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
@@ -249,6 +260,58 @@ This applies only to inspect-bucket workers. Acting workers
 validator runs inside the integrated wave worktree. Those workers
 have `--dangerously-skip-permissions` and operate on the worktree
 copy, not the user's wider filesystem — `--add-dir` is unneeded.
+
+### Telemetry
+
+Controls whether centella writes NDJSON telemetry events for LLM calls. Events
+land in `<run-dir>/<telemetry_subdir>/` — already under `.centella/` and thus
+covered by the existing `.gitignore` exclusion. Telemetry is on by default.
+
+Resolution order (highest priority first):
+
+1. **`--telemetry` / `--no-telemetry`** CLI flags (mutually exclusive).
+2. **`CENTELLA_TELEMETRY`** environment variable, boolean spellings
+   (`1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`).
+3. **`centella.toml`**, `telemetry = true|false`.
+4. **Default `True`** (`TELEMETRY_DEFAULT`).
+
+An invalid boolean in env or file is rejected at startup via `die()`.
+
+### Telemetry directory
+
+The subdirectory name (relative to `<run-dir>`) where telemetry NDJSON event
+files are written.
+
+Resolution order (highest priority first):
+
+1. **`--telemetry-dir DIR`** CLI flag.
+2. **`CENTELLA_TELEMETRY_DIR`** environment variable.
+3. **`centella.toml`**, `telemetry_dir = "events"`.
+4. **Default `"events"`** (`TELEMETRY_SUBDIR_DEFAULT`).
+
+### Judge output directory
+
+The subdirectory name (relative to `<run-dir>`) where LLM judge output files
+are written.
+
+Resolution order (highest priority first):
+
+1. **`--judge-dir DIR`** CLI flag.
+2. **`CENTELLA_JUDGE_DIR`** environment variable.
+3. **`centella.toml`**, `judge_dir = "judge-out"`.
+4. **Default `"judge-out"`** (`JUDGE_DIR_DEFAULT`).
+
+### Heal output directory
+
+The subdirectory name (relative to `<run-dir>`) where LLM self-heal loop output
+files are written.
+
+Resolution order (highest priority first):
+
+1. **`--heal-dir DIR`** CLI flag.
+2. **`CENTELLA_HEAL_DIR`** environment variable.
+3. **`centella.toml`**, `heal_dir = "heal-out"`.
+4. **Default `"heal-out"`** (`HEAL_DIR_DEFAULT`).
 
 ### Model selection
 

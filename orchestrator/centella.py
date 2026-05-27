@@ -205,6 +205,36 @@ MODEL_FILE = "centella.toml"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "implementer",
                 "integrator", "validator")
 
+# Telemetry enabled/disabled — see IMPLEMENTATION.md §2 "Telemetry".
+# Resolution order: --telemetry/--no-telemetry CLI → CENTELLA_TELEMETRY env →
+# telemetry in centella.toml → True (on by default). NDJSON events land in
+# <run-dir>/<telemetry_subdir>/ which is already under .centella/ and thus
+# covered by the existing .gitignore exclusion.
+TELEMETRY_DEFAULT = True
+TELEMETRY_ENV = "CENTELLA_TELEMETRY"
+TELEMETRY_FILE = "centella.toml"
+
+# Telemetry event subdir — the directory name appended to <run-dir> where
+# NDJSON event files are written. Resolution order: --telemetry-dir CLI →
+# CENTELLA_TELEMETRY_DIR env → telemetry_dir in centella.toml → "events".
+TELEMETRY_SUBDIR_DEFAULT = "events"
+TELEMETRY_SUBDIR_ENV = "CENTELLA_TELEMETRY_DIR"
+TELEMETRY_SUBDIR_FILE = "centella.toml"
+
+# Judge output directory name — relative to <run-dir>. Holds LLM judge
+# output files. Resolution order: --judge-dir CLI → CENTELLA_JUDGE_DIR env →
+# judge_dir in centella.toml → "judge-out".
+JUDGE_DIR_DEFAULT = "judge-out"
+JUDGE_DIR_ENV = "CENTELLA_JUDGE_DIR"
+JUDGE_DIR_FILE = "centella.toml"
+
+# Heal output directory name — relative to <run-dir>. Holds LLM self-heal
+# loop output files. Resolution order: --heal-dir CLI → CENTELLA_HEAL_DIR env →
+# heal_dir in centella.toml → "heal-out".
+HEAL_DIR_DEFAULT = "heal-out"
+HEAL_DIR_ENV = "CENTELLA_HEAL_DIR"
+HEAL_DIR_FILE = "centella.toml"
+
 
 def _source_of_truth_hint() -> str:
     """The one-line hint shown when the user is asked the source-of-truth
@@ -1385,6 +1415,93 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
         models[worker] = (per_cli or global_cli or per_env or global_env
                           or per_file or global_file or per_worker_default)
     return models
+
+
+def resolve_telemetry_enabled(repo_root: Path,
+                              cli_value: bool | None = None) -> bool:
+    """Resolve the telemetry enabled/disabled preference. Order:
+    --telemetry/--no-telemetry CLI flag → CENTELLA_TELEMETRY env var →
+    telemetry in centella.toml → TELEMETRY_DEFAULT (True). cli_value is
+    True when --telemetry was passed, False when --no-telemetry was passed,
+    None when neither was passed (argparse store_true/store_false pair with
+    default None). env and file values are rejected via die() if not parseable
+    as a boolean — a bad config is caught at startup."""
+    if cli_value is not None:
+        return cli_value
+    env = os.environ.get(TELEMETRY_ENV, "").strip()
+    if env:
+        try:
+            parsed = _parse_bool_envtoml(env)
+        except ValueError:
+            die(f"{TELEMETRY_ENV}={env!r} is not a boolean "
+                "(use 1/0, true/false, yes/no, on/off)")
+        if parsed is not None:
+            return parsed
+    cfg = repo_root / TELEMETRY_FILE
+    file_val = _read_toml_key(cfg, "telemetry")
+    if file_val is not None:
+        try:
+            parsed = _parse_bool_envtoml(file_val)
+        except ValueError:
+            die(f"{cfg}: telemetry={file_val!r} is not a boolean")
+        if parsed is not None:
+            return parsed
+    return TELEMETRY_DEFAULT
+
+
+def resolve_telemetry_subdir(repo_root: Path,
+                             cli_value: str | None = None) -> str:
+    """Resolve the telemetry event subdirectory name. Order:
+    --telemetry-dir CLI flag → CENTELLA_TELEMETRY_DIR env var →
+    telemetry_dir in centella.toml → TELEMETRY_SUBDIR_DEFAULT ("events").
+    The value is a plain directory name (or relative path) appended to
+    the run dir — not validated against the filesystem at resolve time."""
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    env = os.environ.get(TELEMETRY_SUBDIR_ENV, "").strip()
+    if env:
+        return env
+    cfg = repo_root / TELEMETRY_SUBDIR_FILE
+    file_val = _read_toml_key(cfg, "telemetry_dir")
+    if file_val is not None and file_val.strip():
+        return file_val.strip()
+    return TELEMETRY_SUBDIR_DEFAULT
+
+
+def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
+    """Resolve the judge output directory name. Order:
+    --judge-dir CLI flag → CENTELLA_JUDGE_DIR env var →
+    judge_dir in centella.toml → JUDGE_DIR_DEFAULT ("judge-out").
+    The value is a plain directory name (or relative path) appended to
+    the run dir — not validated against the filesystem at resolve time."""
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    env = os.environ.get(JUDGE_DIR_ENV, "").strip()
+    if env:
+        return env
+    cfg = repo_root / JUDGE_DIR_FILE
+    file_val = _read_toml_key(cfg, "judge_dir")
+    if file_val is not None and file_val.strip():
+        return file_val.strip()
+    return JUDGE_DIR_DEFAULT
+
+
+def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
+    """Resolve the heal output directory name. Order:
+    --heal-dir CLI flag → CENTELLA_HEAL_DIR env var →
+    heal_dir in centella.toml → HEAL_DIR_DEFAULT ("heal-out").
+    The value is a plain directory name (or relative path) appended to
+    the run dir — not validated against the filesystem at resolve time."""
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    env = os.environ.get(HEAL_DIR_ENV, "").strip()
+    if env:
+        return env
+    cfg = repo_root / HEAL_DIR_FILE
+    file_val = _read_toml_key(cfg, "heal_dir")
+    if file_val is not None and file_val.strip():
+        return file_val.strip()
+    return HEAL_DIR_DEFAULT
 
 
 async def run_proc(cmd: list[str], *, cwd: str | None = None,
@@ -4105,6 +4222,33 @@ def main() -> None:
     ap.add_argument("-q", "--quiet", action="count", default=0,
                     help="shortcut: -q=normal (pre-streaming behavior), "
                          "-qq=quiet (errors and phase boundaries only)")
+    # Telemetry knobs. --telemetry / --no-telemetry are a mutually exclusive
+    # pair; default None means "neither was passed" so the resolver falls
+    # through to env / TOML / TELEMETRY_DEFAULT.
+    _tel_grp = ap.add_mutually_exclusive_group()
+    _tel_grp.add_argument("--telemetry", dest="telemetry",
+                          action="store_true", default=None,
+                          help=f"enable telemetry (default on); also "
+                               f"{TELEMETRY_ENV}=1 or telemetry=true in "
+                               "centella.toml")
+    _tel_grp.add_argument("--no-telemetry", dest="telemetry",
+                          action="store_false",
+                          help=f"disable telemetry event writing; also "
+                               f"{TELEMETRY_ENV}=0 or telemetry=false in "
+                               "centella.toml")
+    ap.add_argument("--telemetry-dir", metavar="DIR",
+                    help=f"subdirectory name under the run dir for telemetry "
+                         f"NDJSON events (default '{TELEMETRY_SUBDIR_DEFAULT}'); "
+                         f"also {TELEMETRY_SUBDIR_ENV} or telemetry_dir in "
+                         "centella.toml")
+    ap.add_argument("--judge-dir", metavar="DIR",
+                    help=f"subdirectory name under the run dir for LLM judge "
+                         f"output (default '{JUDGE_DIR_DEFAULT}'); also "
+                         f"{JUDGE_DIR_ENV} or judge_dir in centella.toml")
+    ap.add_argument("--heal-dir", metavar="DIR",
+                    help=f"subdirectory name under the run dir for LLM self-heal "
+                         f"output (default '{HEAL_DIR_DEFAULT}'); also "
+                         f"{HEAL_DIR_ENV} or heal_dir in centella.toml")
     args = ap.parse_args()
 
     # --list short-circuits everything else: read .centella/runs/* and
@@ -4195,6 +4339,14 @@ def main() -> None:
     # → []. Re-attached to args so orchestrate() can fold it into state.
     args.inspect_dirs = resolve_inspect_dirs(
         repo_root, getattr(args, "inspect_dir", None))
+
+    # Resolve telemetry knobs. Re-attached to args so orchestrate() and any
+    # telemetry writer can read them without re-resolving.
+    args.telemetry = resolve_telemetry_enabled(repo_root, args.telemetry)
+    args.telemetry_subdir = resolve_telemetry_subdir(
+        repo_root, args.telemetry_dir)
+    args.judge_dir = resolve_judge_dir(repo_root, args.judge_dir)
+    args.heal_dir = resolve_heal_dir(repo_root, args.heal_dir)
 
     # Signal handlers (DESIGN §6 / DESIGN §14): SIGTERM and SIGHUP raise
     # InterruptedBySignal so the same try/except machinery that catches
