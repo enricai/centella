@@ -22,7 +22,7 @@ import pytest
 def _minimal_run_json(**overrides) -> dict:
     base = {
         "run_id": "feat-foo-abc123",
-        "branch": "centella/feat-foo-abc123",
+        "branch": "centella/runs/feat-foo-abc123",
         "working_branch": "main",
         "started_at": "2026-05-26T10:00:00+00:00",
         "finished_at": None,

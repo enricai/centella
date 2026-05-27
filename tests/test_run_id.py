@@ -213,10 +213,21 @@ def test_compute_run_id_handles_empty_timestamp(centella):
 # --- compute_run_branch ----------------------------------------------------
 
 def test_compute_run_branch_shape(centella):
-    assert centella.compute_run_branch("feat-foo-abc123") == "centella/feat-foo-abc123"
+    assert centella.compute_run_branch("feat-foo-abc123") == "centella/runs/feat-foo-abc123"
 
 
 def test_compute_run_branch_is_pure(centella):
     """Same input → same output. Trivial but pinning the contract."""
     rid = "fix-bar-def456"
     assert centella.compute_run_branch(rid) == centella.compute_run_branch(rid)
+
+
+def test_compute_subtask_branch_shape(centella):
+    assert (centella.compute_subtask_branch("feat-foo-abc123", "feat-001")
+            == "centella/subtasks/feat-foo-abc123/feat-001")
+
+
+def test_compute_subtask_branch_is_pure(centella):
+    rid, sid = "fix-bar-def456", "fix-002"
+    assert (centella.compute_subtask_branch(rid, sid)
+            == centella.compute_subtask_branch(rid, sid))

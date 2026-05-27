@@ -7,7 +7,8 @@
 # Modes:
 #   cleanup.sh --run-id <id> [--branches]
 #     Remove .centella/runs/<id>/worktrees/* and prune git metadata.
-#     With --branches also delete centella/<id> and centella/<id>/* branches.
+#     With --branches also delete centella/runs/<id> and
+#     centella/subtasks/<id>/* branches.
 #
 #   cleanup.sh --all-runs [--branches]
 #     Same as above, applied to every directory under .centella/runs/
@@ -54,11 +55,13 @@ clean_one_run() {
   git worktree prune
 
   if [ "$rm_branches" = "1" ]; then
-    # Per-run branches: centella/<run-id> (one segment) and
-    # centella/<run-id>/<sid> (two segments, the subtask branches).
+    # Per-run branches live under two disjoint namespaces:
+    #   centella/runs/<run-id>           (the run branch itself)
+    #   centella/subtasks/<run-id>/<sid> (one branch per subtask)
+    # See DESIGN.md §3 for why the namespaces are split.
     for b in $(git for-each-ref --format='%(refname:short)' \
-               "refs/heads/centella/${run_id}" \
-               "refs/heads/centella/${run_id}/"); do
+               "refs/heads/centella/runs/${run_id}" \
+               "refs/heads/centella/subtasks/${run_id}/"); do
       git branch -D "$b" 2>/dev/null || true
     done
   fi
@@ -68,7 +71,7 @@ clean_one_run() {
 "(state dir kept as audit trail at ${run_dir}; rm -rf manually if no longer needed)"
   else
     echo "cleanup: removed worktrees for run ${run_id} "\
-"(branches centella/${run_id}[/*] and state dir kept; "\
+"(branches centella/runs/${run_id} + centella/subtasks/${run_id}/* and state dir kept; "\
 "pass --branches to delete branches too)"
   fi
 }
@@ -167,9 +170,11 @@ if [ "$LEGACY" = "true" ]; then
   fi
   git worktree prune
 
-  # Legacy branches: centella/staging and any centella/<sid> without a /
-  # separator after centella/ (per-run branches are centella/<run-id>/<sid>
-  # — two segments — which we deliberately leave alone).
+  # Legacy branches: centella/staging and any one-segment centella/<sid>
+  # (a single name segment after centella/, no further /). Current per-run
+  # branches are centella/runs/<run-id> and centella/subtasks/<run-id>/<sid>
+  # — both have at least one extra / and are deliberately left alone by the
+  # centella/*/*) keep guard below.
   if git show-ref --verify --quiet refs/heads/centella/staging; then
     git branch -D centella/staging 2>/dev/null || true
   fi

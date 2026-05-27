@@ -21,7 +21,7 @@ CENTELLA_PY = (Path(__file__).resolve().parent.parent
 # --- behavior of _retryable_failure ---------------------------------------
 
 @pytest.mark.parametrize("reason", [
-    "subtask branch for feat-001 has no commits ahead of the run branch (centella/feat-foo-abc123) — implementer claimed complete without making any changes",
+    "subtask branch for feat-001 has no commits ahead of the run branch (centella/runs/feat-foo-abc123) — implementer claimed complete without making any changes",
     "worktree has 3 uncommitted change(s) — implementer left it dirty",
     "single uncommitted change found",
 ])

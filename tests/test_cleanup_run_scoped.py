@@ -73,12 +73,14 @@ def test_cleanup_scopes_worktree_removal_to_run_dir():
 
 
 def test_cleanup_branch_delete_scopes_to_run_id():
-    """When --branches is passed, only centella/<run-id> and
-    centella/<run-id>/* get deleted — NOT every centella/* branch."""
+    """When --branches is passed, only centella/runs/<run-id> and
+    centella/subtasks/<run-id>/* get deleted — NOT every centella/* branch.
+    The two prefixes are disjoint so neither is an ancestor ref of the
+    other (see compute_run_branch docstring)."""
     src = _src()
-    # The for-each-ref pattern restricts to the run_id's namespace.
-    assert 'refs/heads/centella/${run_id}' in src
-    assert 'refs/heads/centella/${run_id}/' in src
+    # The for-each-ref patterns restrict to the run_id's namespace.
+    assert 'refs/heads/centella/runs/${run_id}' in src
+    assert 'refs/heads/centella/subtasks/${run_id}/' in src
 
 
 def test_cleanup_all_runs_excludes_bootstrap():
@@ -118,7 +120,10 @@ def test_cleanup_legacy_still_removes_old_state_json():
 
 def test_cleanup_legacy_preserves_per_run_branches():
     """Commit 3's invariant: --legacy deletes ONE-segment centella/<sid>
-    branches but leaves TWO-segment centella/<run-id>/<sid> alone."""
+    branches but leaves multi-segment per-run branches alone. Under the
+    current shape that means centella/runs/<run-id> and
+    centella/subtasks/<run-id>/<sid> — both match the centella/*/* keep-
+    guard because each has at least one extra `/` after `centella/`."""
     src = _src()
     legacy_body = src.split('LEGACY" = "true"')[1].split("exit 0")[0]
     assert "centella/*/*" in legacy_body

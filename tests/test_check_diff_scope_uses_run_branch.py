@@ -1,13 +1,13 @@
 """Regression test for the per-run refactor: `check_diff_scope` and the
 finalize divergence check must compute diffs against the run branch
-(`centella/<run-id>`), not the legacy `centella/staging` branch.
+(now `centella/runs/<run-id>`), not the legacy `centella/staging` branch.
 
 Background: commit 3 of the parallel-safe refactor moved branch names
-from a global `centella/staging` to per-run `centella/<run-id>`. Two
-git-diff call sites kept the old name hardcoded, which means git
-returned non-zero and the functions silently returned `None` —
-disabling DESIGN §12's protected-path enforcement (check_diff_scope)
-and the finalize divergence-warning check.
+from a global `centella/staging` to per-run branches. Two git-diff call
+sites kept the old name hardcoded, which means git returned non-zero
+and the functions silently returned `None` — disabling DESIGN §12's
+protected-path enforcement (check_diff_scope) and the finalize
+divergence-warning check.
 
 This test pins the source so a future regression would fail loudly
 instead of silently disabling enforcement again. Source-text pin

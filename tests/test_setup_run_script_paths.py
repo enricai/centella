@@ -4,11 +4,19 @@ After commit 3 of the parallel-safe refactor:
 - `scripts/setup-run.sh` (renamed from setup-staging.sh) takes a RUN_ID
   argument and scopes all paths under `.centella/runs/$RUN_ID/`.
 - `scripts/new-worktree.sh` takes a second RUN_ID argument; subtask
-  branches are `centella/$RUN_ID/$ID`, branched off `centella/$RUN_ID`.
+  branches are `centella/subtasks/$RUN_ID/$ID`, branched off
+  `centella/runs/$RUN_ID`.
 - `scripts/integrate.sh` takes a second RUN_ID argument; merge target is
-  `centella/$RUN_ID`.
+  `centella/runs/$RUN_ID` and merge source is
+  `centella/subtasks/$RUN_ID/$ID`.
 - `scripts/finalize.sh` takes a RUN_ID argument; merge source is
-  `centella/$RUN_ID`.
+  `centella/runs/$RUN_ID`.
+
+The run-branch (`centella/runs/…`) and subtask-branch
+(`centella/subtasks/…`) prefixes are deliberately disjoint so neither is
+an ancestor ref of the other in git's loose ref store — without this,
+`git worktree add` for the first subtask fails with `cannot lock ref …`.
+See DESIGN.md §3 and `test_branch_namespaces_dont_collide.py`.
 
 None of these scripts should reference the legacy `centella/staging`
 branch name (which is removed by `cleanup.sh --legacy`).
@@ -53,7 +61,7 @@ def test_setup_run_uses_per_run_paths():
 
 def test_setup_run_branch_is_per_run():
     src = _script("setup-run.sh")
-    assert 'BRANCH="centella/${RUN_ID}"' in src
+    assert 'BRANCH="centella/runs/${RUN_ID}"' in src
     # The legacy 'centella/staging' branch name is gone.
     assert 'centella/staging' not in src
 
@@ -70,11 +78,13 @@ def test_new_worktree_uses_per_run_paths():
     assert '.centella/runs/${RUN_ID}/worktrees/${ID}' in src
 
 
-def test_new_worktree_branch_is_two_segment():
-    """Subtask branches are centella/<run-id>/<sid>, not centella/<sid>."""
+def test_new_worktree_branch_uses_subtasks_namespace():
+    """Subtask branches are centella/subtasks/<run-id>/<sid>, branched off
+    centella/runs/<run-id>. The two namespaces must be disjoint so neither
+    is an ancestor ref of the other in git's loose ref store."""
     src = _script("new-worktree.sh")
-    assert 'BRANCH="centella/${RUN_ID}/${ID}"' in src
-    assert 'PARENT_BRANCH="centella/${RUN_ID}"' in src
+    assert 'BRANCH="centella/subtasks/${RUN_ID}/${ID}"' in src
+    assert 'PARENT_BRANCH="centella/runs/${RUN_ID}"' in src
 
 
 def test_new_worktree_branches_off_run_branch():
@@ -96,9 +106,9 @@ def test_integrate_merges_into_per_run_staging():
     assert 'STAGING=".centella/runs/${RUN_ID}/worktrees/staging"' in src
 
 
-def test_integrate_branch_is_two_segment():
+def test_integrate_branch_uses_subtasks_namespace():
     src = _script("integrate.sh")
-    assert 'BRANCH="centella/${RUN_ID}/${ID}"' in src
+    assert 'BRANCH="centella/subtasks/${RUN_ID}/${ID}"' in src
     assert 'centella/staging' not in src
 
 
@@ -111,7 +121,7 @@ def test_finalize_takes_run_id_arg():
 
 def test_finalize_merges_per_run_branch():
     src = _script("finalize.sh")
-    assert 'BRANCH="centella/${RUN_ID}"' in src
+    assert 'BRANCH="centella/runs/${RUN_ID}"' in src
     # The legacy centella/staging branch is gone from executable lines.
     # (Comments may still mention it for historical context.)
     non_comment = "\n".join(

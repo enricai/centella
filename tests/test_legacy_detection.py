@@ -74,12 +74,14 @@ def test_cleanup_legacy_removes_centella_staging_branch():
 
 
 def test_cleanup_legacy_preserves_per_run_branches():
-    """Per-run branches (centella/<run-id>/<sid>) have two segments
-    after `centella/`. The legacy mode must NOT delete those."""
+    """Per-run branches have at least one additional `/` segment after
+    `centella/` — the run branch is `centella/runs/<run-id>` and subtask
+    branches are `centella/subtasks/<run-id>/<sid>`. The legacy mode
+    must NOT delete those."""
     src = CLEANUP_SH.read_text()
     # The mode iterates centella/* branches and uses a case statement to
-    # skip two-segment names. We pin the structural element.
+    # skip multi-segment names. We pin the structural element.
     assert 'centella/*/*' in src, (
         "cleanup.sh --legacy must use the centella/*/* glob to preserve "
-        "two-segment per-run subtask branches"
+        "multi-segment per-run branches (centella/runs/* and centella/subtasks/*/*)."
     )

@@ -20,12 +20,12 @@ import pytest
 def test_writes_to_run_dir_run_json(centella, tmp_path):
     """Basic write to a fresh run dir."""
     centella._write_run_json(tmp_path, run_id="feat-foo-abc123",
-                             branch="centella/feat-foo-abc123")
+                             branch="centella/runs/feat-foo-abc123")
     sidecar = tmp_path / "run.json"
     assert sidecar.exists()
     data = json.loads(sidecar.read_text())
     assert data["run_id"] == "feat-foo-abc123"
-    assert data["branch"] == "centella/feat-foo-abc123"
+    assert data["branch"] == "centella/runs/feat-foo-abc123"
 
 
 def test_merges_with_existing(centella, tmp_path):
@@ -33,7 +33,7 @@ def test_merges_with_existing(centella, tmp_path):
     into the first call's contents — used to update push/PR status
     incrementally without re-writing every field."""
     centella._write_run_json(tmp_path, run_id="feat-foo-abc123",
-                             branch="centella/feat-foo-abc123",
+                             branch="centella/runs/feat-foo-abc123",
                              task="add stuff")
     centella._write_run_json(tmp_path, pushed_at="2026-05-26T15:00:00+00:00")
     data = json.loads((tmp_path / "run.json").read_text())
@@ -123,7 +123,7 @@ def test_full_lifecycle(centella, tmp_path):
     centella._write_run_json(
         tmp_path,
         run_id="feat-foo-abc123",
-        branch="centella/feat-foo-abc123",
+        branch="centella/runs/feat-foo-abc123",
         working_branch="main",
         started_at="2026-05-26T14:00:00+00:00",
         task="x",

@@ -271,7 +271,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
 {
   "subtask_id": "bugfix-001",
   "status": "complete | incomplete-handoff | blocked | failed | needs-clarification",
-  "branch": "centella/bugfix-001",
+  "branch": "centella/subtasks/<run-id>/bugfix-001",
   "criteria_results": [
     {"criterion": "...", "met": true, "evidence": "how it was verified"}
   ],

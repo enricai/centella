@@ -218,6 +218,38 @@ The resolved value lives on `st.data["verbosity"]` and is
 re-resolved fresh on every run, including `--resume` — the user
 can dial up or down at resume time without editing state.
 
+### Inspect directories
+
+Extra directories the inspect-bucket workers (classifier, planner,
+reconciler) may read. Forwarded to each `claude -p` invocation as
+one `--add-dir` flag per entry. Use this when a task references a
+sibling repo outside the current repo cwd — for example, "compare
+how beacon and centella handle X, beacon is at `~/src/enric/beacon`":
+without `--inspect-dir ~/src/enric/beacon`, the classifier and
+planner cannot `Read`/`Grep`/`Glob` that path, and an attempt to
+fall back to `ls`/`find` is blocked by the workspace sandbox even
+though `INSPECT_TOOLS` allowlists those verbs.
+
+Resolution order (highest priority first):
+
+1. **`--inspect-dir PATH`** CLI flag, repeatable.
+2. **`CENTELLA_INSPECT_DIRS`** environment variable, colon-separated.
+3. **`centella.toml`**, `inspect_dirs = "/abs/path/a,/abs/path/b"`
+   (a comma-separated string, parsed by `_read_toml_key`).
+4. **Default** `[]` (no extra directories).
+
+Paths are expanded (`~` → `$HOME`) and resolved to absolute form at
+startup. Duplicates are removed. The resolved list lives on
+`st.data["inspect_dirs"]` and is re-resolved fresh on every run,
+including `--resume`, so the user can add or remove paths without
+editing state.
+
+This applies only to inspect-bucket workers. Acting workers
+(implementer, integrator) run inside the wave's worktree; the
+validator runs inside the integrated wave worktree. Those workers
+have `--dangerously-skip-permissions` and operate on the worktree
+copy, not the user's wider filesystem — `--add-dir` is unneeded.
+
 ### Model selection
 
 Every worker shells out to `claude -p`. The model passed via `--model` to that
@@ -305,10 +337,11 @@ Each worker is one `claude -p` headless process. Flags used:
 | `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.centella/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
 | `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/implementer/integrator, or the `VALIDATOR_SYSTEM` constant in `centella.py` for the validator |
-| `--allowedTools` | tool allowlist; three buckets — **read-only** (`READ_TOOLS`: Read/Grep/Glob/WebSearch/WebFetch) for classifier, planner, and reconciler; **acting** (`ACT_TOOLS`: read-set + Bash/Write/Edit) for implementer and integrator; **run-and-read** (`RUN_TOOLS`: read-set + Bash) for the validator — Bash to execute criteria, no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
+| `--allowedTools` | tool allowlist; three buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, and reconciler; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer and integrator; **run-and-read** (`RUN_TOOLS`: read set + Bash) for the validator. The acting and run-and-read buckets keep Bash unrestricted because their workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
-| `--dangerously-skip-permissions` | acting *and* run-and-read workers (implementer, integrator, validator) — suppresses all permission prompts for unattended Bash and file writes |
+| `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
+| `--dangerously-skip-permissions` | acting *and* run-and-read workers (implementer, integrator, validator) — suppresses all permission prompts for unattended Bash and file writes. **Not** applied to inspect workers — they run in the real repo cwd (no worktree isolation), so the blast-radius assumption that justifies skip-permissions doesn't hold. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
 
 `claude_p()` is `async`; every caller awaits it. Internally it awaits
 `_invoke()`, which spawns the worker via the `run_proc` helper
@@ -345,7 +378,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `centella.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
 | 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5, §14). |
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
-| 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `centella/<run-id>` and its worktree (per-run, isolated from any other run) |
+| 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `centella/runs/<run-id>` and its worktree (per-run, isolated from any other run) |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then re-validate. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume` |
 | 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh` | merge run branch into working branch; post-merge sanity checks; push the run branch and open a PR (unless `--no-push`); record push / PR outcome in `run.json` |
 
@@ -383,7 +416,7 @@ Run-id collisions are detected outside preflight because the final `run_id` is o
 | Check | Where | Catches |
 |-------|-------|---------|
 | `State.rename_to(new_run_id)` refuses if the target dir exists | `orchestrate()` after `phase_classify` | `.centella/runs/<run-id>/` already exists on disk |
-| `setup-run.sh` preserves an existing `centella/<run-id>` branch instead of creating it | wave-execute phase | A pre-existing branch with the same name (treated as a resume; the run picks up wherever the branch was left) |
+| `setup-run.sh` preserves an existing `centella/runs/<run-id>` branch instead of creating it | wave-execute phase | A pre-existing branch with the same name (treated as a resume; the run picks up wherever the branch was left) |
 
 The bootstrap directory `.centella/runs/_bootstrap-<6hex>/` is used until classify completes; the rename is atomic on POSIX same-filesystem.
 
@@ -472,13 +505,13 @@ verify manually; the run does not abort.
 | Check | Catches | On failure |
 |-------|---------|-----------|
 | most-recent merge subject contains `'centella:'` (read from `git log --merges -1 --format=%s HEAD`) | finalize merged to the wrong branch | non-fatal warning |
-| `git diff --stat centella/<run-id>..HEAD` empty | merge silently dropped changes | non-fatal warning |
+| `git diff --stat centella/runs/<run-id>..HEAD` empty | merge silently dropped changes | non-fatal warning |
 
 ### Resume integrity — `validate_resume_state()`
 Enforces (one half of) DESIGN §6's "the run branch is the resume contract"
 invariant — state.json's `waves`/`completed_waves` say *which* wave to
-resume; the never-reset `centella/<run-id>` branch holds *the work* every
-prior wave produced. Both must be coherent for resume to be safe.
+resume; the never-reset `centella/runs/<run-id>` branch holds *the work*
+every prior wave produced. Both must be coherent for resume to be safe.
 
 On `--resume`: asserts `task` is present and non-empty; asserts `waves`,
 `completed_waves`, `subtask_status` are well-formed *if present*. `waves` is
@@ -595,13 +628,13 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 
 | Script | Behavior |
 |--------|----------|
-| `setup-run.sh <run-id>` | Creates `centella/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `.centella/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `.centella/runs/<run-id>/worktrees/staging` if missing. Appends `.centella/` to the repo's `.git/info/exclude` (idempotent). Safe on `--resume`. |
-| `new-worktree.sh <id> <run-id>` | Creates `centella/<run-id>/<id>` worktree at `.centella/runs/<run-id>/worktrees/<id>` branched off the current `centella/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. |
-| `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.centella/runs/<run-id>/worktrees/staging`): `git merge --no-ff centella/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
-| `finalize.sh <run-id>` | The *local-merge half* of finalize. Checks out the working branch (recorded by `setup-run.sh`), merges `centella/<run-id>` into it. On conflict: `git merge --abort`, restore the working branch clean, exit non-zero with manual-merge instructions; run branch left intact. The push and PR step is **not** in this script — it lives in `push_and_open_pr()` in `centella.py` (see below) so it can compose the PR body with `compose_pr_body()`, write `run.json`, and emit Python-style multi-line failure messages. |
-| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap \| --legacy] [--branches]` | Default (no flag): scans `.centella/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.centella/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--legacy` removes the pre-per-run layout (`.centella/state.json`, `.centella/worktrees/`, `centella/staging` branch). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches (`centella/<id>` and `centella/<id>/*`); without `--branches`, branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh` — full nuke-the-run is the Ctrl-C path in the orchestrator (`_cleanup_on_abnormal_exit(full_purge=True)`). |
+| `setup-run.sh <run-id>` | Creates `centella/runs/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `.centella/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `.centella/runs/<run-id>/worktrees/staging` if missing. Appends `.centella/` to the repo's `.git/info/exclude` (idempotent). Safe on `--resume`. |
+| `new-worktree.sh <id> <run-id>` | Creates `centella/subtasks/<run-id>/<id>` worktree at `.centella/runs/<run-id>/worktrees/<id>` branched off the current `centella/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`centella/runs/…`) and subtask-branch (`centella/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
+| `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.centella/runs/<run-id>/worktrees/staging`): `git merge --no-ff centella/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
+| `finalize.sh <run-id>` | The *local-merge half* of finalize. Checks out the working branch (recorded by `setup-run.sh`), merges `centella/runs/<run-id>` into it. On conflict: `git merge --abort`, restore the working branch clean, exit non-zero with manual-merge instructions; run branch left intact. The push and PR step is **not** in this script — it lives in `push_and_open_pr()` in `centella.py` (see below) so it can compose the PR body with `compose_pr_body()`, write `run.json`, and emit Python-style multi-line failure messages. |
+| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap \| --legacy] [--branches]` | Default (no flag): scans `.centella/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.centella/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--legacy` removes the pre-per-run layout (`.centella/state.json`, `.centella/worktrees/`, `centella/staging` branch). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches (`centella/runs/<id>` and `centella/subtasks/<id>/*`); without `--branches`, branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh` — full nuke-the-run is the Ctrl-C path in the orchestrator (`_cleanup_on_abnormal_exit(full_purge=True)`). |
 
-A run branch `centella/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
+A run branch `centella/runs/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
 ### Push and PR (Python; called from `phase_finalize`)
 
@@ -609,7 +642,7 @@ The push + PR step is implemented in Python rather than in `finalize.sh`. It run
 
 | Function (centella.py) | Behavior |
 |--------|----------|
-| `push_and_open_pr(st, no_verify)` | Pushes `centella/<run-id>` to `origin` (with `--no-verify` appended if the CLI flag was set), then opens a PR via `gh pr create --base <working-branch> --head centella/<run-id> --title centella: <run-id> --body-file -` piping `compose_pr_body(st.data, st.run_id)`. Push failure dies non-zero with a multi-line message naming both branches, the captured stderr, and the exact retry command; updates `.centella/runs/<run-id>/run.json` with `push_error`. PR-creation failure is **non-fatal**: logs a warning with the pushed-branch URL and the retry command; updates `run.json` with `pr_error` and returns 0 (the run is complete; only the PR is missing). |
+| `push_and_open_pr(st, no_verify)` | Pushes `centella/runs/<run-id>` to `origin` (with `--no-verify` appended if the CLI flag was set), then opens a PR via `gh pr create --base <working-branch> --head centella/runs/<run-id> --title centella: <run-id> --body-file -` piping `compose_pr_body(st.data, st.run_id)`. Push failure dies non-zero with a multi-line message naming both branches, the captured stderr, and the exact retry command; updates `.centella/runs/<run-id>/run.json` with `push_error`. PR-creation failure is **non-fatal**: logs a warning with the pushed-branch URL and the retry command; updates `run.json` with `pr_error` and returns 0 (the run is complete; only the PR is missing). |
 | `_check_gh_cli(no_push)` | Preflight gate. Short-circuits silently when `--no-push` is set. Else verifies `shutil.which("gh")`, `gh auth status` exits 0, and `git remote get-url origin` succeeds. Each failure dies with an actionable message + the `--no-push` escape hatch. |
 
 `--no-push` skips the entire push + PR step (the run completes with the local merge only). CLI flag, `CENTELLA_NO_PUSH` env, `no_push = true` in `centella.toml` — same precedence pattern as `--source-of-truth`. `--no-verify` is CLI-only and only affects the push step (worker `git commit`s inside worktrees still run all hooks).
@@ -666,7 +699,7 @@ discovery without parsing the full `state.json`):
 | Field | Shape | Notes |
 |-------|-------|-------|
 | `run_id` | str | the run identifier (matches the directory name and the branch suffix) |
-| `branch` | str | the run branch — always `centella/<run_id>` |
+| `branch` | str | the run branch — always `centella/runs/<run_id>` |
 | `working_branch` | str | the branch HEAD-at-run-start; the PR base and the finalize merge target |
 | `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
 | `finished_at` | ISO-8601 str \| null | wall-clock end time, set at finalize success |
@@ -723,6 +756,7 @@ written somewhere in `orchestrator/centella.py`. The coupling test in
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both` / `ask`) |
 | `no_clarify` | bool | whether `--no-clarify` was passed |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
+| `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler) via `--add-dir`. Resolved from `--inspect-dir` / `CENTELLA_INSPECT_DIRS` / `inspect_dirs` in `centella.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
 | `test_runner` | list[str] | detected short-circuit test command |
 | `integrator_failure` | dict | unresolvable conflict from `integrate_wave` (non-fatal signal log) |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
@@ -865,6 +899,8 @@ enforcement functions:
 | `test_check_merge_committed.py` | `check_merge_committed()` (real-git fixtures) |
 | `test_criteria_revision.py` | `_proposal_structurally_valid()`, `apply_criteria_revision()`, `record_criteria_revision()` (DESIGN §9 proposal channel) |
 | `test_validator_tools.py` | `RUN_TOOLS` composition and `validate_wave`'s wiring — pins that the validator gets `Bash` but never `Write`/`Edit`, enforcing the DESIGN §12 "you do not modify code" rule mechanically (per §3 of this document) |
+| `test_inspect_tools.py` | `INSPECT_TOOLS` composition and the three inspect-callsite wirings (classifier, planner, reconciler) — pins that the inspect bucket grants `Bash(<verb>:*)` patterns but never `Write`/`Edit` or bare `Bash`, the same DESIGN §12 enforcement applied to workers that don't get `--dangerously-skip-permissions` |
+| `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 
 Run with `pytest tests/` from the repo root. The suite completes in
 under two seconds end to end.

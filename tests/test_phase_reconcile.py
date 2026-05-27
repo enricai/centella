@@ -198,12 +198,14 @@ def test_phase_reconcile_uses_reconciler_schema(centella):
     assert 'schema_key="reconciler"' in src
 
 
-def test_phase_reconcile_uses_read_tools(centella):
+def test_phase_reconcile_uses_inspect_tools(centella):
     """Reconciler is read-only — same tool bucket as classifier/planner.
     Pin so a refactor doesn't accidentally upgrade it to ACT_TOOLS
-    (write/edit) which would let the worker modify files."""
+    (write/edit) which would let the worker modify files. INSPECT_TOOLS
+    replaced READ_TOOLS to allow allowlisted read-only Bash without
+    relying on --dangerously-skip-permissions (DESIGN §12)."""
     src = inspect.getsource(centella.phase_reconcile)
-    assert "allowed_tools=READ_TOOLS" in src
+    assert "allowed_tools=INSPECT_TOOLS" in src
 
 
 def test_phase_reconcile_uses_reconciler_model(centella):

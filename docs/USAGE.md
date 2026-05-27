@@ -99,67 +99,75 @@ appear at `.centella/subtasks/<id>.json`.
 
 ## Step 4 — Wave execution
 
-For each wave Centella creates a per-subtask git worktree off the
-`centella/staging` branch, then spawns an implementer worker in each
-worktree. Workers run concurrently, capped by `--max-parallel` (default
-4).
+For each wave Centella creates a per-subtask git worktree off the run
+branch (`centella/runs/<run-id>`), then spawns an implementer worker in
+each worktree. Workers run concurrently, capped by `--max-parallel`
+(default 4).
 
-On stdout you'll see lines like:
+On stdout you'll see lines like (with a hypothetical `<run-id>` of
+`feat-add-dry-run-flag-a3f7c2`):
 
 ```
 [wave 1] implementer feat-add-dry-run-flag: start
 [wave 1] implementer feat-add-dry-run-flag: ok (3 turns, 12.4s)
-[wave 1] integrating feat-add-dry-run-flag into centella/staging
-[wave 1] validating centella/staging
+[wave 1] integrating feat-add-dry-run-flag into centella/runs/feat-add-dry-run-flag-a3f7c2
+[wave 1] validating centella/runs/feat-add-dry-run-flag-a3f7c2
 ```
 
 And `git worktree list` will show entries like:
 
 ```
-/your/repo                         abc1234 [main]
-/your/repo/.centella/worktrees/staging   def5678 [centella/staging]
-/your/repo/.centella/worktrees/feat-add-dry-run-flag  ghi9012 [centella/feat-add-dry-run-flag]
+/your/repo                                                                       abc1234 [main]
+/your/repo/.centella/runs/feat-add-dry-run-flag-a3f7c2/worktrees/staging         def5678 [centella/runs/feat-add-dry-run-flag-a3f7c2]
+/your/repo/.centella/runs/feat-add-dry-run-flag-a3f7c2/worktrees/feat-add-dry-run-flag  ghi9012 [centella/subtasks/feat-add-dry-run-flag-a3f7c2/feat-add-dry-run-flag]
 ```
 
-After every implementer commits in its worktree, the integrator merges its
-branch into `centella/staging`, and the validator runs your project's
-detected test runner against staging to confirm nothing regressed. Acting
-workers use `--dangerously-skip-permissions` by design — bounded by
-worktree isolation. See [README "Safety"](../README.md#safety) and
+After every implementer commits in its worktree, the integrator merges
+its branch into the run branch, and the validator runs your project's
+detected test runner against the run branch to confirm nothing regressed.
+Acting workers use `--dangerously-skip-permissions` by design — bounded
+by worktree isolation. See [README "Safety"](../README.md#safety) and
 [`DESIGN.md`](DESIGN.md) §6.
 
-## Step 5 — Reviewing staging
+## Step 5 — Reviewing the run branch
 
-Before phase 6 merges anything into your working branch, **review staging
-yourself**. This is what staging-as-integration-buffer (DESIGN §6) buys
-you:
+Before phase 6 merges anything into your working branch, **review the
+run branch yourself**. This is what the run-branch-as-integration-buffer
+(DESIGN §6) buys you:
 
 ```bash
-git log centella/staging --oneline
-git diff main..centella/staging
+git log centella/runs/<run-id> --oneline
+git diff main..centella/runs/<run-id>
 ```
 
 You will see one commit per subtask (one per worker), with subtask id in
 the subject line. If the diff looks wrong — too broad, missed an edge
 case, conflicting with something you wanted preserved — this is where you
-intervene. Either re-run Centella with a refined task, or hand-edit
-staging, or abandon and `scripts/cleanup.sh --branches`.
+intervene. Either re-run Centella with a refined task, hand-edit the run
+branch, or abandon and `./scripts/cleanup.sh --run-id <run-id> --branches`.
 
 ## Step 6 — Finalization
 
-Phase 6 merges `centella/staging` into your working branch (the branch you
-were on when you invoked Centella, recorded in `.centella/working-branch`)
-and runs post-merge sanity checks. The `centella/*` worker branches and
-the `centella/staging` branch remain in your repo as an audit trail. Each
-worker's full commit history is preserved on `centella/<subtask-id>`.
+Phase 6 merges `centella/runs/<run-id>` into your working branch (the
+branch you were on when you invoked Centella, recorded in
+`.centella/runs/<run-id>/working-branch`) and runs post-merge sanity
+checks. The per-subtask branches under `centella/subtasks/<run-id>/` and
+the run branch `centella/runs/<run-id>` remain in your repo as an audit
+trail. Each worker's full commit history is preserved on its
+`centella/subtasks/<run-id>/<subtask-id>` branch.
 
 When you no longer need the audit trail:
 
 ```bash
-scripts/cleanup.sh --branches
+./scripts/cleanup.sh --run-id <run-id> --branches
 ```
 
-removes the worktrees and deletes the `centella/*` branches.
+removes that run's worktrees and deletes both its run branch
+(`centella/runs/<run-id>`) and every subtask branch
+(`centella/subtasks/<run-id>/*`). The per-run state directory
+`.centella/runs/<run-id>/` is kept as a smaller audit trail; `rm -rf` it
+manually when you no longer need that either. For an audit cleanup
+across every past run, use `--all-runs --branches`.
 
 ## What happens when something goes wrong
 
@@ -167,16 +175,17 @@ removes the worktrees and deletes the `centella/*` branches.
 resolve (an external dependency, an ambiguous spec, a failing test it
 cannot fix). The wave aborts *before* integration, the blocker reason
 lands in `state['blocked'][<subtask-id>]` and `subtask_status[<id>] =
-"blocked"`, and Centella exits non-zero. You read the blocker, fix the
-upstream issue (often by editing the task and re-running, sometimes by
-hand-resolving), then `./centella --resume`. See
-[`DESIGN.md`](DESIGN.md) §8 for the evidence-gated loop logic that
-produces this signal.
+"blocked"` inside `.centella/runs/<run-id>/state.json`, and Centella
+exits non-zero. You read the blocker, fix the upstream issue (often by
+editing the task and re-running, sometimes by hand-resolving), then
+`./centella --resume`. See [`DESIGN.md`](DESIGN.md) §8 for the
+evidence-gated loop logic that produces this signal.
 
 **Integration fails.** The integrator can't merge a subtask branch into
-staging — usually a conflict it cannot resolve behaviorally. Centella
-records the failure in `state['integrator_failure']` and exits. Pull up
-the conflicting branches yourself, resolve, and resume.
+the run branch — usually a conflict it cannot resolve behaviorally.
+Centella records the failure in `state['integrator_failure']` (inside
+`.centella/runs/<run-id>/state.json`) and exits. Pull up the conflicting
+branches yourself, resolve, and resume.
 
 **The run is interrupted.** Ctrl-C, system reboot, budget-cap hit. Run
 `./centella --resume` from the same directory. The resume cursor is

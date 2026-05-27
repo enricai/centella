@@ -5,20 +5,20 @@
 # is green. Leaves the repo checked out on the working branch.
 #
 # Push and PR are added in a subsequent commit. For now this script does
-# the same local merge it always did, just against centella/<run-id>
+# the same local merge it always did, just against centella/runs/<run-id>
 # instead of the global centella/staging.
 #
 # If the merge conflicts — which happens only if the working branch received
 # commits DURING the centella run, so it has diverged from where the run
 # branch was branched — the merge is aborted cleanly: the working branch
 # is restored to its pre-finalize state, and the script exits non-zero. The
-# orchestrator reports this; centella/<run-id> is intact and the run can be
-# finalized manually.
+# orchestrator reports this; centella/runs/<run-id> is intact and the run
+# can be finalized manually.
 set -euo pipefail
 
 RUN_ID="${1:?usage: finalize.sh <run-id>}"
 RUN_DIR=".centella/runs/${RUN_ID}"
-BRANCH="centella/${RUN_ID}"
+BRANCH="centella/runs/${RUN_ID}"
 WORKING_BRANCH_FILE="${RUN_DIR}/working-branch"
 
 if [ ! -f "${WORKING_BRANCH_FILE}" ]; then

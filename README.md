@@ -41,7 +41,7 @@ centella "<task>"
    ├─ Phase 2  Plan — one planner per category (parallel)        → N claude -p
    │             ↓ reconcile cross-domain capability tags          → 0 or 1 claude -p
    ├─ Phase 3  Schedule — global dependency graph → topo waves   (pure Python)
-   ├─ Phase 4  Create centella/<run-id> branch + worktree (per-run unique)
+   ├─ Phase 4  Create centella/runs/<run-id> branch + worktree (per-run unique)
    ├─ Phase 5  Per wave: implement (parallel, isolated worktrees) → claude -p each
    │           integrate into the run branch; validate the run branch
    └─ Phase 6  Merge run branch → working branch; push + open PR; cleanup
@@ -207,8 +207,8 @@ subprocess; there is no in-session agent nesting.
 | `classifier` | `prompts/classifier.md` | opus | 1 | category set + intent questions |
 | `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
 | `reconciler` | `prompts/reconciler.md` | opus | 0 or 1 (spawned only when planners' capability tags don't align) | renames / added_provides / added_subtasks / unresolvable |
-| `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `centella/<run-id>/<subtask-id>` branch |
-| `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `centella/<run-id>` |
+| `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `centella/subtasks/<run-id>/<subtask-id>` branch |
+| `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `centella/runs/<run-id>` |
 | `validator` | constant `VALIDATOR_SYSTEM` in `centella.py` (not a file) | opus | once per wave | pass/fail on the run branch |
 
 **Per-worker model defaults:** judgment workers (classifier, planner,
@@ -254,11 +254,11 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/reconciler.md` | System prompt: reconcile cross-domain capability-tag drift between planner outputs |
 | `prompts/implementer.md` | System prompt: execute one subtask end to end |
 | `prompts/integrator.md` | System prompt: resolve merge conflicts behaviorally |
-| `scripts/setup-run.sh` | Create per-run branch + worktree (`centella/<run-id>`) |
+| `scripts/setup-run.sh` | Create per-run branch + worktree (`centella/runs/<run-id>`) |
 | `scripts/new-worktree.sh` | Create per-subtask branch + worktree off the run branch |
 | `scripts/integrate.sh` | Merge a subtask branch into the run branch |
 | `scripts/finalize.sh` | Merge the run branch into the working branch (local merge only — the push + PR step lives in Python's `push_and_open_pr`, called from `phase_finalize` unless `--no-push`) |
-| `scripts/cleanup.sh` | Remove worktrees for one run (default `--run-id`) or all runs (`--all-runs`). State dir always preserved as audit. `--branches` also deletes the matching `centella/<run-id>*` branches. `--bootstrap` removes orphaned `_bootstrap-*` dirs (runs that died before classify completed). `--legacy` removes the pre-per-run layout. |
+| `scripts/cleanup.sh` | Remove worktrees for one run (default `--run-id`) or all runs (`--all-runs`). State dir always preserved as audit. `--branches` also deletes the matching `centella/runs/<id>` run branch and `centella/subtasks/<id>/*` subtask branches. `--bootstrap` removes orphaned `_bootstrap-*` dirs (runs that died before classify completed). `--legacy` removes the pre-per-run layout. |
 | `centella` | Executable entry-point wrapper |
 | `commands/centella.md` | Thin plugin skill — reachable as `/centella` from Claude Code |
 | `docs/DESIGN.md` | Full design document and rationale |
@@ -272,13 +272,13 @@ Acting workers use `--dangerously-skip-permissions`. That is a real risk
 surface — it is what makes the run unattended. It is bounded by worktree
 isolation (each worker operates in its own isolated checkout, not your main
 working tree) but not eliminated. **Run on repositories you trust, ideally in
-a container, and review the run branch (`centella/<run-id>`) before relying
+a container, and review the run branch (`centella/runs/<run-id>`) before relying
 on the result.** Push + PR at finalize is the natural review surface; you
 can also pass `--no-push` to keep finalize fully local.
 
 The run writes only to `.centella/runs/<run-id>/` (auto-excluded from git
-via `.git/info/exclude`) and to `centella/<run-id>` plus
-`centella/<run-id>/<subtask-id>` branches until Phase 6, when it merges into
+via `.git/info/exclude`) and to `centella/runs/<run-id>` plus
+`centella/subtasks/<run-id>/<subtask-id>` branches until Phase 6, when it merges into
 your working branch and (unless `--no-push`) pushes the run branch to
 `origin`. After a run, the run branches are kept as an audit trail. Remove
 them with `scripts/cleanup.sh --run-id <id> --branches` (or `--all-runs
@@ -299,7 +299,8 @@ them with `scripts/cleanup.sh --run-id <id> --branches` (or `--all-runs
 
 - **Run interrupted (Ctrl-C)** — Ctrl-C is treated as the user's explicit
   "throw this away" gesture. The run's worktrees, branches, and state dir
-  are all removed (`centella/<run-id>*` branches included). The run is
+  are all removed (`centella/runs/<run-id>` and
+  `centella/subtasks/<run-id>/*` branches included). The run is
   *not* resumable. If you want to abort temporarily and resume later, use
   `kill <pid>` (SIGTERM) instead — see the next entry.
 
@@ -336,7 +337,8 @@ key is read or sent.
 **Can I run multiple Centella instances in the same repository?**
 Yes. Each invocation derives a unique `run_id` and namespaces all of its
 state under `.centella/runs/<run-id>/` and its branches under
-`centella/<run-id>` — so parallel runs in the same clone never collide.
+`centella/runs/<run-id>` (run branch) and `centella/subtasks/<run-id>/<sid>`
+(subtask branches) — so parallel runs in the same clone never collide.
 Use `--list` to see what's in flight and `--resume --run-id <id>` to
 resume a specific one.
 
@@ -350,8 +352,8 @@ The validator falls back to a worker-driven correctness check. See
 and what happens when nothing is detected.
 
 **Can I see what each worker did?**
-Yes. Every worker commits to its own `centella/<run-id>/<subtask-id>`
-branch and those branches survive the run. `git log centella/<run-id>/<subtask-id>`
+Yes. Every worker commits to its own `centella/subtasks/<run-id>/<subtask-id>`
+branch and those branches survive the run. `git log centella/subtasks/<run-id>/<subtask-id>`
 is your per-worker audit trail; `scripts/cleanup.sh --run-id <id> --branches`
 removes one run's branches, `--all-runs --branches` removes all of them.
 

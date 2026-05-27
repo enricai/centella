@@ -247,7 +247,7 @@ three inputs known by the end of Phase 1:
   precision).
 
 The result looks like `feat-add-telemetry-skills-a3f7c2`. It is the same
-string in three places: the run branch name (`centella/<run-id>`), the
+string in three places: the run branch name (`centella/runs/<run-id>`), the
 per-run state directory (`.centella/runs/<run-id>/`), and the title of the
 PR opened at finalize. A user looking at any of the three can grep for the
 others.
@@ -260,11 +260,20 @@ is no shared "staging" namespace that two runs could collide on.
 ### The run branch as an integration buffer
 
 Integration does not happen on the user's working branch. Each run has its
-own **run branch** (`centella/<run-id>`) that receives every subtask's work;
-the user's branch is untouched until the run finishes and succeeds. A failed
-or messy integration therefore never lands on the branch the user cares
-about. Multiple runs in the same repository each have their own run branch
-and integrate independently.
+own **run branch** (`centella/runs/<run-id>`) that receives every subtask's
+work; the user's branch is untouched until the run finishes and succeeds. A
+failed or messy integration therefore never lands on the branch the user
+cares about. Multiple runs in the same repository each have their own run
+branch and integrate independently.
+
+Subtask branches live under a sibling namespace: `centella/subtasks/<run-id>/<sid>`.
+The run-branch and subtask-branch prefixes are deliberately disjoint
+(`centella/runs/…` vs. `centella/subtasks/…`) because git's loose ref store
+cannot hold both a ref AT a path and a ref UNDER that same path
+simultaneously — `centella/<run-id>` as a leaf ref and
+`centella/<run-id>/<sid>` as a child ref would collide on the first
+`git worktree add`. Sibling prefixes make the collision structurally
+impossible.
 
 Integration is **incremental, one wave at a time**. Each wave's results are
 merged into the run branch and the merged result is validated before the
@@ -405,9 +414,10 @@ runs a cleanup pass before exiting, and the cleanup *scope* depends on
 the cause.
 
 **Ctrl-C (SIGINT) → full purge.** The user explicitly told centella to
-abort. Worktrees, run branch + per-subtask branches (`centella/<run-id>`,
-`centella/<run-id>/*`), and the per-run state directory are all removed.
-The run is gone; `--resume` cannot recover it.
+abort. Worktrees, run branch + per-subtask branches
+(`centella/runs/<run-id>` and `centella/subtasks/<run-id>/*`), and the
+per-run state directory are all removed. The run is gone; `--resume`
+cannot recover it.
 
 **SIGTERM, SIGHUP, WorkerError, any other exception → worktrees only.**
 The orchestrator was likely killed by something external (CI cancel,

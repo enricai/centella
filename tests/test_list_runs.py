@@ -127,10 +127,10 @@ def test_list_runs_skips_bootstrap_dirs(centella, tmp_path, capsys):
 def test_list_runs_renders_branch_from_run_json(centella, tmp_path, capsys):
     _make_run(tmp_path, "feat-a-aaaaaa",
               {"started_at": "2026-05-26T10:00:00+00:00", "task": "x"},
-              run_json={"branch": "centella/feat-a-aaaaaa"})
+              run_json={"branch": "centella/runs/feat-a-aaaaaa"})
     centella.list_runs(tmp_path)
     out = capsys.readouterr().out
-    assert "centella/feat-a-aaaaaa" in out
+    assert "centella/runs/feat-a-aaaaaa" in out
 
 
 def test_list_runs_falls_back_to_compute_run_branch(centella, tmp_path, capsys):
@@ -140,4 +140,4 @@ def test_list_runs_falls_back_to_compute_run_branch(centella, tmp_path, capsys):
               {"started_at": "2026-05-26T10:00:00+00:00", "task": "x"})
     centella.list_runs(tmp_path)
     out = capsys.readouterr().out
-    assert "centella/feat-a-aaaaaa" in out
+    assert "centella/runs/feat-a-aaaaaa" in out

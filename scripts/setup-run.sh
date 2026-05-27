@@ -3,19 +3,25 @@
 #
 # Each centella invocation has a unique run_id; this script sets up the
 # directory and branch for that run. Records the current working branch,
-# creates `centella/<run-id>` off the current HEAD, adds a worktree at
-# `.centella/runs/<run-id>/worktrees/staging`, and ensures `.centella/`
+# creates `centella/runs/<run-id>` off the current HEAD, adds a worktree
+# at `.centella/runs/<run-id>/worktrees/staging`, and ensures `.centella/`
 # is git-excluded.
 #
-# GENUINELY idempotent: if `centella/<run-id>` already exists (a run is
-# in progress, or this is a --resume), the branch is LEFT WHERE IT IS.
+# GENUINELY idempotent: if `centella/runs/<run-id>` already exists (a run
+# is in progress, or this is a --resume), the branch is LEFT WHERE IT IS.
 # It is never force-reset — doing so would discard every integration
 # commit from the waves already completed.
+#
+# Branch shape: the `runs/` segment is mandatory. Subtask branches live
+# under `centella/subtasks/<run-id>/<sid>` (a sibling namespace) so the
+# run-branch and its subtask branches can never be parent/child refs in
+# git's loose ref store. See DESIGN.md §3 ("The run branch as an
+# integration buffer") for the loose-ref-store collision being avoided.
 set -euo pipefail
 
 RUN_ID="${1:?usage: setup-run.sh <run-id>}"
 RUN_DIR=".centella/runs/${RUN_ID}"
-BRANCH="centella/${RUN_ID}"
+BRANCH="centella/runs/${RUN_ID}"
 STAGING_WT="${RUN_DIR}/worktrees/staging"
 WORKING_BRANCH_FILE="${RUN_DIR}/working-branch"
 
@@ -34,7 +40,7 @@ fi
 WORKING_BRANCH="$(cat "${WORKING_BRANCH_FILE}")"
 
 # Create the run branch ONLY if it does not already exist. An existing
-# centella/<run-id> carries the integrated work of completed waves — never reset it.
+# centella/runs/<run-id> carries the integrated work of completed waves — never reset it.
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   echo "run-branch: ${BRANCH} (existing — preserved, not reset)"
 else

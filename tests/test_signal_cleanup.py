@@ -170,18 +170,24 @@ def test_cleanup_full_purge_deletes_branches(centella, tmp_path, monkeypatch):
     st = _FakeState(run_id, run_dir)
 
     branches_to_delete = [
-        f"centella/{run_id}",
-        f"centella/{run_id}/feat-001",
+        f"centella/runs/{run_id}",
+        f"centella/subtasks/{run_id}/feat-001",
     ]
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         if cmd[:2] == ["git", "for-each-ref"]:
-            # Return all branches on the first matching call; empty on others.
-            if cmd[3].startswith(f"refs/heads/centella/{run_id}") and not cmd[3].endswith("/"):
-                return subprocess.CompletedProcess(cmd, 0, f"centella/{run_id}\n", "")
-            return subprocess.CompletedProcess(cmd, 0, f"centella/{run_id}/feat-001\n", "")
+            # The cleanup walks two globs: refs/heads/centella/runs/<id>
+            # (the run branch, exact match) and refs/heads/centella/subtasks/<id>/
+            # (the subtask-branch prefix). Distinguish by the runs/ vs subtasks/
+            # segment so each glob returns the matching branch.
+            glob = cmd[3]
+            if glob == f"refs/heads/centella/runs/{run_id}":
+                return subprocess.CompletedProcess(cmd, 0, f"centella/runs/{run_id}\n", "")
+            if glob == f"refs/heads/centella/subtasks/{run_id}/":
+                return subprocess.CompletedProcess(cmd, 0, f"centella/subtasks/{run_id}/feat-001\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(centella.subprocess, "run", fake_run)
 

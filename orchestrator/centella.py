@@ -78,7 +78,7 @@ STATE_FIELDS = (
     "worker_count", "telemetry",
     "categories", "classifier_questions", "answers",
     "needs_source_of_truth", "source_of_truth_pref", "no_clarify",
-    "verbosity",
+    "verbosity", "inspect_dirs",
     "test_runner",
     "integrator_failure", "integrator_warnings", "scope_warnings",
 )
@@ -103,12 +103,42 @@ CATEGORY_ABBREV = {
     "documentation": "docs",
 }
 
-READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch"
-ACT_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit"
+_READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
+# INSPECT_TOOLS is the read-only-with-shell bucket for classifier, planner,
+# and reconciler. These workers run in the real repo cwd (not a worktree),
+# so they cannot use --dangerously-skip-permissions safely. Without
+# pre-approval, Bash calls in -p mode are gated by the permission system,
+# return is_error=true, and surface as "tool-fail" — even for benign
+# commands like `ls foo 2>&1` whose redirection trips the
+# multiple-operations splitter. The Bash(<verb>:*) prefix patterns
+# pre-approve specific read-only verbs (verified against claude 2.1.150:
+# the pattern matcher handles trailing redirection like `2>&1`).
+# Write/Edit are deliberately omitted: the §12 "read-only worker" contract
+# stays mechanically enforced — anything outside this allowlist falls
+# through and is rejected in non-interactive mode.
+INSPECT_TOOLS = (
+    f"{_READ_BASE},"
+    "Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),"
+    "Bash(wc:*),Bash(grep:*),Bash(rg:*),Bash(file:*),Bash(stat:*),"
+    "Bash(tree:*),Bash(pwd),Bash(echo:*),"
+    "Bash(git log:*),Bash(git show:*),Bash(git diff:*),"
+    "Bash(git status),Bash(git branch:*),Bash(git ls-files:*)"
+)
+ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
 # RUN_TOOLS adds Bash to the read set so the validator can execute criteria
 # (pytest, shell checks) without gaining Write/Edit. Mechanical enforcement of
 # VALIDATOR_SYSTEM's "you do not modify code" rule, per DESIGN §12.
-RUN_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,Bash"
+RUN_TOOLS = f"{_READ_BASE},Bash"
+
+# --inspect-dir preference: extra directories to grant the inspect-bucket
+# workers (classifier, planner, reconciler) read access to via the
+# Claude Code CLI's --add-dir flag. Without this, Read/Grep/Glob and the
+# allowlisted Bash verbs in INSPECT_TOOLS are sandboxed to the repo cwd,
+# so cross-repo references like "~/src/enric/beacon" fail with "blocked,
+# outside allowed working directories". Repeatable on the CLI; env var is
+# colon-separated; TOML key is a comma-separated string. Empty by default.
+INSPECT_DIRS_ENV = "CENTELLA_INSPECT_DIRS"
+INSPECT_DIRS_FILE = "centella.toml"
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 
@@ -556,8 +586,10 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     failures are caught — one bad worktree shouldn't block the others.
 
     If `full_purge` is True (the user's explicit Ctrl-C gesture):
-    additionally delete every centella/<run-id>* branch and recursively
-    remove `st.run_dir`. The run is gone; `--resume` can't recover it.
+    additionally delete the run branch (`centella/runs/<run-id>`) and
+    every subtask branch (`centella/subtasks/<run-id>/*`), and
+    recursively remove `st.run_dir`. The run is gone; `--resume` can't
+    recover it.
 
     If `full_purge` is False (SIGTERM/SIGHUP/exception): state.json and
     the run branch are left intact so `--resume --run-id <id>` can
@@ -592,10 +624,13 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         pass
     if not full_purge:
         return
-    # Full purge: delete branches and the run dir.
+    # Full purge: delete branches and the run dir. The run branch lives
+    # at centella/runs/<run-id> and subtask branches under
+    # centella/subtasks/<run-id>/<sid> — see compute_run_branch for the
+    # namespace-disjointness rationale.
     branch_globs = [
-        f"refs/heads/centella/{st.run_id}",
-        f"refs/heads/centella/{st.run_id}/",
+        f"refs/heads/centella/runs/{st.run_id}",
+        f"refs/heads/centella/subtasks/{st.run_id}/",
     ]
     for glob in branch_globs:
         r = subprocess.run(
@@ -683,7 +718,7 @@ def _check_gh_cli(no_push: bool) -> None:
 # --- run identifier (DESIGN §6 "The run identifier") --------------------
 #
 # A run_id namespaces a single centella invocation across its branch
-# (`centella/<run-id>`), state directory (`.centella/runs/<run-id>/`),
+# (`centella/runs/<run-id>`), state directory (`.centella/runs/<run-id>/`),
 # and PR title (`centella: <run-id>`). Built from three deterministic
 # inputs known by the end of Phase 1: short-category abbrev, sanitized
 # task slug, and a 6-hex digest of `started_at`. Two concurrent runs
@@ -765,9 +800,28 @@ def compute_run_id(categories: list[str], task: str, started_at: str) -> str:
 
 def compute_run_branch(run_id: str) -> str:
     """The git branch name carrying a run's integrated work.
-    Trivial wrapper, but the single place to change branch-name shape
-    later if needed (e.g., adding a `centella/runs/` prefix)."""
-    return f"centella/{run_id}"
+
+    The `centella/runs/` prefix is **mandatory**, not cosmetic. Subtask
+    branches live under the sibling prefix `centella/subtasks/<run-id>/<sid>`
+    (see `compute_subtask_branch`). Git's loose ref store represents each
+    ref as a file inside `refs/heads/…/`, so a ref AT a path and a ref
+    UNDER that same path cannot coexist. If both lived under
+    `centella/<run-id>` the first `git worktree add` for a subtask would
+    fail with `cannot lock ref …`. The disjoint `runs/` and `subtasks/`
+    sub-namespaces make that collision structurally impossible."""
+    return f"centella/runs/{run_id}"
+
+
+def compute_subtask_branch(run_id: str, sid: str) -> str:
+    """The git branch name for one subtask's worktree.
+
+    Paired with `compute_run_branch` — see that function for the
+    namespace-disjointness rationale. The bash side
+    (`scripts/new-worktree.sh`, `scripts/integrate.sh`) constructs the
+    same string; this helper exists so the shape is grep-able from
+    Python and any future Python call site that needs a subtask branch
+    name goes through one function."""
+    return f"centella/subtasks/{run_id}/{sid}"
 
 
 # --- run.json sidecar invariants (IMPLEMENTATION.md §8) -----------------
@@ -1132,6 +1186,47 @@ def resolve_confidence_rounds(repo_root: Path,
     return DEFAULT_CAPS["confidence_rounds"]
 
 
+def resolve_inspect_dirs(repo_root: Path,
+                         cli_values: list[str] | None = None) -> list[str]:
+    """Resolve the extra inspection directories for classifier/planner/
+    reconciler. Order: --inspect-dir CLI flags (one or more, repeatable) →
+    CENTELLA_INSPECT_DIRS env var (colon-separated) → inspect_dirs in
+    centella.toml (comma-separated string) → []. Paths are expanded
+    (~ → $HOME) and resolved to absolute form so a relative path in TOML
+    still works after the orchestrator changes cwd. Non-existent paths
+    are accepted at resolve time — the CLI surfaces a clearer error if
+    --add-dir gets a bad path, and we want startup to fail fast at the
+    use site rather than rejecting a typo before classify even runs."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        p = raw.strip()
+        if not p:
+            return
+        abs_p = str(Path(p).expanduser().resolve())
+        if abs_p not in seen:
+            seen.add(abs_p)
+            out.append(abs_p)
+
+    if cli_values:
+        for p in cli_values:
+            _add(p)
+        return out
+    env = os.environ.get(INSPECT_DIRS_ENV, "").strip()
+    if env:
+        for p in env.split(":"):
+            _add(p)
+        return out
+    cfg = repo_root / INSPECT_DIRS_FILE
+    file_val = _read_toml_key(cfg, "inspect_dirs")
+    if file_val is not None:
+        for p in file_val.split(","):
+            _add(p)
+        return out
+    return out
+
+
 def _parse_bool_envtoml(value: str) -> bool | None:
     """Parse a boolean from an env var or TOML scalar. Returns True/False
     for the conventional spellings; None for the empty string / unset.
@@ -1392,7 +1487,8 @@ async def preflight(centella_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     # 3. (removed in per-run refactor) The global centella/* branch and
     #    .centella/worktrees/* checks used to fail a second concurrent
     #    run; they no longer apply now that each run namespaces its
-    #    branches as centella/<run-id> and its worktrees under the
+    #    branches as centella/runs/<run-id> (and subtask branches as
+    #    centella/subtasks/<run-id>/<sid>) and its worktrees under the
     #    per-run dir. A run_id collision is detected separately at
     #    State.rename_to() (filesystem side) and during setup-run.sh
     #    (git side). See DESIGN.md §6 and §14 ("single-clone parallelism").
@@ -1873,10 +1969,10 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     Returns a fatal error string if protected paths were touched.
     Logs a non-fatal warning for unexpected scope. Returns None when clean.
 
-    The diff is computed against the run branch (centella/<run-id>) — the
-    base every subtask branched off of. Hardcoding `centella/staging` here
-    used to silently disable the check after the per-run refactor (the
-    branch doesn't exist), so the protected-path enforcement was off."""
+    The diff is computed against the run branch (`centella/runs/<run-id>`)
+    — the base every subtask branched off of. Hardcoding `centella/staging`
+    here used to silently disable the check after the per-run refactor
+    (the branch doesn't exist), so the protected-path enforcement was off."""
     run_branch = compute_run_branch(st.run_id)
     r = await run_proc(
         ["git", "diff", "--name-only", f"{run_branch}..HEAD"],
@@ -1961,7 +2057,7 @@ async def check_branch_has_commits(sid: str, worktree: str,
                                    parent_branch: str) -> str | None:
     """Return error if the implementer's subtask branch has no commits
     ahead of the run branch (`parent_branch` — typically
-    `centella/<run-id>`). An empty diff means the worker produced
+    `centella/runs/<run-id>`). An empty diff means the worker produced
     schema-valid JSON claiming success while doing nothing — a silent
     no-op that wastes an integration attempt."""
     if not Path(worktree).exists():
@@ -2398,7 +2494,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
 
 async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    cwd: str, allowed_tools: str, max_turns: int, autonomous: bool,
-                   caps: dict, st: "State", model: str, sid: str) -> dict:
+                   caps: dict, st: "State", model: str, sid: str,
+                   add_dirs: list[str] | None = None) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
 
@@ -2424,6 +2521,13 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     `sid` is the worker identifier used in inline log tags and the
     per-worker log filename (e.g. `bugfix-001`, `classifier`,
     `planner-bug-fixing`, `integrator-feat-001`, `validator-wave-2`).
+
+    `add_dirs` are extra paths forwarded to the CLI as `--add-dir` entries.
+    Used by the inspect bucket (classifier, planner, reconciler) so the
+    `Read`/`Grep`/`Glob` sandbox and the allowlisted `Bash` verbs can reach
+    sibling repos referenced in the task description. Resolved by
+    `resolve_inspect_dirs()` and persisted under `st.data["inspect_dirs"]`
+    so `--resume` honors the original choice.
     """
     schema = json.dumps(SCHEMAS[schema_key], separators=(",", ":"))
     centella_dir = st.path.parent
@@ -2440,6 +2544,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             "--max-turns", str(max_turns),
             "--model", model,
         ]
+        for d in (add_dirs or ()):
+            cmd.extend(["--add-dir", d])
         if autonomous:
             # acting workers run inside an isolated worktree; skipping prompts
             # is what makes the run unattended. Blast radius is the worktree.
@@ -2586,8 +2692,9 @@ async def phase_classify(task: str, st: State, caps: dict, no_clarify: bool,
     result = await claude_p(
         user_prompt=f"TASK:\n{task}\n\nClassify it and apply the clarification filter.",
         system_prompt=sys_prompt, schema_key="classifier", cwd=os.getcwd(),
-        allowed_tools=READ_TOOLS, max_turns=20, autonomous=False,
+        allowed_tools=INSPECT_TOOLS, max_turns=20, autonomous=False,
         caps=caps, st=st, model=models["classifier"], sid="classifier",
+        add_dirs=st.data.get("inspect_dirs") or None,
     )
     cats = [c for c in result.get("categories", []) if c in CATEGORIES]
     if not cats:
@@ -2819,10 +2926,11 @@ async def phase_plan(task: str, st: State, caps: dict,
                   "per your instructions.")
             return await claude_p(user_prompt=up, system_prompt=sys_prompt,
                                   schema_key="planner", cwd=os.getcwd(),
-                                  allowed_tools=READ_TOOLS, max_turns=40,
+                                  allowed_tools=INSPECT_TOOLS, max_turns=40,
                                   autonomous=False, caps=caps, st=st,
                                   model=models["planner"],
-                                  sid=f"planner-{category}")
+                                  sid=f"planner-{category}",
+                                  add_dirs=st.data.get("inspect_dirs") or None)
 
     plans = await gather_or_cancel(*(plan_one(c) for c in cats))
     for category, plan in zip(cats, plans):
@@ -3031,9 +3139,10 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     output = await claude_p(
         user_prompt=user_prompt, system_prompt=sys_prompt,
         schema_key="reconciler", cwd=os.getcwd(),
-        allowed_tools=READ_TOOLS, max_turns=30,
+        allowed_tools=INSPECT_TOOLS, max_turns=30,
         autonomous=False, caps=caps, st=st,
         model=models["reconciler"], sid="reconciler",
+        add_dirs=st.data.get("inspect_dirs") or None,
     )
 
     # Fail closed on unresolvable BEFORE mutating anything — the user
@@ -3824,6 +3933,7 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
         # resume without editing state.json.
         st.data["source_of_truth_pref"] = sot_pref
         st.data["verbosity"] = verbosity
+        st.data["inspect_dirs"] = list(getattr(args, "inspect_dirs", []) or [])
         st.save()
         # Absorb --answers on resume too. The documented user flow for
         # a non-interactive deferred-question exit (Phase-1 or §11
@@ -3839,6 +3949,7 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
         st.data = {"task": task, "started_at": now(), "worker_count": 0,
                    "source_of_truth_pref": sot_pref,
                    "verbosity": verbosity,
+                   "inspect_dirs": list(getattr(args, "inspect_dirs", []) or []),
                    "no_clarify": bool(args.no_clarify)}
         st.save()
         await preflight(centella_dir, verbosity=verbosity,
@@ -3958,6 +4069,15 @@ def main() -> None:
                     help=f"source-of-truth preference "
                          f"({'|'.join(SOURCE_OF_TRUTH_VALUES)}); overrides "
                          f"{SOURCE_OF_TRUTH_ENV} and centella.toml")
+    ap.add_argument("--inspect-dir", action="append", metavar="PATH",
+                    dest="inspect_dir",
+                    help="extra directory the inspect-bucket workers "
+                         "(classifier, planner, reconciler) may read. "
+                         "Forwarded to `claude -p` as --add-dir. Repeatable. "
+                         "Use for sibling repos referenced in the task that "
+                         "live outside the current repo cwd. Also "
+                         f"{INSPECT_DIRS_ENV} (colon-separated) or "
+                         "inspect_dirs in centella.toml (comma-separated).")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
                          f"({'|'.join(MODEL_VALUES)}); without an override, "
@@ -4069,6 +4189,12 @@ def main() -> None:
     # preflight() / phase_finalize() see the resolved value uniformly via
     # `args.no_push` regardless of where the choice came from.
     args.no_push = resolve_no_push(repo_root, args.no_push)
+
+    # Resolve --inspect-dir: CLI flags (repeatable) → CENTELLA_INSPECT_DIRS
+    # env (colon-separated) → inspect_dirs in centella.toml (comma-separated)
+    # → []. Re-attached to args so orchestrate() can fold it into state.
+    args.inspect_dirs = resolve_inspect_dirs(
+        repo_root, getattr(args, "inspect_dir", None))
 
     # Signal handlers (DESIGN §6 / DESIGN §14): SIGTERM and SIGHUP raise
     # InterruptedBySignal so the same try/except machinery that catches
