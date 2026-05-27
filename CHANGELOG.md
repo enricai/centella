@@ -38,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Per-worker overrides (`--model-<worker>`, `CENTELLA_MODEL_<WORKER>`,
   `model_<worker>`) let you dial individual workers independently.
 
+- `validate_checkpoint()` rejects a wider set of placeholder tokens.
+  The single-token noise list now includes `nothing`, `unknown`, `todo`,
+  and `pending`, and a normalization step strips trailing `.`/`!`/`…`
+  and collapses pure-`?` runs before the membership check — so `None.`,
+  `TBD!`, and `???` are caught alongside the bare forms. The two
+  "nothing-to-report-is-OK" sections (`Decisions made`, `Open unknowns`)
+  continue to accept these. Effect: a previously-accepted thin handoff
+  that used any of the new variants now fails the checkpoint validation
+  and the orchestrator routes the subtask to `blocked` per the existing
+  rule.
+
 ### Deprecated
 
 ### Removed

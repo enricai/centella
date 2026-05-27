@@ -435,7 +435,7 @@ checked mechanically, never semantic merit. A reviewer wanting stronger
 judgment reads `state.json["criteria_revisions"]` after the run.
 
 | `check_diff_scope()` | `.centella/` `.git/` `.claude/` in the diff | **Terminal** (protected path); scope-volume warning is non-fatal (triggered when `files_likely_touched` is non-empty *and* touched > max(3× expected, 5), or when touched > 15 regardless of the planner's estimate) |
-| `validate_checkpoint()` — on `incomplete-handoff` | required section missing; required section empty/whitespace; required section contains only a placeholder token (`none`/`n/a`/`tbd`/…); a path listed under `## Files touched` no longer exists in the worktree and is not flagged `[deleted]` | returns `blocked` |
+| `validate_checkpoint()` — on `incomplete-handoff` | required section missing; required section empty/whitespace; required section contains only a placeholder token (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing `.`/`!`/`?`/`…` ignored and repeated `?` collapsed); a path listed under `## Files touched` no longer exists in the worktree and is not flagged `[deleted]` | returns `blocked` |
 | `_retryable_failure(summary)` — on `status='failed'` returned by the worker itself | worker self-report of failure | routed through the retry policy using the worker's `summary` as the reason; because `summary` is freeform text it almost never matches a retryable marker, so in practice a self-reported `failed` is **terminal** on first occurrence |
 
 ### Wave-level checks (after integration, before validation)
@@ -751,9 +751,11 @@ touched*, *Decisions made*, *Evidence gate status*, *Next action*, *Open
 unknowns*. The validator enforces three layers: (a) every section header
 must be present; (b) every section must carry non-whitespace content; (c)
 the five "must carry handoff context" sections reject single-token
-placeholder content (`none`/`n/a`/`tbd`/`—`/`-`/`?`) — the two
+placeholder content (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`) — the two
 "nothing-to-report-is-OK" sections (*Decisions made*, *Open unknowns*)
-accept these. When a `worktree_root` is passed, `validate_checkpoint()`
+accept these. Trailing punctuation (`.`/`!`/`?`/`…`) is stripped before
+the comparison and repeated `?` is collapsed, so `None.`, `TBD!`, and
+`???` are caught alongside the bare tokens. When a `worktree_root` is passed, `validate_checkpoint()`
 also runs a freshness check: every path listed under *Files touched* must
 either still exist in the worktree or carry a `[deleted]` annotation,
 catching stale checkpoints whose paths were removed by partial work after

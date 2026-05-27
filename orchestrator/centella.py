@@ -1655,8 +1655,15 @@ _CHECKPOINT_SECTIONS_ALLOW_NONE = {"## Decisions made", "## Open unknowns"}
 
 # Single-token substitutes for content. A required section that contains
 # only one of these is not a checkpoint, it's a placeholder — the
-# successor would learn nothing from it.
-_NOISE_TOKENS = {"none", "n/a", "na", "tbd", "—", "--", "-", "?"}
+# successor would learn nothing from it. `_normalize_for_noise()` strips
+# trailing punctuation and collapses repeated `?` before the membership
+# check, so `None.`, `TBD!`, and `???` are caught alongside the bare
+# tokens.
+_NOISE_TOKENS = {
+    "none", "n/a", "na", "tbd",
+    "nothing", "unknown", "todo", "pending",
+    "—", "--", "-", "?",
+}
 
 
 def _split_checkpoint_sections(content: str) -> dict[str, list[str]]:
@@ -1708,7 +1715,7 @@ def validate_checkpoint(path: str,
         # where "nothing to report" is a legitimate answer.
         if header in _CHECKPOINT_SECTIONS_ALLOW_NONE:
             continue
-        if all(_strip_bullet(l).lower() in _NOISE_TOKENS for l in lines):
+        if all(_normalize_for_noise(l) in _NOISE_TOKENS for l in lines):
             return (f"section '{header}' contains only placeholder tokens "
                     f"({lines!r}) — successor cannot resume from this")
 
@@ -1728,6 +1735,21 @@ def validate_checkpoint(path: str,
                         "[deleted] — checkpoint is stale")
 
     return None
+
+
+def _normalize_for_noise(line: str) -> str:
+    """Reduce a checkpoint line to its comparison key for `_NOISE_TOKENS`.
+    Strips the bullet marker, lowercases, collapses a pure run of `?` to a
+    single `?`, then peels off trailing `.`/`!`/`…` — so `None.`, `TBD!`,
+    and `???` all match their bare-token forms. The `?`-collapse runs
+    before the trailing-punctuation strip; otherwise `???` would be
+    eaten down to the empty string and miss the `?` token entirely."""
+    s = _strip_bullet(line).lower().strip()
+    if s and set(s) == {"?"}:
+        s = "?"
+    while s and s[-1] in ".!…":
+        s = s[:-1].rstrip()
+    return s
 
 
 def _strip_bullet(line: str) -> str:

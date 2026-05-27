@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 def _full_good_checkpoint() -> str:
     """A complete checkpoint with real content in every section."""
@@ -144,6 +146,58 @@ def test_noise_token_in_decisions_made_passes(centella, tmp_path):
     p = tmp_path / "dec-na.md"
     p.write_text(ok)
     assert centella.validate_checkpoint(str(p)) is None
+
+
+# Widened token set + trailing-punctuation normalization. Each value is
+# the entire body of `## Current status` (a section that must carry
+# handoff context, so a placeholder body is always rejected).
+@pytest.mark.parametrize("body", [
+    # widened English tokens
+    "nothing",
+    "Unknown",
+    "todo",
+    "pending",
+    # trailing punctuation on the original tokens
+    "None.",
+    "n/a.",
+    "TBD!",
+    "tbd…",
+    # repeated `?` collapses
+    "???",
+    "????",
+    # bullet + widened + trailing punctuation, combined
+    "- Nothing.",
+    "* unknown!",
+])
+def test_widened_noise_tokens_rejected(centella, tmp_path, body):
+    bad = _full_good_checkpoint().replace(
+        "## Current status\n"
+        "Half-implemented; endpoint exists, tests pending.\n",
+        f"## Current status\n{body}\n")
+    p = tmp_path / "bad.md"
+    p.write_text(bad)
+    err = centella.validate_checkpoint(str(p))
+    assert err is not None, f"expected rejection for body={body!r}"
+    assert "placeholder" in err
+
+
+@pytest.mark.parametrize("body", [
+    # real prose with a trailing period: must NOT be mistaken for a token
+    "Half-implemented; endpoint exists, tests pending.",
+    # a word that happens to start with a noise token but carries content
+    "None of the auth paths have been wired yet.",
+    # bullet with substantive content
+    "- todo: this is real next-step content, not a placeholder",
+])
+def test_real_content_not_falsely_rejected(centella, tmp_path, body):
+    ok = _full_good_checkpoint().replace(
+        "## Current status\n"
+        "Half-implemented; endpoint exists, tests pending.\n",
+        f"## Current status\n{body}\n")
+    p = tmp_path / "ok.md"
+    p.write_text(ok)
+    assert centella.validate_checkpoint(str(p)) is None, (
+        f"unexpected rejection for body={body!r}")
 
 
 # ----- freshness check on `## Files touched` ---------------------------------
