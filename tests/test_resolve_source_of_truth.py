@@ -1,8 +1,8 @@
 """Tests for resolve_source_of_truth().
 
-Covers the CLI flag → env var → per-repo file → 'ask' resolution order,
+Covers the CLI flag → env var → per-repo file → 'both' resolution order,
 the value enum, comment/whitespace handling, and the die() path for
-invalid values.
+invalid values (including the legacy 'ask' value, now rejected).
 """
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ def test_file_absent_env_set(centella, repo_root, monkeypatch):
     assert centella.resolve_source_of_truth(repo_root) == "research"
 
 
-def test_both_unset_defaults_to_ask(centella, repo_root):
-    assert centella.resolve_source_of_truth(repo_root) == "ask"
+def test_both_unset_defaults_to_both(centella, repo_root):
+    assert centella.resolve_source_of_truth(repo_root) == "both"
 
 
 def test_env_wins_over_file(centella, repo_root, monkeypatch):
@@ -72,16 +72,36 @@ def test_comments_and_blank_lines_tolerated(centella, repo_root):
     assert centella.resolve_source_of_truth(repo_root) == "research"
 
 
-@pytest.mark.parametrize("value", ["codebase", "research", "both", "ask"])
-def test_all_four_values_accepted_in_file(centella, repo_root, value):
+@pytest.mark.parametrize("value", ["codebase", "research", "both"])
+def test_all_three_values_accepted_in_file(centella, repo_root, value):
     (repo_root / "centella.toml").write_text(f"source_of_truth = {value}\n")
     assert centella.resolve_source_of_truth(repo_root) == value
 
 
-@pytest.mark.parametrize("value", ["codebase", "research", "both", "ask"])
-def test_all_four_values_accepted_in_env(centella, repo_root, monkeypatch, value):
+@pytest.mark.parametrize("value", ["codebase", "research", "both"])
+def test_all_three_values_accepted_in_env(centella, repo_root, monkeypatch, value):
     monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", value)
     assert centella.resolve_source_of_truth(repo_root) == value
+
+
+def test_legacy_ask_in_file_dies(centella, repo_root, capsys):
+    (repo_root / "centella.toml").write_text("source_of_truth = ask\n")
+    with pytest.raises(SystemExit) as exc:
+        centella.resolve_source_of_truth(repo_root)
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "is not one of" in err
+    assert "ask" in err
+
+
+def test_legacy_ask_in_env_dies(centella, repo_root, monkeypatch, capsys):
+    monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "ask")
+    with pytest.raises(SystemExit) as exc:
+        centella.resolve_source_of_truth(repo_root)
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "is not one of" in err
+    assert "ask" in err
 
 
 def test_bad_file_value_dies(centella, repo_root, capsys):
@@ -106,9 +126,9 @@ def test_bad_env_value_dies(centella, repo_root, monkeypatch, capsys):
 
 def test_empty_env_treated_as_unset(centella, repo_root, monkeypatch):
     monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "")
-    assert centella.resolve_source_of_truth(repo_root) == "ask"
+    assert centella.resolve_source_of_truth(repo_root) == "both"
 
 
 def test_whitespace_only_env_treated_as_unset(centella, repo_root, monkeypatch):
     monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "   ")
-    assert centella.resolve_source_of_truth(repo_root) == "ask"
+    assert centella.resolve_source_of_truth(repo_root) == "both"

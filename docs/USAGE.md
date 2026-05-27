@@ -45,9 +45,9 @@ export CENTELLA_SOURCE_OF_TRUTH=codebase
 /path/to/centella/centella --model opus "Add a --dry-run flag …"
 ```
 
-Setting `CENTELLA_SOURCE_OF_TRUTH=codebase` up front tells the classifier
-not to ask whether to trust the codebase or external research — useful for
-a tight walkthrough where you don't want to be interrupted.
+Setting `CENTELLA_SOURCE_OF_TRUTH=codebase` up front pins the
+source-of-truth preference for this run — useful when the default
+(`both`) is not what you want.
 
 Within the first few seconds you will see preflight output on stdout — git
 identity check, working-tree-clean check, a live `claude -p` smoke test —
@@ -200,10 +200,9 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
 
 ## Tuning for your workflow
 
-- `--source-of-truth codebase|research|both|ask` — one-off CLI override;
-  beats env and `centella.toml`.
-- `CENTELLA_SOURCE_OF_TRUTH=codebase|research|both|ask` — sticky preference;
-  skips the clarification question.
+- `--source-of-truth codebase|research|both` — one-off CLI override;
+  beats env and `centella.toml`. Unset → default `both`.
+- `CENTELLA_SOURCE_OF_TRUTH=codebase|research|both` — sticky preference.
 - `centella.toml` at the repo root with `source_of_truth = codebase` —
   committed per-repo default; outranked by env and CLI.
 - `--model sonnet|opus|haiku` — model for every worker this run.
@@ -222,7 +221,8 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
 - `--max-workers N` — cap total `claude -p` subprocess count over the run.
 - `--max-parallel N` — cap concurrent implementers per wave.
 - `--no-clarify` — skip clarification entirely; intent questions are
-  dropped and source-of-truth defaults to `codebase`.
+  dropped and source-of-truth is taken from the resolved preference
+  (default `both`).
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70` — lower auto-compaction threshold
   for worker processes.
 

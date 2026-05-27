@@ -84,9 +84,9 @@ export CENTELLA_NO_PUSH=1
 /path/to/centella/centella "task" --no-verify
 
 # Skip clarification entirely (DESIGN §11). Intent questions from the
-# classifier are dropped; the source-of-truth question is satisfied from
-# CENTELLA_SOURCE_OF_TRUTH / centella.toml if set, and otherwise defaults
-# to `codebase` with a logged warning.
+# classifier are dropped; the source-of-truth value is taken from the
+# resolved preference (CLI / CENTELLA_SOURCE_OF_TRUTH / centella.toml /
+# default `both`).
 /path/to/centella/centella "task" --no-clarify
 
 # Pre-supply clarification answers:
@@ -112,9 +112,10 @@ export CENTELLA_CONFIDENCE_ROUNDS=12
 /path/to/centella/centella "task" --verbosity normal
 export CENTELLA_VERBOSITY=stream
 
-# Set the source-of-truth preference globally so centella does not ask
-# (or pass --source-of-truth on the command line for a one-off override):
-export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both, ask
+# Override the default source-of-truth preference (`both`). CLI flag and
+# env var are session-scoped overrides; commit `source_of_truth = ...` in
+# centella.toml for a per-repo default.
+export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both
 /path/to/centella/centella "task" --source-of-truth codebase
 
 # Choose the model. Without overrides: judgment workers (classifier,
@@ -177,11 +178,11 @@ claude --plugin-dir /path/to/centella
 ### Source-of-truth preference
 
 For feature work, centella needs to know whether to draw conventions from the
-codebase, from online research, from both (codebase first; research as
-fallback), or to ask the user. Resolution order (highest priority first):
+codebase, from online research, or from both (codebase first; research as
+fallback). Resolution order (highest priority first):
 
-1. **`--source-of-truth`** CLI flag, values `codebase` | `research` | `both` |
-   `ask`. Argparse rejects anything else before the orchestrator runs.
+1. **`--source-of-truth`** CLI flag, values `codebase` | `research` | `both`.
+   Argparse rejects anything else before the orchestrator runs.
 
 2. **`CENTELLA_SOURCE_OF_TRUTH`** environment variable, same value set.
 
@@ -192,12 +193,16 @@ fallback), or to ask the user. Resolution order (highest priority first):
    source_of_truth = codebase
    ```
 
-4. **Default `ask`.** When unset, centella surfaces the question on a feature
-   task and prints a hint that setting the env var or the per-repo file
-   will skip it next time.
+4. **Default `both`.** When unset, centella runs feature tasks with
+   `source_of_truth = both` — codebase patterns first, with researched
+   best-practice standards as a fallback where the codebase is insufficient.
+   The preference is never surfaced as an interactive question; setting it
+   explicitly (CLI, env, or file) overrides the default.
 
 An invalid value in env or file is rejected at startup via `die()` — bad
-config is caught before any worker spawns.
+config is caught before any worker spawns. A legacy `ask` value anywhere
+(CLI, env, file, or `--answers`) now fails with the standard validation
+error.
 
 > The CLI/env > file order reflects that the CLI flag and env var are
 > session-scoped knobs (a user reaching for them is making a one-off
@@ -466,9 +471,9 @@ the original run and the resume is intentional and takes effect.
 
 ### The `--answers` file
 
-A JSON object keyed by classifier-assigned question `id`, plus
-`source_of_truth` set to `"codebase"`, `"research"`, or `"both"` when the
-source-of-truth question was asked:
+A JSON object keyed by classifier-assigned question `id`. Optionally
+includes a `source_of_truth` key set to `"codebase"`, `"research"`, or
+`"both"` to override the resolved preference for this run:
 
 ```json
 { "q1": "answer text", "source_of_truth": "codebase" }
@@ -525,7 +530,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 |-------|-------------|--------------|
 | Preflight | `preflight` | git identity, clean working tree, `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected later in the flow (filesystem side in `State.rename_to()` post-classify; git side in `setup-run.sh`'s branch-creation step) — they cannot be checked in preflight because the final `run_id` isn't known until phase_classify completes. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `--resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 8-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
-| 0 Clarify | `gather_answers` | if questions and interactive: collect; non-interactive: write `pending-questions.json`, exit code 10; `--no-clarify` skips clarification entirely per DESIGN §11 — intent questions dropped, source-of-truth resolved from preference or defaulted to `codebase` with a warning |
+| 0 Clarify | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`); if classifier intent questions remain and interactive: collect; non-interactive: write `pending-questions.json`, exit code 10; `--no-clarify` drops intent questions entirely per DESIGN §11 |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `centella.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
 | 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5, §14). |
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
@@ -910,7 +915,7 @@ written somewhere in `orchestrator/centella.py`. The coupling test in
 | `classifier_questions` | list[dict] | intent questions the classifier surfaced |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation |
-| `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both` / `ask`) |
+| `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `no_clarify` | bool | whether `--no-clarify` was passed |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
 | `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler) via `--add-dir`. Resolved from `--inspect-dir` / `CENTELLA_INSPECT_DIRS` / `inspect_dirs` in `centella.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
@@ -925,8 +930,6 @@ the plugin skill in `commands/centella.md`):
 | Field | Shape | Notes |
 |-------|-------|-------|
 | `questions` | array of `{id, question, why_underivable?}` | the classifier-surfaced intent questions not already in `--answers` |
-| `source_of_truth` | bool | true if the user still needs to answer the source-of-truth question |
-| `source_of_truth_hint` | string \| null | the env-var/`centella.toml` hint to show the user when `source_of_truth` is true |
 
 `answers.json` (written by the plugin skill, passed back via
 `--answers .centella/answers.json`):
@@ -934,7 +937,7 @@ the plugin skill in `commands/centella.md`):
 | Field | Shape | Notes |
 |-------|-------|-------|
 | `<question id>` | string | one entry per question id from `pending-questions.json.questions[].id` |
-| `source_of_truth` | `"codebase"` / `"research"` / `"both"` | required only when `pending-questions.json.source_of_truth` was true |
+| `source_of_truth` | `"codebase"` / `"research"` / `"both"` | optional; overrides the resolved preference for this run |
 
 The checkpoint schema — seven required sections, enforced by
 `validate_checkpoint()`: *Frozen success criteria*, *Current status*, *Files
@@ -975,8 +978,8 @@ type. Required fields, current shape:
   (array of `{id, question, why_underivable?}` — only `id` and `question`
   are required on each question), `source_of_truth_question` (bool). The
   classifier only flags whether the source-of-truth question is relevant;
-  the orchestrator's preference resolution (see §2) decides whether to
-  actually ask.
+  the orchestrator's preference resolution (see §2) supplies the value
+  (default `both`).
 - **planner** — required: `domain`, `subtasks`, `status`, `confidence`.
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,

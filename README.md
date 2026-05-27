@@ -107,12 +107,13 @@ git clone https://github.com/enricai/centella.git
 /path/to/centella/centella "task" --confidence-rounds 12
 export CENTELLA_CONFIDENCE_ROUNDS=12
 
-# Set the source-of-truth preference globally so centella does not ask,
-# or pass --source-of-truth on the command line for a one-off override.
-# Alternatively, commit a centella.toml at the repo root with the line
-# `source_of_truth = codebase` (or research / both / ask).
+# Override the default source-of-truth preference (`both`) — pass
+# --source-of-truth on the command line for a one-off, set
+# CENTELLA_SOURCE_OF_TRUTH for the session, or commit a centella.toml
+# at the repo root with the line `source_of_truth = codebase` (or
+# research / both).
 # Precedence (highest first): --source-of-truth > env > centella.toml.
-export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both, ask
+export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both
 /path/to/centella/centella "task" --source-of-truth codebase
 
 # Choose the model. Without overrides, judgment workers (classifier /
@@ -154,12 +155,12 @@ Complete reference for every CLI flag, environment variable, and
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `CENTELLA_NO_PUSH` / `centella.toml`. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
-| `--no-clarify` | off | Skip clarification entirely. Intent questions are dropped; source-of-truth is resolved from `--source-of-truth` / env / file, otherwise defaults to `codebase`. |
+| `--no-clarify` | off | Skip clarification entirely. Intent questions are dropped; source-of-truth is the resolved preference (`--source-of-truth` / env / file / default `both`). |
 | `--max-workers N` | 40 | Cap on total `claude -p` invocations across the run. |
 | `--max-parallel N` | 4 | Cap on concurrent workers within a wave. |
 | `--confidence-rounds N` | 8 | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `CENTELLA_CONFIDENCE_ROUNDS` and `centella.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
-| `--source-of-truth VALUE` | — | `codebase` / `research` / `both` / `ask`. Overrides `CENTELLA_SOURCE_OF_TRUTH` and `centella.toml`. |
+| `--source-of-truth VALUE` | `both` | `codebase` / `research` / `both`. Overrides `CENTELLA_SOURCE_OF_TRUTH` and `centella.toml`. |
 | `--model ALIAS` | per-worker (judgment: `opus`; implementer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | inherits `--model` | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
 | `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.centella/logs/<sid>.log`. |
@@ -170,7 +171,7 @@ Complete reference for every CLI flag, environment variable, and
 
 | Env var | `centella.toml` key | Description |
 |---------|---------------------|-------------|
-| `CENTELLA_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both` / `ask`). Overridden by `--source-of-truth`. |
+| `CENTELLA_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `CENTELLA_MODEL` | `model` | Model alias applied to every worker (beats the per-worker defaults). Overridden by `--model` and per-worker overrides. |
 | `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
 | `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer, default 8). Overridden by `--confidence-rounds`. |
@@ -181,7 +182,7 @@ Complete reference for every CLI flag, environment variable, and
 ### Precedence
 
 - **Source-of-truth** (highest first): `--source-of-truth` →
-  `CENTELLA_SOURCE_OF_TRUTH` → `centella.toml` → default `ask`.
+  `CENTELLA_SOURCE_OF_TRUTH` → `centella.toml` → default `both`.
 - **Model** (per worker, highest first): `--model-<worker>` →
   `--model` → `CENTELLA_MODEL_<WORKER>` → `CENTELLA_MODEL` →
   `model_<worker>` in `centella.toml` → `model` in `centella.toml` →

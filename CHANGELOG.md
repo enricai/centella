@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`ask` source-of-truth value.** The four-value preference
+  (`codebase` / `research` / `both` / `ask`) collapses to three.
+  Default is now `both` (codebase first; research as fallback) — the
+  preference is never surfaced as an interactive question, because
+  setting `--source-of-truth` / `CENTELLA_SOURCE_OF_TRUTH` /
+  `source_of_truth` in `centella.toml` already expresses an explicit
+  intent, and an unset preference implicitly accepts `both`. A legacy
+  `ask` value anywhere (CLI, env, TOML, `--answers`) now fails the
+  standard validation gate at startup. `gather_answers` no longer
+  prompts for source-of-truth or emits the `source_of_truth` /
+  `source_of_truth_hint` fields in `pending-questions.json`.
+
 ### Added
 
 - `reconciler` worker. Spawned by the orchestrator between `phase_plan`

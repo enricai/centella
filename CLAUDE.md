@@ -83,7 +83,7 @@ orchestrator and not used anywhere in this repo.
   points and never inside a `st.data[k] = v; st.save()` pair.
 - **Source-of-truth answers go through the validation gate in
   `gather_answers`.** Anything reading `answers["source_of_truth"]` can
-  trust the value is in `SOURCE_OF_TRUTH_ANSWERS` (`codebase` /
+  trust the value is in `SOURCE_OF_TRUTH_VALUES` (`codebase` /
   `research` / `both`).
 - **Don't write to `.centella/` from inside a subtask worktree.** The
   worktree is disposable; coordination state must outlive it. The
@@ -134,9 +134,9 @@ tests/                      pytest suite
 # Resume after an interruption:
 ./centella --resume
 
-# Set a global source-of-truth preference (otherwise centella asks)
-# — or pass --source-of-truth for a one-off override:
-export CENTELLA_SOURCE_OF_TRUTH=codebase   # or: research, both, ask
+# Override the default source-of-truth preference (`both`) with an env
+# var, the CLI flag, or a per-repo file:
+export CENTELLA_SOURCE_OF_TRUTH=codebase   # or: research, both
 ./centella "task" --source-of-truth codebase
 # …or commit a centella.toml at the repo root with: source_of_truth = codebase
 

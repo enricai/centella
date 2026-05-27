@@ -146,10 +146,11 @@ EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → CENTELLA_SOURCE_OF_TRUTH env var →
-# per-repo centella.toml → 'ask'. CLI/env are session knobs, so they
-# outrank the committed file default.
-SOURCE_OF_TRUTH_VALUES = ("codebase", "research", "both", "ask")
-SOURCE_OF_TRUTH_ANSWERS = ("codebase", "research", "both")  # 'ask' is never an answer
+# per-repo centella.toml → 'both'. CLI/env are session knobs, so they
+# outrank the committed file default. The preference is never surfaced
+# as an interactive question: any explicit setting overrides the
+# default, and unset means the caller implicitly accepted 'both'.
+SOURCE_OF_TRUTH_VALUES = ("codebase", "research", "both")
 SOURCE_OF_TRUTH_ENV = "CENTELLA_SOURCE_OF_TRUTH"
 SOURCE_OF_TRUTH_FILE = "centella.toml"
 
@@ -256,16 +257,6 @@ HEAL_MAX_ROUNDS_ENV = "CENTELLA_HEAL_MAX_ROUNDS"
 HEAL_SUCCESS_THRESHOLD_ENV = "CENTELLA_HEAL_SUCCESS_THRESHOLD"
 HEAL_MAX_ROUNDS_FILE = "centella.toml"
 HEAL_SUCCESS_THRESHOLD_FILE = "centella.toml"
-
-
-def _source_of_truth_hint() -> str:
-    """The one-line hint shown when the user is asked the source-of-truth
-    question — interactive and non-interactive paths share this string."""
-    return (f"Skip this question next time by passing "
-            f"--source-of-truth codebase|research|both on the next "
-            f"invocation, by setting {SOURCE_OF_TRUTH_ENV}=codebase|research|both, "
-            f"or by adding source_of_truth=... to {SOURCE_OF_TRUTH_FILE} "
-            f"at the repo root.")
 
 
 VALIDATOR_SYSTEM = (
@@ -1275,7 +1266,7 @@ def resolve_source_of_truth(repo_root: Path,
                             cli_value: str | None = None) -> str:
     """Resolve the source-of-truth preference. Order:
     --source-of-truth CLI flag → CENTELLA_SOURCE_OF_TRUTH env var →
-    centella.toml → default 'ask'. argparse validates `cli_value` via
+    centella.toml → default 'both'. argparse validates `cli_value` via
     choices=, so it is trusted when set. env and file values are
     rejected via die() if not in SOURCE_OF_TRUTH_VALUES — a bad
     config is caught at startup, not during a planner run."""
@@ -1294,7 +1285,7 @@ def resolve_source_of_truth(repo_root: Path,
             die(f"{cfg}: source_of_truth={file_val!r} is not one of "
                 f"{SOURCE_OF_TRUTH_VALUES}")
         return file_val
-    return "ask"
+    return "both"
 
 
 def resolve_confidence_rounds(repo_root: Path,
@@ -3833,38 +3824,24 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     defer by writing pending-questions.json and exiting."""
     questions = st.data.get("classifier_questions", [])
     need_sot = st.data.get("needs_source_of_truth", False)
-    sot_pref = st.data.get("source_of_truth_pref", "ask")
+    sot_pref = st.data.get("source_of_truth_pref", "both")
     answers: dict = dict(supplied or {})
 
     provided_sot = answers.get("source_of_truth")
-    if provided_sot is not None and provided_sot not in SOURCE_OF_TRUTH_ANSWERS:
+    if provided_sot is not None and provided_sot not in SOURCE_OF_TRUTH_VALUES:
         die(f"source_of_truth={provided_sot!r} is not one of "
-            f"{SOURCE_OF_TRUTH_ANSWERS}")
+            f"{SOURCE_OF_TRUTH_VALUES}")
 
-    # If the preference is preset (not 'ask') and the classifier flagged a
-    # feature task, satisfy source_of_truth from the preference without
-    # asking. See DESIGN.md §11.
-    if need_sot and "source_of_truth" not in answers and sot_pref != "ask":
+    # Satisfy source_of_truth non-interactively from the resolved
+    # preference (DESIGN §11). The preference always holds a real value
+    # — `codebase`, `research`, or `both` (default) — so this never
+    # blocks for an interactive answer.
+    if need_sot and "source_of_truth" not in answers:
         answers["source_of_truth"] = sot_pref
 
-    # --no-clarify means "skip clarification entirely" per DESIGN §11. If
-    # the source-of-truth is still missing at this point — preference is
-    # 'ask' and no answer was pre-supplied — default to 'codebase' and warn
-    # rather than block. DESIGN's rationale: the caller invoked --no-clarify
-    # to guarantee the task is fully specified, so any remaining question
-    # must be resolved by the orchestrator without user interaction.
-    if (st.data.get("no_clarify") and need_sot
-            and "source_of_truth" not in answers):
-        answers["source_of_truth"] = "codebase"
-        log("--no-clarify with no source-of-truth preference set; defaulting "
-            f"to 'codebase' (pass --source-of-truth, set {SOURCE_OF_TRUTH_ENV}, "
-            f"or set source_of_truth in {SOURCE_OF_TRUTH_FILE} to choose a "
-            "different default)")
-
     pending = [q for q in questions if q.get("id") not in answers]
-    sot_missing = need_sot and "source_of_truth" not in answers
 
-    if not pending and not sot_missing:
+    if not pending:
         st.data["answers"] = answers
         st.save()
         return answers
@@ -3874,8 +3851,6 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
         centella_dir = st.path.parent
         (centella_dir / "pending-questions.json").write_text(json.dumps({
             "questions": pending,
-            "source_of_truth": sot_missing,
-            "source_of_truth_hint": _source_of_truth_hint() if sot_missing else None,
         }, indent=2))
         log("clarification needed; wrote .centella/pending-questions.json")
         sys.exit(EXIT_NEEDS_ANSWERS)
@@ -3885,19 +3860,6 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
         if q.get("why_underivable"):
             print(f"  (underivable: {q['why_underivable']})")
         answers[q["id"]] = input("  > ").strip()
-    if sot_missing:
-        print("\n? Build feature work from the existing codebase's patterns, "
-              "from researched best-practice standards, or both?")
-        print(f"  ({_source_of_truth_hint()})")
-        choice = input("  [codebase/research/both] > ").strip().lower()
-        if choice.startswith("c"):
-            answers["source_of_truth"] = "codebase"
-        elif choice.startswith("r"):
-            answers["source_of_truth"] = "research"
-        elif choice.startswith("b"):
-            answers["source_of_truth"] = "both"
-        else:
-            die("source-of-truth answer must be codebase, research, or both")
 
     st.data["answers"] = answers
     st.save()
@@ -3942,9 +3904,9 @@ def absorb_supplied_answers(args, st: State, centella_dir: Path) -> None:
     # Validate source_of_truth if present — same validation gate as
     # gather_answers uses, so a bad value fails at startup not mid-run.
     provided_sot = supplied.get("source_of_truth")
-    if provided_sot is not None and provided_sot not in SOURCE_OF_TRUTH_ANSWERS:
+    if provided_sot is not None and provided_sot not in SOURCE_OF_TRUTH_VALUES:
         die(f"source_of_truth={provided_sot!r} is not one of "
-            f"{SOURCE_OF_TRUTH_ANSWERS}")
+            f"{SOURCE_OF_TRUTH_VALUES}")
 
     answers = st.data.setdefault("answers", {})
     # Supplied keys override anything already in state — a re-run with

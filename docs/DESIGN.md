@@ -656,19 +656,19 @@ request leaves nothing for the filter to catch, so it runs with zero questions.
 
 When a feature task's request leaves the source of truth ambiguous, centella
 resolves it from a preference: `codebase` (build from existing patterns only),
-`research` (build from researched best-practice standards), `both` (codebase
-first; research only where the codebase is insufficient), or `ask` (surface
-the question to the user). The preference is read, in order, from a CLI flag
-on the invocation, from an environment variable, from a per-repo config file
-committed at the repo root, and otherwise defaults to `ask`. The CLI flag and
-env var outrank the file because they are session-scoped knobs — a user
-reaching for either is making a one-off override of the repo default. When
-`ask` fires, the question is presented with a hint listing all three ways to
-skip it next time. A request that already names its own source of truth, or a
-non-feature task where the question does not apply, runs without it.
-Whichever path resolved the preference, its value becomes a setting carried
-to every planner and implementer, so the whole run draws from one consistent
-source of truth.
+`research` (build from researched best-practice standards), or `both` (codebase
+first; research only where the codebase is insufficient). The preference is
+read, in order, from a CLI flag on the invocation, from an environment
+variable, from a per-repo config file committed at the repo root, and
+otherwise defaults to `both`. The CLI flag and env var outrank the file
+because they are session-scoped knobs — a user reaching for either is making
+a one-off override of the repo default. The preference is never surfaced as
+an interactive question: any explicit setting overrides the default, and a
+caller who sets nothing has implicitly accepted `both`. A request that
+already names its own source of truth, or a non-feature task where the
+question does not apply, runs without it. Whichever path resolved the
+preference, its value becomes a setting carried to every planner and
+implementer, so the whole run draws from one consistent source of truth.
 
 When Centella runs in a context where it cannot block for an answer, the
 clarification step is non-blocking: it records the questions, exits with a

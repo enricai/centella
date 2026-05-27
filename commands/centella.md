@@ -24,21 +24,15 @@ clarification step if one occurs.
    ```
 
 2. **If it exits with code 10**, the orchestrator needs the user to answer
-   clarification questions before it can continue. Read
+   classifier intent questions before it can continue. Read
    `.centella/pending-questions.json`, present each question to the user
-   verbatim (and the source-of-truth choice if `source_of_truth` is `true`),
-   and collect their answers. When `source_of_truth` is `true`, also show
-   the `source_of_truth_hint` string from the same file to the user, so they
-   learn how to suppress this question on future runs.
+   verbatim, and collect their answers.
 
-3. Write the answers as a JSON object to `.centella/answers.json`, keyed by each
-   question's `id`, plus `source_of_truth` set to `codebase`, `research`, or
-   `both` if the source-of-truth question was asked. The user can skip this
-   question on future runs by passing `--source-of-truth codebase|research|both`
-   to centella, by setting `CENTELLA_SOURCE_OF_TRUTH=codebase|research|both`
-   in their environment, or by adding `source_of_truth=...` to a `centella.toml`
-   file at the repo root. (Precedence: `--source-of-truth` > env > file.)
-   They can also pin the model with `--model sonnet|opus|haiku` (env:
+3. Write the answers as a JSON object to `.centella/answers.json`, keyed by
+   each question's `id`. The user can also override the source-of-truth
+   preference for this run by including `source_of_truth` set to `codebase`,
+   `research`, or `both` (otherwise the resolved preference applies, default
+   `both`). They can pin the model with `--model sonnet|opus|haiku` (env:
    `CENTELLA_MODEL`); per-worker overrides via `--model-<worker>` /
    `CENTELLA_MODEL_<WORKER>`. Then resume:
 

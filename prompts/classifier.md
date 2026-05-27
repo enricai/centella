@@ -41,10 +41,10 @@ no codebase and no research source. The *how* is always derivable. Be strict:
 inspect the codebase before deciding something is underivable.
 
 If the task includes feature work, set `source_of_truth_question` to `true`.
-The orchestrator decides from a preference (`--source-of-truth` CLI flag →
-`CENTELLA_SOURCE_OF_TRUTH` env var → per-repo `centella.toml` → default
-`ask`) whether to actually surface the question or use a pre-set value;
-the classifier's job is only to flag that the question is relevant.
+The orchestrator resolves the value from a preference (`--source-of-truth`
+CLI flag → `CENTELLA_SOURCE_OF_TRUTH` env var → per-repo `centella.toml`
+→ default `both`) and supplies it to every planner and implementer; the
+classifier's job is only to flag that the question is relevant.
 
 ## Output
 

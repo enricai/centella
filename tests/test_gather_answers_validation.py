@@ -1,7 +1,8 @@
 """Tests for the source-of-truth validation gate in gather_answers().
 
-Covers the validation that rejects invalid pre-supplied answers, plus the
-non-TTY defer-to-file path and its hint propagation.
+Covers the validation that rejects invalid pre-supplied answers (including
+the legacy 'ask' value, now rejected), and the non-interactive flow where
+the resolved preference satisfies source_of_truth without asking the user.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import pytest
 @pytest.fixture
 def state(centella, tmp_path):
     """A fresh State at a tmp_path/.centella/runs/<run-id>/, with a feature
-    task that needs source_of_truth and pref='ask'."""
+    task that needs source_of_truth and pref='both' (the new default)."""
     centella_root = tmp_path / ".centella"
     run_id = "test-run-aaa111"
     (centella_root / "runs" / run_id).mkdir(parents=True)
@@ -25,7 +26,7 @@ def state(centella, tmp_path):
         "categories": ["feature-implementation"],
         "classifier_questions": [],
         "needs_source_of_truth": True,
-        "source_of_truth_pref": "ask",
+        "source_of_truth_pref": "both",
     }
     return st
 
@@ -52,11 +53,14 @@ def test_invalid_value_rejected(centella, state, capsys, bad_value):
     assert bad_value in err
 
 
-def test_ask_rejected_as_answer(centella, state, capsys):
-    """`ask` is a preference value, never an answer."""
+def test_legacy_ask_rejected_as_answer(centella, state, capsys):
+    """The legacy 'ask' value is no longer a valid answer."""
     with pytest.raises(SystemExit) as exc:
         centella.gather_answers(state, {"source_of_truth": "ask"})
     assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "is not one of" in err
+    assert "ask" in err
 
 
 @pytest.mark.parametrize("value", ["codebase", "research", "both"])
@@ -65,25 +69,33 @@ def test_valid_values_pass(centella, state, value):
     assert answers["source_of_truth"] == value
 
 
-# --- non-TTY defer path with hint ------------------------------------------
+# --- preference fills in source_of_truth without asking --------------------
 
-def test_defer_writes_pending_with_hint(centella, state, non_tty_stdin):
-    """With pref='ask' and no supplied answer + non-TTY, gather_answers
-    writes pending-questions.json with a non-null hint and exits 10."""
-    with pytest.raises(SystemExit) as exc:
-        centella.gather_answers(state, None)
-    assert exc.value.code == centella.EXIT_NEEDS_ANSWERS
-
-    pq = json.loads((state.path.parent / "pending-questions.json").read_text())
-    assert pq["source_of_truth"] is True
-    assert pq["source_of_truth_hint"]
-    assert "CENTELLA_SOURCE_OF_TRUTH" in pq["source_of_truth_hint"]
-    assert "centella.toml" in pq["source_of_truth_hint"]
+@pytest.mark.parametrize("pref", ["codebase", "research", "both"])
+def test_preference_satisfies_source_of_truth(centella, state, pref):
+    """gather_answers fills source_of_truth from the resolved preference,
+    without prompting the user or deferring to pending-questions.json."""
+    state.data["source_of_truth_pref"] = pref
+    answers = centella.gather_answers(state, None)
+    assert answers["source_of_truth"] == pref
+    assert not (state.path.parent / "pending-questions.json").exists()
 
 
-def test_defer_hint_null_when_not_needed(centella, state, non_tty_stdin):
-    """When the task does not need source_of_truth, the hint field is null."""
-    state.data["needs_source_of_truth"] = False
+def test_default_preference_is_both(centella, state):
+    """With the new default, source_of_truth is filled with 'both' when
+    nothing else is specified."""
+    answers = centella.gather_answers(state, None)
+    assert answers["source_of_truth"] == "both"
+
+
+# --- non-TTY defer path: only fires for classifier intent questions --------
+
+def test_defer_writes_pending_for_classifier_questions(
+        centella, state, non_tty_stdin):
+    """When the classifier surfaced intent questions and stdin is non-TTY,
+    gather_answers writes pending-questions.json and exits 10. The file
+    contains only the questions; source-of-truth was already satisfied
+    from the preference."""
     state.data["classifier_questions"] = [
         {"id": "q1", "question": "Is the bug intermittent?",
          "why_underivable": "user-specific"}
@@ -93,40 +105,25 @@ def test_defer_hint_null_when_not_needed(centella, state, non_tty_stdin):
     assert exc.value.code == centella.EXIT_NEEDS_ANSWERS
 
     pq = json.loads((state.path.parent / "pending-questions.json").read_text())
-    assert pq["source_of_truth"] is False
-    assert pq["source_of_truth_hint"] is None
+    assert pq == {"questions": [
+        {"id": "q1", "question": "Is the bug intermittent?",
+         "why_underivable": "user-specific"}
+    ]}
 
 
-# --- preference fills in source_of_truth without asking --------------------
-
-@pytest.mark.parametrize("pref", ["codebase", "research", "both"])
-def test_preset_preference_skips_question(centella, state, pref):
-    """When pref is set (not 'ask'), gather_answers fills in source_of_truth
-    without asking and without deferring."""
-    state.data["source_of_truth_pref"] = pref
+def test_no_defer_when_no_classifier_questions(centella, state, non_tty_stdin):
+    """No classifier questions + source-of-truth satisfied from preference
+    → no defer file, no exit."""
     answers = centella.gather_answers(state, None)
-    assert answers["source_of_truth"] == pref
+    assert answers["source_of_truth"] == "both"
+    assert not (state.path.parent / "pending-questions.json").exists()
 
 
 # --- --no-clarify "skips clarification entirely" (DESIGN §11) --------------
 
 def test_no_clarify_with_preference_satisfies_sot(centella, state):
-    """--no-clarify + a real preference: SoT comes from the preference, no
-    defer file, no warning needed."""
+    """--no-clarify: source_of_truth comes from the resolved preference."""
     state.data["source_of_truth_pref"] = "research"
     state.data["no_clarify"] = True
     answers = centella.gather_answers(state, None)
     assert answers["source_of_truth"] == "research"
-
-
-def test_no_clarify_with_ask_defaults_to_codebase(centella, state, capsys):
-    """--no-clarify + pref='ask': defaults to 'codebase' rather than blocking,
-    and logs a warning explaining the default."""
-    state.data["no_clarify"] = True  # pref already 'ask' via fixture
-    answers = centella.gather_answers(state, None)
-    assert answers["source_of_truth"] == "codebase"
-    out = capsys.readouterr().out
-    assert "--no-clarify" in out
-    assert "defaulting" in out
-    # no pending-questions.json should have been written
-    assert not (state.path.parent / "pending-questions.json").exists()
