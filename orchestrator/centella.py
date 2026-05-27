@@ -636,6 +636,23 @@ SCHEMAS: dict[str, dict] = {
             "suggested_fixes": {"type": "array", "items": {"type": "string"}},
         },
     },
+    "patch_generator": {
+        # Output of the patch-generator worker. The worker proposes a
+        # minimal edit to the system prompt that addresses the observed
+        # failure mode. `anchor` and `replacement` are the only required
+        # fields; the heal loop validates that `anchor` is a literal
+        # substring of the current prompt body before applying the patch
+        # (per the prompts-are-advisory-code-enforces principle — the
+        # check is in request_patch, not in the prompt).
+        "type": "object",
+        "required": ["anchor", "replacement"],
+        "properties": {
+            "anchor": {"type": "string"},
+            "replacement": {"type": "string"},
+            "strategy": {"type": "string"},
+            "pivot_reason": {"type": ["string", "null"]},
+        },
+    },
 }
 
 
@@ -3584,10 +3601,97 @@ def write_heal_report(call_type: str, state: HealState,
     return report_path
 
 
+async def request_patch(state: HealState, iter_n: int,
+                        st: "State", caps: dict,
+                        models: dict[str, str]) -> tuple[str, str]:
+    """Invoke the patch-generator worker to propose a minimal prompt edit.
+
+    Builds a user_prompt containing:
+    - The current prompt body (resolved via resolve_prompt)
+    - The failing samples (response_content from each)
+    - The prior iteration history for context
+
+    Calls claude_p() with schema_key="patch_generator" and sid
+    `heal-patch-<call_type>-iter<N>`.
+
+    After the worker responds, validates that the returned `anchor` is a
+    literal substring of the resolved prompt body. If not, raises ValueError
+    — the heal loop must not apply a patch that cannot be cleanly located in
+    the prompt (per the prompts-are-advisory-code-enforces principle: this
+    check lives in code, not in the prompt).
+
+    Returns (anchor_match, patch_text) on success.
+    """
+    call_type = state.call_type
+    _, prompt_body, _ = resolve_prompt(call_type)
+    sys_prompt = (PROMPTS / "patch_generator.md").read_text()
+
+    # Build the failing samples section: only response_content is needed
+    # for the patch-generator to understand what went wrong.
+    sample_lines = []
+    for rec in state.failing_samples:
+        cid = rec.get("call_id", "?")
+        resp = rec.get("response_content", "")
+        sample_lines.append(f"call_id: {cid}\nresponse_content:\n{resp}")
+    samples_block = "\n---\n".join(sample_lines) if sample_lines else "(none)"
+
+    # Prior history: anchor/replacement/strategy/pass_rate for each iteration.
+    history_lines = []
+    for entry in state.history:
+        n = entry.get("iter_n", "?")
+        pr = entry.get("pass_rate", 0.0)
+        # patch text is not stored in history; only pass_rate and scores are.
+        history_lines.append(f"iter {n}: pass_rate={pr:.2%}")
+    history_block = "\n".join(history_lines) if history_lines else "(no prior iterations)"
+
+    user_prompt = (
+        f"CALL TYPE: {call_type}\n"
+        f"ITERATION: {iter_n}\n\n"
+        "CURRENT SYSTEM PROMPT:\n"
+        f"{prompt_body}\n\n"
+        "FAILING SAMPLES:\n"
+        f"{samples_block}\n\n"
+        "PRIOR ITERATION HISTORY:\n"
+        f"{history_block}\n\n"
+        "Propose a minimal patch to the system prompt that addresses the "
+        "failure mode. Return anchor, replacement, strategy, and pivot_reason."
+    )
+
+    model = models.get("heal", MODEL_DEFAULT_PER_WORKER.get("heal", MODEL_DEFAULT))
+    st.bump_workers(caps)
+    result = await claude_p(
+        user_prompt=user_prompt,
+        system_prompt=sys_prompt,
+        schema_key="patch_generator",
+        cwd=os.getcwd(),
+        allowed_tools=INSPECT_TOOLS,
+        max_turns=20,
+        autonomous=False,
+        caps=caps,
+        st=st,
+        model=model,
+        sid=f"heal-patch-{call_type}-iter{iter_n}",
+    )
+
+    anchor = result.get("anchor", "")
+    replacement = result.get("replacement", "")
+
+    # Code-enforced: anchor must be a literal substring of the prompt body.
+    # A patch that cannot be located would corrupt the prompt silently —
+    # the prompt is advisory but this application check is mechanical.
+    if anchor not in prompt_body:
+        raise ValueError(
+            f"request_patch: anchor {anchor!r} not found in resolved prompt "
+            f"for call_type={call_type!r} — cannot apply patch safely"
+        )
+
+    return anchor, replacement
+
+
 async def phase_heal(call_type: str, failing_records: list[dict],
                      heal_dir: Path, caps: dict,
                      st: "State", models: dict[str, str],
-                     request_patch,
+                     request_patch_fn=None,
                      n: int = HEAL_N_REPLAYS_DEFAULT,
                      config: dict | None = None) -> str:
     """Drive the full heal loop for one call_type.
@@ -3595,17 +3699,22 @@ async def phase_heal(call_type: str, failing_records: list[dict],
     Phases (per iteration):
       1. Baseline (once): run n unpatched replays per record to measure noise-floor.
       2. Loop:
-         a. request_patch(state, iter_n) → (anchor_match, patch_text)
+         a. request_patch_fn(state, iter_n) → (anchor_match, patch_text)
          b. heal_apply_patch — materialise patched prompts
          c. heal_replay_patched — run n replays with the patched prompt + judge
          d. check_convergence — returns SUCCESS/PLATEAUED/TIMEOUT/BUDGET_EXHAUSTED/
             REGRESSED/CONTINUE
       3. write_heal_report — always written, even if the loop terminates early.
 
-    `request_patch` is a callable taking (state: HealState, iter_n: int) and
-    returning (anchor_match: str, patch_text: str). Injecting it keeps this
-    function independently testable with a stub — feat-009 wires in the real
-    patch-generator subagent.
+    `request_patch_fn` is a callable taking (state: HealState, iter_n: int) and
+    returning (anchor_match: str, patch_text: str). When None (the default), the
+    real `request_patch` worker is used. Injecting a stub keeps this function
+    independently testable.
+
+    Note: the injected callable may be sync (for tests) or async. If it is a
+    sync stub with 2 arguments (state, iter_n), it is called directly. If it is
+    None, the real async `request_patch(state, iter_n, st, caps, models)` is
+    awaited — this is the production path.
 
     Returns the terminal verdict string.
     """
@@ -3637,7 +3746,16 @@ async def phase_heal(call_type: str, failing_records: list[dict],
         iter_n += 1
         # Update worker_count snapshot before convergence check each iteration.
         converge_config["worker_count"] = st.data.get("worker_count", 0)
-        anchor_match, patch_text = request_patch(hs, iter_n)
+
+        # Invoke the patch generator: real worker (default) or injected stub.
+        if request_patch_fn is None:
+            anchor_match, patch_text = await request_patch(
+                hs, iter_n, st, caps, models)
+        elif asyncio.iscoroutinefunction(request_patch_fn):
+            anchor_match, patch_text = await request_patch_fn(hs, iter_n)
+        else:
+            anchor_match, patch_text = request_patch_fn(hs, iter_n)
+
         heal_apply_patch(call_type, iter_n, patch_text, anchor_match,
                          heal_dir, hs.failing_samples)
         hs = await heal_replay_patched(call_type, iter_n, n, heal_dir,
