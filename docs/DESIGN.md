@@ -339,14 +339,17 @@ a purely textual merge can satisfy git while silently breaking the behavior
 one side was validated against, and only a worker that understands intent
 can avoid that.
 
-The behavioral re-check that *catches* a merge gone wrong happens immediately
-after, at the wave level: once the integrator commits the merge, the
-orchestrator re-runs every wave subtask's frozen criteria against the
-integrated run branch (the same validator pass that runs at the end of every wave, whether
-an integrator was needed or not). A merge that satisfied git but broke an
-already-validated subtask is caught there, not in the integrator itself.
-Keeping the re-check in one place — the wave-level validator — means there
-is no double-validation and no place to forget.
+The mechanical re-check that *catches* a merge that broke the tree
+runs immediately after: once the integrator commits the merge, the
+orchestrator scans the integrated worktree for unresolved conflict
+markers (`<<<<<<<`). A merge that left markers behind aborts the
+run. There is no LLM-level wave validator beyond that: per-subtask
+quality is the implementer's confidence gate (§8); whether the
+integrated tree is *behaviorally* correct is a question the
+conformance phase touches and the human PR review confirms. Centella
+does not re-run subtask criteria at the wave boundary — that role
+belonged to an earlier wave-level validator that was removed when the
+criteria file became informational (§8, §9).
 
 ### When integration cannot succeed
 
@@ -560,31 +563,58 @@ before the orchestrator ever reads it (see §12). The *quality* of the
 artifacts each field names is model-judged; the *presence* of the discipline
 is not.
 
+**Confidence is the only load-bearing gate.** The implementer's
+`root_cause` / `solution` scores (and the planner's `task_understanding`
+/ `decomposition_quality`) are the only signals the orchestrator
+escalates to `failed` or `blocked` on. Tests passing, lint clean, build
+green, per-criterion satisfaction in a written criteria file — all
+**best-effort signals**. The orchestrator surfaces them as warnings
+attached to the subtask result and to telemetry, never as gating
+conditions. The reason is the same incentive §9 *Post-work conformance*
+flags from a different angle: any code-enforced "tests must pass" gate
+invites a stuck model to weaken the test rather than fix the code. The
+confidence gate, anchored to falsifiers and gap evidence, is the
+discipline that cannot be cheated by lowering a bar — a worker that
+cannot justify confidence in *the work itself* exits blocked, and the
+orchestrator's structural enforcement is limited to "did the worker
+fill in the self-gate fields at all," not "is the model's score
+correct."
+
 ---
 
-## 9. Locked success criteria
+## 9. Success criteria (informational; historical lock)
 
-Each implementer's first step is to turn its assigned seed into a complete,
-concrete success-criteria set — automated tests wherever possible, precise
-documented checks where a test is genuinely impossible. The criteria cover both
-the explicit success condition and the regression guards: adjacent behavior
-that must *not* change.
+Each implementer's first step is to turn its assigned seed into a brief
+success-criteria file describing what success looks like for the
+subtask — the explicit success condition plus any regression guards
+worth naming. The file is **informational**. It is written for the
+implementer's own clarity, read by the conformance phase (§9
+*Post-work conformance*) for context on what the subtask was about,
+and useful as a reference for human reviewers. The orchestrator does
+not gate on whether the file's individual criteria are satisfied; that
+is what the confidence gate at §8 is for.
 
-**Once implementation begins, the criteria are frozen.** The implementer may
-not rewrite them. The reason is a specific failure mode: a stuck model, unable
-to make the code pass the test, weakens the test instead. "Revise the criteria
-if you find evidence they were wrong" sounds reasonable and is exactly the
-loophole that failure mode exploits — and it is not reliably detectable from
-the evidence the same model offers.
+The implementer may update the file freely as its understanding
+evolves. There is no lock. This is a reversal of an earlier discipline
+in centella that locked the criteria file by sha256 hash on first write
+and used a worker-initiated `criteria_revision_proposal` channel to
+thread any later edits through orchestrator approval. The lock was
+introduced to guard against a stuck model lowering its own bar to
+clear a hard gate. With the confidence gate as the sole load-bearing
+signal (§8), the bar is the model's *anchored confidence in the
+solution*, not the contents of a text file — there is no longer a
+fixed bar to lower. The lock and the proposal channel were removed in
+the same change that consolidated build/lint/test under the conformance
+phase. (State-file readers may still encounter `criteria_locks` and
+`criteria_revisions` keys in old resumed runs; they are read-tolerant
+deprecations, no longer written.)
 
-So revision is **proposal-only**. An implementer that believes its criteria are
-genuinely wrong returns a *proposed* revision together with the evidence; it
-does not apply it. Only the orchestrator approves a revision, only on hard
-evidence, and every approved revision is logged with its justification. The
-principle: the checker and the thing being checked are never the same agent.
-This is enforced structurally — the orchestrator detects after the fact whether
-a criteria set changed between worker invocations and rejects the subtask if it
-did — so a worker that ignores the rule is caught, not trusted.
+The criteria file remains useful as input to the conformance phase and
+as PR-time documentation, but it does not produce `failed` or `blocked`
+outcomes. A worker that wants to record "this criterion isn't met"
+does so via `criteria_results[].met: false` in its result — the value
+is recorded and surfaces as a warning, but does not change the
+subtask's terminal status.
 
 ### Post-work conformance
 
@@ -599,11 +629,11 @@ a finished change, but they are not part of the assigned criteria and would be
 the wrong thing to bake into them: criteria are scoped to the subtask, and the
 repo's rules are an environmental fact that survives across subtasks.
 
-So a separate phase runs once a subtask's criteria-bound work has settled:
+So a separate phase runs once a subtask's work has settled:
 the **conformer**. It triggers only on the success path — implementer reports
-`status: "complete"`, commits are present, the worktree is clean, the criteria
-lock is intact, no protected path was written. None of the other terminal
-statuses (handoff, clarification, failed, blocked) invoke it. The conformer
+`status: "complete"`, commits are present, the worktree is clean, no
+protected path was written. None of the other terminal statuses
+(handoff, clarification, failed, blocked) invoke it. The conformer
 reads the diff the subtask just produced, reads whatever rules files the
 orchestrator located in the repo, and is empowered to commit fixes to the same
 worktree branch — updating documentation, adding or amending tests, repairing
@@ -633,13 +663,14 @@ Two further disciplines apply, and they sit at the §12 axis:
   assertion, or skip a lint rule to clear the bar. Keeping the phase
   advisory removes that incentive while still surfacing the residual to the
   human and to telemetry.
-- **No backsliding.** The conformer can add commits but must not undo what
-  the implementer just did. The criteria file is the codified statement of
-  what the subtask had to achieve; the orchestrator re-verifies the criteria
-  lock after the conformer's commits and rolls them back if the lock changed.
-  And the diff-scope check — no writes to `.centella/`, `.git/`, `.claude/` —
-  is re-run against the conformer's commits as well, on the same protected
-  paths and with the same terminality.
+- **No backsliding.** The conformer can add commits but must not write to
+  protected paths. The diff-scope check — no writes to `.centella/`,
+  `.git/`, `.claude/` — is re-run against the conformer's commits, on
+  the same protected paths and with the same terminality as it ran
+  against the implementer's commits. (Earlier iterations of this phase
+  also re-verified the criteria-file hash and rolled back conformer
+  commits that touched it; that check was removed when the criteria
+  lock was retired — §8.)
 
 The phase is bounded by a separate cap from the evidence loop: the conformer
 gets a small number of orchestrator-level rounds (default 2) in which to
@@ -648,9 +679,8 @@ detect and fix drift. Exhausting the cap with residuals still present does
 returns `complete`, and the work moves on to integration. This is consistent
 with the rest of §12: what cannot be guaranteed in code (a model genuinely
 catching every documentation drift) is not promoted to a hard guarantee by
-prompt; what *can* be guaranteed (the criteria stayed frozen, protected
-paths stayed untouched, the worker's structured output is well-formed) is
-enforced in code.
+prompt; what *can* be guaranteed (protected paths stayed untouched, the
+worker's structured output is well-formed) is enforced in code.
 
 ---
 
@@ -830,9 +860,9 @@ recurs everywhere in the design:
   mechanically that real work was committed (§7-style verification).
 - The orchestrator does not trust an integrator's "resolved" claim; it confirms
   the merge was actually completed (§6).
-- The orchestrator does not trust that frozen criteria stayed frozen; it detects
-  a changed criteria set between invocations (§9).
-- Every worker result is schema-validated before it is acted on (§7).
+- Every worker result is schema-validated before it is acted on (§7) — a worker
+  that skipped its self-gate fields (§8) fails its own JSON validation before
+  the orchestrator reads the payload.
 
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**
@@ -1161,13 +1191,13 @@ is deliberate and is justified in the section named.
 | Decompose into the most granular subtasks | §5 | Target narrowed to *smallest independently verifiable unit* — "most granular possible" over-decomposes (§5). |
 | Determine parallel vs. sequential — waves | §5; Phase 3 | Done globally over a merged dependency graph, not per-domain. |
 | A subagent per granular subtask | §3; Phase 5 implementers | — |
-| Define success criteria | §9 | Tests preferred; frozen once implementation starts. |
+| Define success criteria | §9 | Written as an informational file; orchestrator does not gate on it. The confidence gate (§8) is the load-bearing discipline; tests / lint / build / per-criterion satisfaction are best-effort signals surfaced as warnings. |
 | Plan the change | §8 | — |
-| Confidence 1–10 on root cause and solution | §8 | Kept, but anchored to evidence gates — a self-reported number is not a measurement. |
+| Confidence 1–10 on root cause and solution | §8 | Kept, but anchored to evidence gates — a self-reported number is not a measurement. The only load-bearing gate. |
 | Loop until confidence ≥ 9 | §8 | Kept, bounded, and gated on evidence rather than intuition. |
 | Implement the change | §3; Phase 5 | — |
-| Validate against criteria; loop until met | §8, §9 | Criteria revision is proposal-only — the checker cannot rewrite its own bar. |
-| Reassess criteria if strong evidence | §9 | Allowed, but proposal-only and orchestrator-approved. |
+| Validate against criteria; loop until met | §8, §9 | Replaced by the §8 confidence gate. The criteria file is informational; the orchestrator does not loop on per-criterion satisfaction (an earlier lock + proposal-only revision channel was retired with the criteria file's load-bearing role). |
+| Reassess criteria if strong evidence | §9 | The implementer updates the criteria file freely as understanding evolves; no lock, no proposal channel. |
 | Fully automated, no questions | §11 | Default zero questions; the derive-or-research filter defines the only exception. |
 | Gather information from the codebase | §11 | Codebase first, research second, user only for genuine intent. |
 | Compact context at 70% | §10 | Replaced by orchestrator-driven handoff — no channel exists to trigger self-compaction. A lower auto-compaction threshold is an optional backstop only. |
