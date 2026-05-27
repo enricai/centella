@@ -28,8 +28,9 @@ pip install pytest         # the only dev dependency
 ./centella --help          # smoke-check the entry point
 ```
 
-There is no `pyproject.toml` and no install step. Centella runs out of the
-checkout.
+There is no `pyproject.toml`; contributors develop out of the checkout.
+End-users get a one-command install via the Claude Code plugin marketplace
+or `scripts/install.sh` — see [README *Install*](README.md#install).
 
 ## Running the tests
 
@@ -57,6 +58,9 @@ for any change:
       renamed or removed a string used elsewhere.
 - [ ] `git diff --stat` — confirm the diff is scoped to what the change
       intended; no collateral edits.
+- [ ] `python3 -c 'import json; json.load(open(".claude-plugin/plugin.json")); json.load(open(".claude-plugin/marketplace.json"))'`
+      — if either manifest in `.claude-plugin/` was touched, confirm both
+      are valid JSON.
 
 (Mirrors `CLAUDE.md`'s checklist — keep in sync if you change either file.)
 
