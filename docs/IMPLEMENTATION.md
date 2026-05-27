@@ -36,6 +36,12 @@ centella/
 │   ├── finalize.sh                merge run branch into working branch; push; open PR
 │   └── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 ├── commands/centella.md            thin plugin skill — launches the orchestrator
+├── skills/
+│   ├── judge-llm-batch/SKILL.md  post-run judge skill — scores a batch of captured
+│   │                              LLM calls against a 3-dimensional accuracy rubric
+│   └── llm-self-heal/SKILL.md    post-run self-heal skill — autonomous loop that
+│                                  proposes and measures prompt patches for failing
+│                                  call_types; uses judge verdicts as the signal
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
 ├── tests/                         pytest suite (see §10)
