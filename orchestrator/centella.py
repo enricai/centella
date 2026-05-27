@@ -2475,17 +2475,6 @@ def validate_resume_state(data: dict) -> None:
             "Inspect the run's state.json manually "
             "(under .centella/runs/<run-id>/).")
 
-    # Legacy state files from before `--no-clarify` was inverted to
-    # `--clarify` carry a `no_clarify` boolean. Centella does not migrate
-    # legacy state — re-run the task fresh. Catching this in the validator
-    # rather than letting the run silently use new semantics keeps the
-    # CHANGELOG contract honest.
-    if "no_clarify" in data:
-        die("state.json carries a legacy 'no_clarify' key from a run "
-            "started before --no-clarify was inverted to --clarify. "
-            "Centella does not migrate legacy state — re-run the task "
-            "fresh under the new flag semantics.")
-
     # waves is optional (absent if interrupted before scheduling); if present
     # it must be well-formed, and completed_waves must be in range.
     if "waves" in data:
@@ -5294,7 +5283,7 @@ def main() -> None:
 
     # --list short-circuits everything else: read .centella/runs/* and
     # exit. No git/CLI checks needed; the user might be inspecting runs
-    # from outside a git repo or with the legacy layout still in place.
+    # from outside a git repo.
     if args.list_runs:
         centella_root = Path(".centella").resolve()
         list_runs(centella_root)
@@ -5307,19 +5296,6 @@ def main() -> None:
     if subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
                       capture_output=True).returncode != 0:
         die("not inside a git repository")
-
-    # Pre-per-run layout detection: a top-level .centella/state.json means
-    # the user upgraded from a previous centella version. We can't safely
-    # migrate (don't know the run_id retroactively), so refuse to run
-    # until the user explicitly cleans up the legacy artifacts.
-    if Path(".centella/state.json").exists():
-        die(
-            "legacy state layout detected at .centella/state.json. "
-            "This version of centella uses per-run state under "
-            ".centella/runs/<run-id>/. To migrate, run "
-            "`scripts/cleanup.sh --legacy` (removes the old layout) and "
-            "re-invoke centella."
-        )
 
     caps = dict(DEFAULT_CAPS)
     if args.max_workers:

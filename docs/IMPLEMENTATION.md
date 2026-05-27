@@ -201,9 +201,7 @@ fallback). Resolution order (highest priority first):
    explicitly (CLI, env, or file) overrides the default.
 
 An invalid value in env or file is rejected at startup via `die()` — bad
-config is caught before any worker spawns. A legacy `ask` value anywhere
-(CLI, env, file, or `--answers`) now fails with the standard validation
-error.
+config is caught before any worker spawns.
 
 > The CLI/env > file order reflects that the CLI flag and env var are
 > session-scoped knobs (a user reaching for them is making a one-off
@@ -227,9 +225,7 @@ priority first):
    `investigation_notes`.
 
 An invalid value in env or file is rejected at startup via `die()` —
-same shape as `--source-of-truth` resolution. State files written
-before this flag existed (carrying `no_clarify`) cannot be resumed;
-re-run the task fresh under `--clarify` if you want questions.
+same shape as `--source-of-truth` resolution.
 
 ### Prompt loading and the shared filter fragment
 
@@ -817,7 +813,7 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 | `new-worktree.sh <id> <run-id>` | Creates `centella/subtasks/<run-id>/<id>` worktree at `.centella/runs/<run-id>/worktrees/<id>` branched off the current `centella/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`centella/runs/…`) and subtask-branch (`centella/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
 | `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.centella/runs/<run-id>/worktrees/staging`): `git merge --no-ff centella/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
 | `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/centella/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — centella does not merge into it locally; the PR (opened by `push_and_open_pr()`) is the proposed integration. The push and PR step lives in `push_and_open_pr()` in `centella.py` (see below) so it can compose the PR body with `compose_pr_body()`, write `run.json`, and emit Python-style multi-line failure messages. |
-| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap \| --legacy] [--branches \| --subtask-branches]` | Default (no flag): scans `.centella/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.centella/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--legacy` removes the pre-per-run layout (`.centella/state.json`, `.centella/worktrees/`, `centella/staging` branch). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`centella/runs/<id>` and `centella/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `centella/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh` — full nuke-the-run is the Ctrl-C path in the orchestrator (`_cleanup_on_abnormal_exit(full_purge=True)`). |
+| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `.centella/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.centella/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`centella/runs/<id>` and `centella/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `centella/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh` — full nuke-the-run is the Ctrl-C path in the orchestrator (`_cleanup_on_abnormal_exit(full_purge=True)`). |
 
 A run branch `centella/runs/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 

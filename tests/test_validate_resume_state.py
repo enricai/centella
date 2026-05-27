@@ -1,8 +1,7 @@
 """Tests for validate_resume_state().
 
-Covers the structural shape checks and the legacy-key rejection that
-prevents state.json files from before `--no-clarify` was inverted to
-`--clarify` from being resumed silently under the new semantics.
+Covers the structural shape checks applied to a loaded state.json
+before a `--resume` proceeds.
 """
 from __future__ import annotations
 
@@ -29,27 +28,6 @@ def test_blank_task_dies(centella, capsys):
     assert exc.value.code != 0
     err = capsys.readouterr().err
     assert "no usable 'task'" in err
-
-
-def test_legacy_no_clarify_true_rejected(centella, capsys):
-    """A state.json written before --no-clarify was inverted to --clarify
-    cannot be resumed; the user must re-run the task fresh."""
-    with pytest.raises(SystemExit) as exc:
-        centella.validate_resume_state({"task": "x", "no_clarify": True})
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "legacy 'no_clarify'" in err
-    assert "re-run" in err.lower()
-
-
-def test_legacy_no_clarify_false_also_rejected(centella, capsys):
-    """The polarity of the legacy value is irrelevant — its presence
-    alone identifies a pre-inversion state file."""
-    with pytest.raises(SystemExit) as exc:
-        centella.validate_resume_state({"task": "x", "no_clarify": False})
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "legacy 'no_clarify'" in err
 
 
 def test_new_clarify_key_accepted(centella):

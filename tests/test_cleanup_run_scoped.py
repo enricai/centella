@@ -5,7 +5,6 @@ cleanup.sh supports:
 - `--all-runs [--branches | --subtask-branches]` — every per-run dir
   (excluding _bootstrap-*)
 - `--bootstrap` — orphaned _bootstrap-* dirs
-- `--legacy` — pre-per-run layout (unchanged from earlier commits)
 - no flag — most-recently-failed run, with y/N prompt
 
 `--subtask-branches` is the post-finalize default (invoked by
@@ -49,13 +48,6 @@ def test_cleanup_declares_bootstrap_mode():
     assert '--bootstrap)' in src
 
 
-def test_cleanup_declares_legacy_mode():
-    src = _src()
-    assert '--legacy)' in src
-    # The legacy mode body itself.
-    assert 'rm -f .centella/state.json' in src
-
-
 def test_cleanup_declares_branches_flag():
     src = _src()
     assert '--branches)' in src
@@ -64,18 +56,17 @@ def test_cleanup_declares_branches_flag():
 # --- run-scoping safety --------------------------------------------------
 
 def test_cleanup_scopes_worktree_removal_to_run_dir():
-    """--run-id only touches .centella/runs/<id>/worktrees/, not the
-    legacy .centella/worktrees/ path. The construction is via a local
+    """--run-id only touches .centella/runs/<id>/worktrees/, not a
+    top-level .centella/worktrees/. The construction is via a local
     `run_dir` variable: `run_dir=".centella/runs/${run_id}"` then
     `"${run_dir}/worktrees"`."""
     src = _src()
     clean_one_run = src.split("clean_one_run() {")[1].split("\n}")[0]
     # The run_dir variable is correctly anchored under runs/.
     assert 'run_dir=".centella/runs/${run_id}"' in clean_one_run
-    # The worktrees path is derived from run_dir, not from the legacy
-    # top-level .centella/worktrees/.
+    # The worktrees path is derived from run_dir.
     assert '${run_dir}/worktrees' in clean_one_run
-    # And the legacy path does NOT appear inside clean_one_run.
+    # And the top-level path must NOT appear inside clean_one_run.
     assert '.centella/worktrees/' not in clean_one_run
 
 
@@ -113,27 +104,6 @@ def test_cleanup_unrecognized_arg_exits_nonzero():
     # The catch-all case in the argument parser.
     assert "cleanup.sh: unrecognized arg:" in src
     assert "exit 2" in src
-
-
-# --- legacy mode preserved (regression guard) ----------------------------
-
-def test_cleanup_legacy_still_removes_old_state_json():
-    """Commit 3 added --legacy; commit 5's rewrite must preserve it."""
-    src = _src()
-    legacy_body = src.split('LEGACY" = "true"')[1].split("exit 0")[0]
-    assert "rm -f .centella/state.json" in legacy_body
-    assert "centella/staging" in legacy_body
-
-
-def test_cleanup_legacy_preserves_per_run_branches():
-    """Commit 3's invariant: --legacy deletes ONE-segment centella/<sid>
-    branches but leaves multi-segment per-run branches alone. Under the
-    current shape that means centella/runs/<run-id> and
-    centella/subtasks/<run-id>/<sid> — both match the centella/*/* keep-
-    guard because each has at least one extra `/` after `centella/`."""
-    src = _src()
-    legacy_body = src.split('LEGACY" = "true"')[1].split("exit 0")[0]
-    assert "centella/*/*" in legacy_body
 
 
 # --- behavioral: single-run cleanup actually removes the dir -------------

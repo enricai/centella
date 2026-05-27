@@ -2,7 +2,7 @@
 
 Covers the CLI flag → env var → per-repo file → 'both' resolution order,
 the value enum, comment/whitespace handling, and the die() path for
-invalid values (including the legacy 'ask' value, now rejected).
+invalid values.
 """
 from __future__ import annotations
 
@@ -82,26 +82,6 @@ def test_all_three_values_accepted_in_file(centella, repo_root, value):
 def test_all_three_values_accepted_in_env(centella, repo_root, monkeypatch, value):
     monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", value)
     assert centella.resolve_source_of_truth(repo_root) == value
-
-
-def test_legacy_ask_in_file_dies(centella, repo_root, capsys):
-    (repo_root / "centella.toml").write_text("source_of_truth = ask\n")
-    with pytest.raises(SystemExit) as exc:
-        centella.resolve_source_of_truth(repo_root)
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "is not one of" in err
-    assert "ask" in err
-
-
-def test_legacy_ask_in_env_dies(centella, repo_root, monkeypatch, capsys):
-    monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "ask")
-    with pytest.raises(SystemExit) as exc:
-        centella.resolve_source_of_truth(repo_root)
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "is not one of" in err
-    assert "ask" in err
 
 
 def test_bad_file_value_dies(centella, repo_root, capsys):

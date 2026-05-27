@@ -18,8 +18,8 @@ an ancestor ref of the other in git's loose ref store — without this,
 `git worktree add` for the first subtask fails with `cannot lock ref …`.
 See DESIGN.md §3 and `test_branch_namespaces_dont_collide.py`.
 
-None of these scripts should reference the legacy `centella/staging`
-branch name (which is removed by `cleanup.sh --legacy`).
+None of these scripts should reference the `centella/staging` branch
+name — it does not exist in the per-run layout.
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def test_setup_run_uses_per_run_paths():
     """The script writes everything under .centella/runs/$RUN_ID/."""
     src = _script("setup-run.sh")
     assert '.centella/runs/${RUN_ID}' in src
-    # And it doesn't write to the legacy paths.
+    # And it doesn't write to top-level paths.
     assert '.centella/worktrees/staging' not in src
     assert '.centella/state.json' not in src
 
@@ -62,7 +62,7 @@ def test_setup_run_uses_per_run_paths():
 def test_setup_run_branch_is_per_run():
     src = _script("setup-run.sh")
     assert 'BRANCH="centella/runs/${RUN_ID}"' in src
-    # The legacy 'centella/staging' branch name is gone.
+    # The 'centella/staging' branch name must not appear.
     assert 'centella/staging' not in src
 
 
@@ -120,12 +120,10 @@ def test_finalize_takes_run_id_arg():
 
 
 def test_finalize_references_per_run_branch():
-    """finalize.sh resolves the per-run branch from ${RUN_ID}, not the
-    legacy global `centella/staging` branch."""
+    """finalize.sh resolves the per-run branch from ${RUN_ID}."""
     src = _script("finalize.sh")
     assert 'BRANCH="centella/runs/${RUN_ID}"' in src
-    # The legacy centella/staging branch is gone from executable lines.
-    # (Comments may still mention it for historical context.)
+    # The 'centella/staging' branch must not appear in executable lines.
     non_comment = "\n".join(
         line for line in src.splitlines() if not line.lstrip().startswith("#")
     )
@@ -136,15 +134,6 @@ def test_finalize_uses_per_run_working_branch_file():
     """Working branch is recorded per-run under runs/<id>/working-branch."""
     src = _script("finalize.sh")
     assert '.centella/runs/${RUN_ID}' in src
-    # The legacy top-level .centella/working-branch is gone.
+    # The top-level .centella/working-branch must not appear.
     assert "\".centella/working-branch\"" not in src
     assert "'.centella/working-branch'" not in src
-
-
-# --- cleanup.sh --legacy --------------------------------------------------
-
-def test_cleanup_has_legacy_mode():
-    src = _script("cleanup.sh")
-    assert '--legacy' in src
-    # The legacy mode removes the old top-level state.json.
-    assert 'rm -f .centella/state.json' in src

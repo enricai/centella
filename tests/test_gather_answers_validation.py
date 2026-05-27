@@ -1,8 +1,8 @@
 """Tests for the source-of-truth validation gate in gather_answers().
 
-Covers the validation that rejects invalid pre-supplied answers (including
-the legacy 'ask' value, now rejected), and the non-interactive flow where
-the resolved preference satisfies source_of_truth without asking the user.
+Covers the validation that rejects invalid pre-supplied answers, and
+the non-interactive flow where the resolved preference satisfies
+source_of_truth without asking the user.
 """
 from __future__ import annotations
 
@@ -51,16 +51,6 @@ def test_invalid_value_rejected(centella, state, capsys, bad_value):
     err = capsys.readouterr().err
     assert "is not one of" in err
     assert bad_value in err
-
-
-def test_legacy_ask_rejected_as_answer(centella, state, capsys):
-    """The legacy 'ask' value is no longer a valid answer."""
-    with pytest.raises(SystemExit) as exc:
-        centella.gather_answers(state, {"source_of_truth": "ask"})
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "is not one of" in err
-    assert "ask" in err
 
 
 @pytest.mark.parametrize("value", ["codebase", "research", "both"])

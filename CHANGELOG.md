@@ -16,10 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same filter before any mid-execution decision — "no questions" never
   means "skip the rigor." Pass `--clarify` (or set
   `CENTELLA_CLARIFY=true` / `clarify = true` in `centella.toml`) to
-  opt into surfacing the questions that survive the filter. **Breaking
-  for `--resume`:** runs started under the old flag carry `no_clarify`
-  in state.json and will fail resume validation. Re-run the task
-  fresh under the new flag.
+  opt into surfacing the questions that survive the filter.
 - **Clarification filter is DRY-ed across the prompts.** The wording
   shown to workers now lives in a single shared fragment
   (`prompts/_clarification_filter.md`), included into
@@ -39,17 +36,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **All legacy / backwards-compat code paths.** Centella now has **no
+  migration path from prior versions** — start fresh. Specifically:
+  the `cleanup.sh --legacy` mode and the `.centella/state.json`
+  detection guard in `main()` (which together migrated installations
+  off the pre-per-run layout) are deleted; the `validate_resume_state`
+  check that rejected pre-inversion `no_clarify` state files is
+  deleted (legacy state's orphan key now does nothing); the
+  `ask`-value-specific rejection tests and doc sentences are deleted
+  (the underlying validation gates still reject any unknown value —
+  they are not legacy-specific).
 - **`ask` source-of-truth value.** The four-value preference
   (`codebase` / `research` / `both` / `ask`) collapses to three.
   Default is now `both` (codebase first; research as fallback) — the
   preference is never surfaced as an interactive question, because
   setting `--source-of-truth` / `CENTELLA_SOURCE_OF_TRUTH` /
   `source_of_truth` in `centella.toml` already expresses an explicit
-  intent, and an unset preference implicitly accepts `both`. A legacy
-  `ask` value anywhere (CLI, env, TOML, `--answers`) now fails the
-  standard validation gate at startup. `gather_answers` no longer
-  prompts for source-of-truth or emits the `source_of_truth` /
-  `source_of_truth_hint` fields in `pending-questions.json`.
+  intent, and an unset preference implicitly accepts `both`.
+  `gather_answers` no longer prompts for source-of-truth or emits the
+  `source_of_truth` / `source_of_truth_hint` fields in
+  `pending-questions.json`.
 
 ### Added
 

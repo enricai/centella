@@ -21,12 +21,6 @@
 #     Remove orphaned .centella/runs/_bootstrap-* directories (runs that
 #     died before classify completed and so have no stable run_id).
 #
-#   cleanup.sh --legacy
-#     Remove the pre-per-run layout: .centella/state.json,
-#     .centella/working-branch, .centella/{subtasks,criteria,checkpoints,
-#     logs}, .centella/worktrees/*, and centella/staging plus any
-#     non-per-run centella/<sid> branches. Use once after upgrading.
-#
 #   cleanup.sh  (no flag)
 #     Scans .centella/runs/*/state.json for the most recently failed run
 #     (most recent without finished_at), prompts y/N, cleans only that run.
@@ -123,7 +117,6 @@ most_recent_failed_run() {
 RUN_ID=""
 ALL_RUNS=false
 BOOTSTRAP=false
-LEGACY=false
 BRANCHES=false
 SUBTASK_BRANCHES=false
 
@@ -141,10 +134,6 @@ while [ $# -gt 0 ]; do
       BOOTSTRAP=true
       shift
       ;;
-    --legacy)
-      LEGACY=true
-      shift
-      ;;
     --branches)
       BRANCHES=true
       shift
@@ -155,7 +144,7 @@ while [ $# -gt 0 ]; do
       ;;
     *)
       echo "cleanup.sh: unrecognized arg: $1" >&2
-      echo "usage: cleanup.sh [--run-id <id> | --all-runs | --bootstrap | --legacy] [--branches | --subtask-branches]" >&2
+      echo "usage: cleanup.sh [--run-id <id> | --all-runs | --bootstrap] [--branches | --subtask-branches]" >&2
       exit 2
       ;;
   esac
@@ -172,47 +161,6 @@ BR_FLAG=0
 [ "$SUBTASK_BRANCHES" = "true" ] && BR_FLAG=2
 
 # --- mode dispatch -------------------------------------------------------
-
-if [ "$LEGACY" = "true" ]; then
-  # ----- legacy-layout migration cleanup ----------------------------------
-  # Remove every pre-per-run artifact under .centella/. The per-run layout
-  # lives under .centella/runs/<run-id>/ and is NOT touched by --legacy.
-  rm -f .centella/state.json
-  rm -f .centella/working-branch
-  rm -f .centella/plan.json
-  rm -f .centella/pending-questions.json
-  rm -f .centella/pending-clarifications.json
-  rm -f .centella/answers.json
-  rm -rf .centella/subtasks .centella/criteria .centella/checkpoints .centella/logs
-
-  if [ -d .centella/worktrees ]; then
-    for d in .centella/worktrees/*/; do
-      [ -d "$d" ] || continue
-      git worktree remove --force "$d" 2>/dev/null || true
-    done
-    rmdir .centella/worktrees 2>/dev/null || true
-  fi
-  git worktree prune
-
-  # Legacy branches: centella/staging and any one-segment centella/<sid>
-  # (a single name segment after centella/, no further /). Current per-run
-  # branches are centella/runs/<run-id> and centella/subtasks/<run-id>/<sid>
-  # — both have at least one extra / and are deliberately left alone by the
-  # centella/*/*) keep guard below.
-  if git show-ref --verify --quiet refs/heads/centella/staging; then
-    git branch -D centella/staging 2>/dev/null || true
-  fi
-  for b in $(git for-each-ref --format='%(refname:short)' refs/heads/centella/); do
-    case "$b" in
-      centella/*/*) : ;;             # per-run branch — keep
-      centella/staging) : ;;          # already deleted above
-      centella/*) git branch -D "$b" 2>/dev/null || true ;;
-    esac
-  done
-
-  echo "legacy layout removed (.centella/ pre-per-run files and centella/staging-style branches)"
-  exit 0
-fi
 
 if [ "$BOOTSTRAP" = "true" ]; then
   # ----- orphaned bootstrap directories -----------------------------------
@@ -267,7 +215,7 @@ fi
 target="$(most_recent_failed_run)"
 if [ -z "$target" ]; then
   echo "cleanup: no in-progress / failed runs found. " \
-       "Use --run-id <id>, --all-runs, --bootstrap, or --legacy."
+       "Use --run-id <id>, --all-runs, or --bootstrap."
   exit 0
 fi
 printf "cleanup: most-recently-failed run is %s — remove? [y/N] " "$target"
