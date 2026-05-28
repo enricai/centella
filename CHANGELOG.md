@@ -49,12 +49,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-planner file-overlap warning at plan-validation time.** When
+  two planners both list the same path in `files_likely_touched`,
+  centella now logs a warning right after reconciliation (before the
+  scheduler builds the DAG) instead of waiting for the integrator to
+  crash mid-wave. Empirically (n=3 historical runs) the signal is
+  clean: the one successful run had zero overlaps; both failed runs
+  had ≥9. The warning is non-fatal — same-file overlap is sometimes
+  legitimate (one planner adds scaffolding the other consumes) — but
+  it surfaces the structural risk early. The full autonomous
+  resolution (extending the reconciler's action vocabulary to handle
+  file-claim conflicts the same way it handles capability-tag
+  vocabulary drift) is tracked as follow-up work.
 - `CENTELLA_MAX_WORKERS` env var and `max_workers` key in
   `centella.toml` resolve through the new `resolve_max_workers()`
   helper, mirroring `resolve_confidence_rounds()`'s precedence.
   `--max-workers` argparse type is now `_positive_int` (was `int`):
   bad values (0, -1, "nope") are rejected at parse time with a clean
   argparse error instead of falling through to a downstream default.
+- `is_protected_path(path)` module-level helper in
+  `orchestrator/centella.py` is the new single source of truth for
+  what the diff-scope check rejects. `check_diff_scope()` and
+  documentation reference it; the previous inline tuple is gone.
 - `CENTELLA_CLARIFY` env var and `clarify` key in `centella.toml`
   (same precedence as `--source-of-truth`: CLI > env > file > default
   `False`). New helper `_resolve_bool_pref` factors the resolution

@@ -2056,6 +2056,40 @@ def validate_plan(subtasks: dict) -> None:
     log(f"plan validation: {len(subtasks)} subtasks ok")
 
 
+def warn_cross_planner_file_overlap(plans: list[dict]) -> None:
+    """Log a warning when subtasks from different planner outputs both list
+    the same path in `files_likely_touched`. Two planners decomposing the
+    same surface produces contradictory criteria the integrator can't
+    reconcile — surface that risk at plan-validation time so the user can
+    re-frame the task before workers start.
+
+    Empirically (n=3 historical runs in May 2026): a successful run had 0
+    cross-planner overlaps; two failed runs had 9 and 10 respectively. The
+    naive cross-prefix overlap signal had zero false positives in that
+    data. This is a warning, not a hard fail — same-file overlap is
+    sometimes legitimate (one planner adds scaffolding the other consumes)
+    and the integrator is still the backstop. The future-work item is to
+    extend the reconciler to resolve overlaps automatically (DESIGN §5)."""
+    file_owners: dict[str, list[tuple[str, str]]] = {}
+    for plan in plans:
+        domain = plan.get("domain") or "?"
+        for s in plan.get("subtasks", []):
+            sid = s.get("id", "?")
+            for f in s.get("files_likely_touched", []):
+                file_owners.setdefault(f, []).append((domain, sid))
+    overlaps = {f: owners for f, owners in file_owners.items()
+                if len({d for d, _ in owners}) > 1}
+    if not overlaps:
+        return
+    log(f"⚠  cross-planner file overlap: {len(overlaps)} file(s) claimed by "
+        "multiple planners. Two planners decomposing the same surface "
+        "produces contradictory subtask criteria the integrator may not "
+        "be able to reconcile. Review the plan before proceeding.")
+    for f, owners in sorted(overlaps.items()):
+        per = ", ".join(f"{d}({sid})" for d, sid in sorted(owners))
+        log(f"     {f}: {per}")
+
+
 def detect_test_runner() -> list[str] | None:
     """Scan cwd for a known deterministic test harness.
     Returns the command as a list, or None if nothing is recognisable."""
@@ -5413,6 +5447,11 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
         # scheduler builds its DAG. Short-circuits with no worker call
         # when planners agreed on vocabulary (the common case).
         plans = await phase_reconcile(plans, task, st, caps, models)
+        # Surface cross-planner file-claim overlaps. Warning only — the
+        # reconciler handles capability-tag drift but not file-claim
+        # conflicts (yet); empirically these correlate strongly with
+        # integrator design-conflict crashes downstream.
+        warn_cross_planner_file_overlap(plans)
         subtasks, waves = schedule(plans)
         validate_plan(subtasks)
         runner = detect_test_runner()

@@ -739,6 +739,17 @@ The bootstrap directory `.centella/runs/_bootstrap-<6hex>/` is used until classi
 | every `depends_on` id exists | dangling edges silently dropped by the scheduler |
 | every `requires` tag has a provider | unresolvable cross-domain dependency |
 
+`warn_cross_planner_file_overlap()` runs immediately after
+`phase_reconcile` (before `validate_plan` and the scheduler) and **logs a
+warning, never fails**, when two planners' subtasks both list the same
+path in `files_likely_touched`. Empirically (May 2026, n=3 historical
+runs) failed runs had ≥9 cross-planner overlaps each while the
+successful run had zero; the warning surfaces that risk at plan time
+instead of waiting for the integrator to crash mid-wave. The reconciler
+currently bridges capability-tag vocabulary drift but not file-claim
+conflicts — a future-work item is to extend its action vocabulary to
+resolve overlaps automatically.
+
 ### Per-subtask checks — in `settle_subtask`, every worker result
 | Check | Catches | On failure |
 |-------|---------|-----------|
