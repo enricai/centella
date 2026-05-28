@@ -851,18 +851,26 @@ takes effect immediately on resume.
 ### Concurrency model
 The orchestrator runs on a single `asyncio` event loop. Each `claude -p`
 worker is spawned via `asyncio.create_subprocess_exec` (wrapped by the
-`run_proc` helper) and awaited; parallel workers within a wave run
-concurrently via `gather_or_cancel` — a small `asyncio.gather` wrapper that,
-on the first exception, cancels every other in-flight task and awaits its
-finalization before re-raising — under an `asyncio.Semaphore` bounded by
-`max_parallel`. Because every mutator runs on the single loop, `State` carries
-no lock — coroutines only interleave at `await` points, which never fall inside
-a `st.data[k] = v; st.save()` pair. `State.save()` still writes to a temp file
-then `os.replace()` for atomicity against process crash. On `KeyboardInterrupt`,
-`SIGTERM`, or `RateLimitedExit`, `asyncio.run` cancels pending tasks;
-`run_proc`'s and `_invoke`'s catch-all `BaseException` handlers kill any
-in-flight child process before re-raising, so no `claude` or `git`
-subprocesses are orphaned.
+`run_proc` helper) and awaited; both spawn sites pass
+`start_new_session=True` so each worker becomes its own POSIX session and
+process-group leader (PGID == PID). This is what makes group-wide
+termination on abnormal exit possible — `claude -p` itself spawns tool-call
+subprocesses (test runners, dev servers) that inherit the new group by
+default, so signaling the group reaches the whole subtree. Parallel
+workers within a wave run concurrently via `gather_or_cancel` — a small
+`asyncio.gather` wrapper that, on the first exception, cancels every
+other in-flight task and awaits its finalization before re-raising —
+under an `asyncio.Semaphore` bounded by `max_parallel`. Because every
+mutator runs on the single loop, `State` carries no lock — coroutines
+only interleave at `await` points, which never fall inside a
+`st.data[k] = v; st.save()` pair. `State.save()` still writes to a temp
+file then `os.replace()` for atomicity against process crash. On
+`KeyboardInterrupt`, `SIGTERM`, or `RateLimitedExit`, `asyncio.run`
+cancels pending tasks; `run_proc`'s and `_invoke`'s catch-all
+`BaseException` handlers call `_terminate_proc_tree(proc)`
+(`os.killpg(pgid, SIGTERM)` → ~2s grace → `os.killpg(pgid, SIGKILL)` →
+reap) before re-raising, so neither the direct `claude`/`git` child nor
+any tool-call grandchild is orphaned.
 
 ### Abnormal exit and rate-limit contract (DESIGN §6 *Cleanup on abnormal exit*)
 

@@ -46,13 +46,26 @@ class _MockStream:
         return b""
 
 
+_MOCK_PID_SENTINEL = 999_999_999
+
+
 class _MockProc:
-    """A mock asyncio.subprocess.Process."""
+    """A mock asyncio.subprocess.Process.
+
+    `pid` is a large positive sentinel so that `os.killpg(pid, sig)`
+    (which `_terminate_proc_tree` uses on exception paths) raises
+    `ProcessLookupError` cleanly on POSIX systems — the helper
+    swallows that. A real-looking PID could collide with a live
+    process group on the test host; `0` is unsafe (means "current
+    process group"); a negative number can be interpreted as a kill
+    target on some kernels. A large unowned positive number is the
+    safe choice."""
     def __init__(self, stdout_lines: list[str], returncode: int = 0):
         self.stdout = _MockStream(stdout_lines)
         self.stderr = _MockStream([])
         self.returncode = returncode
         self.killed = False
+        self.pid = _MOCK_PID_SENTINEL
 
     def kill(self):
         self.killed = True
@@ -378,6 +391,7 @@ def test_value_error_from_line_limit_becomes_worker_error(pila,
                 "type": "system", "subtype": "init", "model": "m"}))
             self.stderr = _MockStream([])
             self.returncode = 1
+            self.pid = _MOCK_PID_SENTINEL
 
         def kill(self):
             pass

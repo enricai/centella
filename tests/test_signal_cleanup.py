@@ -424,3 +424,202 @@ def test_main_system_exit_not_treated_as_unhandled():
         "otherwise the catch-all matches first (BaseException is the "
         "superclass) and SystemExit gets the unhandled-exception path"
     )
+
+
+# --- Subprocess-tree termination (DESIGN §6 "Worker subtree termination") -
+#
+# Pin the two-line discipline that satisfies the design contract: every
+# subprocess spawn passes start_new_session=True (so the child is a
+# session/PG leader); every exception-cleanup path routes through
+# _terminate_proc_tree (which os.killpg's the whole group) instead of
+# proc.kill() (which kills the leader only and leaves grandchildren
+# reparented to init).
+
+def test_every_subprocess_spawn_uses_start_new_session():
+    """Static: every `asyncio.create_subprocess_exec` in pila.py must
+    pass `start_new_session=True` so the child becomes a session/PG
+    leader. Without this flag, `os.killpg(proc.pid, ...)` in the
+    cleanup path either no-ops (the child shares pila's PG and we
+    refuse to kill ourselves) or — worse on POSIX — signals the
+    orchestrator's own group."""
+    src = PILA_PY.read_text()
+    # Find every create_subprocess_exec(...) call. Match across lines
+    # via DOTALL; bound on the closing `)` at the natural call indent.
+    calls = re.findall(
+        r"asyncio\.create_subprocess_exec\((.*?)\n    \)",
+        src, re.DOTALL,
+    )
+    assert calls, ("expected at least one create_subprocess_exec call "
+                   "in pila.py")
+    for i, body in enumerate(calls):
+        assert "start_new_session=True" in body, (
+            f"create_subprocess_exec call #{i + 1} is missing "
+            f"start_new_session=True. Without it the abnormal-exit "
+            f"cleanup path leaks grandchild processes (the bug "
+            f"reported in DESIGN §6 'Worker subtree termination'). "
+            f"Call body:\n{body}"
+        )
+
+
+def test_no_bare_proc_kill_outside_terminate_proc_tree(pila):
+    """Static: the only place `proc.kill()` may appear in pila.py is
+    inside `_terminate_proc_tree` itself (and it doesn't — the helper
+    uses os.killpg). All other exception handlers MUST route through
+    the helper so SIGTERM-then-SIGKILL is applied to the whole group,
+    not just the leader.
+
+    A regression that puts `proc.kill()` back into `run_proc` or
+    `_invoke`'s exception handlers would silently leak grandchildren
+    again. This test pins that against drift."""
+    src = PILA_PY.read_text()
+    # Locate _terminate_proc_tree's body so we can exclude it from
+    # the scan (defensive — the current implementation doesn't call
+    # proc.kill() either, but we don't want this test to lock the
+    # helper's internal mechanism).
+    helper_src = inspect.getsource(pila._terminate_proc_tree)
+    src_outside_helper = src.replace(helper_src, "")
+    matches = re.findall(r"\bproc\.kill\(\)", src_outside_helper)
+    assert not matches, (
+        f"found {len(matches)} bare proc.kill() call(s) outside "
+        f"_terminate_proc_tree. Every subprocess cleanup path must "
+        f"route through _terminate_proc_tree to avoid leaking "
+        f"grandchildren spawned by `claude -p` tool calls."
+    )
+
+
+def test_run_proc_and_invoke_exception_handlers_call_terminate_proc_tree():
+    """Static: both subprocess wrappers' `except` blocks must invoke
+    `_terminate_proc_tree`. Source-pin to catch the case where someone
+    refactors and accidentally drops one of the four handlers."""
+    src = PILA_PY.read_text()
+    # `run_proc`: from its def to the matching `return subprocess.CompletedProcess`
+    m_run = re.search(
+        r"async def run_proc\(.*?\n    return subprocess\.CompletedProcess",
+        src, re.DOTALL,
+    )
+    assert m_run, "could not locate run_proc body in pila.py"
+    run_proc_body = m_run.group(0)
+    # `_invoke` is a top-level `async def`. Bound on the next top-level
+    # def (also flush-left) so we don't bleed into _capture_call or
+    # claude_p downstream.
+    m_inv = re.search(
+        r"\nasync def _invoke\(.*?\n(?=async def |def )",
+        src, re.DOTALL,
+    )
+    assert m_inv, "could not locate _invoke body in pila.py"
+    invoke_body = m_inv.group(0)
+
+    for label, body in [("run_proc", run_proc_body), ("_invoke", invoke_body)]:
+        # Each function must terminate the proc tree on TimeoutError
+        # and on the catch-all BaseException. Count occurrences rather
+        # than slicing nested blocks (which is brittle to inner
+        # try/except inside _invoke's coroutines like _read_stream).
+        timeout_present = re.search(
+            r"except asyncio\.TimeoutError:[^\n]*\n\s*await _terminate_proc_tree\(proc\)",
+            body,
+        )
+        base_present = re.search(
+            r"except BaseException:.*?\n\s*await _terminate_proc_tree\(proc\)",
+            body, re.DOTALL,
+        )
+        assert timeout_present, (
+            f"{label}'s `except asyncio.TimeoutError` handler must "
+            f"`await _terminate_proc_tree(proc)` immediately."
+        )
+        assert base_present, (
+            f"{label}'s `except BaseException` handler must call "
+            f"`await _terminate_proc_tree(proc)` to terminate the "
+            f"worker's whole process group before re-raising."
+        )
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="start_new_session is a no-op on Windows; the POSIX "
+           "process-group semantics this test exercises don't apply.",
+)
+def test_terminate_proc_tree_reaps_grandchildren(pila):
+    """Behavioral: spawn a subprocess with start_new_session=True that
+    itself launches a long-running grandchild, then call
+    _terminate_proc_tree and assert the grandchild is gone.
+
+    Static tests above pin the spelling (`start_new_session=True`,
+    `_terminate_proc_tree` calls); this one pins the semantics — the
+    actual property the DESIGN §6 contract promises."""
+    import asyncio
+    import time
+
+    async def _run():
+        # Parent shell: spawn a `sleep 60` in the background, print its
+        # PID on stdout, then wait. When we kill the group, the sleep
+        # must die too. `exec sleep` would replace the parent — we want
+        # a *separate* grandchild PID to verify the group kill reaches
+        # past the immediate child.
+        script = (
+            "sleep 60 & "
+            "child=$!; "
+            "echo $child; "
+            # Hold the parent alive so the group exists when we signal
+            # it; without this the parent exits after the background
+            # spawn and the test races.
+            "wait $child"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        # Read the grandchild PID off the parent's stdout.
+        line = await proc.stdout.readline()
+        grandchild_pid = int(line.strip())
+        # Sanity: parent and grandchild are alive.
+        assert _pid_alive(proc.pid), "parent died before test could run"
+        assert _pid_alive(grandchild_pid), "grandchild never started"
+
+        try:
+            await pila._terminate_proc_tree(proc)
+        finally:
+            # Safety net: if the helper somehow didn't reap the
+            # grandchild, do it ourselves so a failing test doesn't
+            # leak a 60-second sleeper.
+            if _pid_alive(grandchild_pid):
+                try:
+                    os.kill(grandchild_pid, _signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        # The parent must be reaped.
+        assert proc.returncode is not None, "parent was not reaped"
+        # The grandchild must be gone within a small window. The
+        # helper's grace is _PROC_TREE_GRACE_SEC (2s) plus the
+        # SIGKILL pass — give 3s total for the kernel to flush.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not _pid_alive(grandchild_pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(grandchild_pid), (
+            f"grandchild PID {grandchild_pid} survived "
+            f"_terminate_proc_tree — the process-group kill is not "
+            f"reaching past the immediate child. This is the DESIGN "
+            f"§6 'Worker subtree termination' contract failing."
+        )
+
+    asyncio.run(_run())
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with the given PID exists and we can signal
+    it. `os.kill(pid, 0)` is the POSIX idiom — no signal is delivered;
+    it only does the permission/existence check."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The PID exists but we don't own it — for our test's purposes
+        # (it's a process we spawned ourselves) this should never
+        # happen, but treat it as "alive" to avoid false negatives.
+        return True

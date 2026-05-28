@@ -904,6 +904,71 @@ def _install_signal_handlers() -> None:
         signal.signal(signal.SIGHUP, _raise_intr)
 
 
+_PROC_TREE_GRACE_SEC = 2.0
+
+
+async def _terminate_proc_tree(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a subprocess *and its entire process group*, then reap.
+
+    Pila spawns every subprocess with `start_new_session=True`, so the
+    child becomes a session/PG leader (PGID == PID) and any tool-call
+    subprocesses it spawns inherit the same group. Signaling the
+    leader alone (the old `proc.kill()` path) left those grandchildren
+    reparented to PID 1.
+
+    Protocol: `SIGTERM` to the group, grace window
+    (`_PROC_TREE_GRACE_SEC`) for a clean shutdown, then `SIGKILL` if
+    anything is still alive. `proc.wait()` reaps the leader; the
+    kernel delivers the group signal to every PG member and init
+    reaps them once the group drains.
+
+    `ProcessLookupError` covers the race where the leader has already
+    exited before we signal. `PermissionError` covers the rare case
+    where the kernel won't let us signal a group we no longer own.
+    Both are non-fatal — the cleanup callers re-raise the original
+    exception either way.
+
+    `asyncio.CancelledError` (and other `BaseException`s) propagate
+    out of this helper unhandled, *after* the SIGKILL pass has been
+    issued in the `finally` block. Swallowing cancellation here would
+    silently break asyncio teardown — the caller's outer `raise` in
+    `run_proc` / `_invoke` would still fire, but the event loop
+    shutdown path expects `CancelledError` to surface."""
+    pgid = proc.pid  # PGID == PID when spawned with start_new_session=True
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    exited_cleanly = False
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_PROC_TREE_GRACE_SEC)
+        exited_cleanly = True
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        # SIGKILL escalation runs whenever the leader did not exit
+        # within the grace window — that includes the asyncio.TimeoutError
+        # path above AND the case where a CancelledError (or any other
+        # BaseException) is propagating through us. Once SIGTERM has
+        # been issued and we've started reaping, we are committed to
+        # tearing the group down; bailing out with the group still
+        # alive would leak the subtree we just signaled. CancelledError
+        # still propagates from the surrounding finally — we just make
+        # sure the kernel has had the SIGKILL and a chance to reap first.
+        if not exited_cleanly:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            # `shield` keeps the reap running if the caller's task
+            # gets cancelled mid-wait; the cancellation still surfaces
+            # to the caller, but the OS does not accumulate a zombie.
+            try:
+                await asyncio.shield(proc.wait())
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     """Clean up after an abnormal exit (signal, exception, WorkerError).
 
@@ -2078,12 +2143,18 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     """Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`.
     On timeout, kills the process and raises `subprocess.TimeoutExpired` — same
     semantics callers already handle. One helper everywhere keeps the asyncio
-    boilerplate out of the call sites."""
+    boilerplate out of the call sites.
+
+    `start_new_session=True` makes the child a session/PG leader so the
+    abnormal-exit cleanup path can `os.killpg(pgid, ...)` the entire
+    subtree — see `_terminate_proc_tree`. POSIX-only behavior; the flag
+    is a no-op on Windows."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         if timeout is None:
@@ -2092,18 +2163,13 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _terminate_proc_tree(proc)
         raise subprocess.TimeoutExpired(cmd, timeout)
     except BaseException:
         # Any other exception (CancelledError from a parent abort, an unexpected
         # OSError/BrokenPipeError from the PIPE, etc.) must still leave no
-        # orphan child. Reap then re-raise the original exception.
-        proc.kill()
-        try:
-            await proc.wait()
-        except BaseException:
-            pass
+        # orphan subtree. Terminate the process group then re-raise.
+        await _terminate_proc_tree(proc)
         raise
     return subprocess.CompletedProcess(
         cmd,
@@ -3012,6 +3078,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=10 * 1024 * 1024,
+        # Session/PG leader so `_terminate_proc_tree` can reap the tool-call
+        # grandchildren `claude -p` spawns (vitest, dev servers, etc.).
+        start_new_session=True,
     )
     envelope: dict | None = None
     stderr_chunks: list[bytes] = []
@@ -3089,21 +3158,14 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             asyncio.gather(_read_stream(), _drain_stderr(), proc.wait()),
             timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        try:
-            await proc.wait()
-        except BaseException:
-            pass
+        await _terminate_proc_tree(proc)
         raise subprocess.TimeoutExpired(cmd, timeout)
     except BaseException:
-        # Same orphan-child guard as run_proc: kill + reap, then
-        # re-raise. Pila's gather_or_cancel relies on this for
-        # clean aborts.
-        proc.kill()
-        try:
-            await proc.wait()
-        except BaseException:
-            pass
+        # Same orphan-subtree guard as run_proc: terminate the whole
+        # process group (claude -p + its tool-call grandchildren) and
+        # reap, then re-raise. Pila's gather_or_cancel relies on this
+        # for clean aborts.
+        await _terminate_proc_tree(proc)
         raise
 
     if envelope is None:

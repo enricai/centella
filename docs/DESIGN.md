@@ -455,6 +455,23 @@ SIGTERM, SIGHUP, WorkerError, or any other exception:
   checkpoints under `.pila/runs/<run-id>/checkpoints/` survive too,
   so in-flight subtasks resume from where they left off.
 
+**Worker subtree termination on abnormal exit.** Cleanup must reach
+not just the direct `claude -p` child but every process *it*
+spawned (test runners, build tools, dev servers — whatever a
+`claude -p` worker invoked as a tool call). Signaling only the
+leader leaves grandchildren reparented to PID 1, where they survive
+the orchestrator's exit and continue consuming CPU until the user
+reaps them manually.
+
+The contract: every abnormal-exit path terminates the worker's
+*entire* subprocess subtree before the orchestrator returns control
+to the shell, with a brief grace window for graceful shutdown
+followed by a forceful kill for anything still alive. This is a code
+guarantee (§12 "prompts are advisory, code enforces"), not a polite
+ask of `claude -p`. See IMPLEMENTATION.md "Concurrency model" for
+the POSIX mechanism (process-group isolation + group-wide signal
+delivery) that satisfies it.
+
 Earlier versions of pila gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
 accidental Ctrl-C catastrophic — and it conflated user intent ("stop
@@ -471,9 +488,11 @@ hit (delivered as assistant-text content in the verbatim format
 `{"allowed", "allowed_warning"}`), pila raises
 `RateLimitedExit(reset_at, raw)`.
 The exception propagates through the existing asyncio cancellation
-chain — `_invoke`'s `BaseException` guard kills the in-flight
-`claude -p` child and reaps it, sibling wave-tasks cancel through
-the same path — so no orphan subprocesses remain. Then:
+chain — `_invoke`'s `BaseException` guard terminates the in-flight
+`claude -p` worker's entire process group and reaps it, sibling
+wave-tasks cancel through the same path — so no orphan subprocesses
+remain (see "Worker subtree termination on abnormal exit" above).
+Then:
 
 - If `reset_at` was parsed cleanly from the literal Claude Code
   message format, pila runs the worktree-only cleanup, sleeps until
