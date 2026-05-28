@@ -4724,6 +4724,14 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         # arm of _retryable_failure catches the empty-handoff and
         # allows one retry; the failed_retries cap then bounds the
         # chain.
+        #
+        # Why retry rather than terminal: pila's typical usage is
+        # unattended (overnight runs), so a transient hang has real
+        # value in recovering on a fresh process. The worst case —
+        # one extra 90-min worker invocation bounded by failed_retries
+        # — is an acceptable trade for that recovery chance. An
+        # operator-supervised mode that wanted fail-fast semantics
+        # would need a separate cap (not currently in scope).
         timeout = caps.get("worker_timeout_sec", "?")
         return {"subtask_id": sid, "status": "incomplete-handoff",
                 "checkpoint_path": str(pila_dir / "checkpoints" / f"{sid}.md"),
@@ -6108,20 +6116,27 @@ def main() -> None:
         st.save()
         log(f"rate-limited: {e.raw_message}")
         if e.reset_at is not None:
-            wait_seconds = max(
-                0,
-                int((e.reset_at - datetime.now(e.reset_at.tzinfo))
-                    .total_seconds())) + 30
-            log(f"  sleeping until {e.reset_at.isoformat()} "
-                f"(~{wait_seconds}s) then auto-resuming")
-            # Run cleanup now so the sleep doesn't hold worktrees
-            # occupied. State and branches preserved by full_purge=False.
+            # Run cleanup BEFORE computing wait_seconds, so the sleep
+            # duration reflects time remaining after cleanup finishes
+            # — not time-from-now-at-exception. With the worktree-
+            # remove timeout raised to 240s per worktree, a wave with
+            # several heavy worktrees can spend tens of minutes inside
+            # cleanup; computing wait_seconds first would make the
+            # logged "sleeping until X" line under-promise the actual
+            # wake-up time by that much. State and branches preserved
+            # by full_purge=False.
             try:
                 _cleanup_on_abnormal_exit(st, full_purge=False)
             except BaseException as ce:
                 log(f"  cleanup before sleep failed (non-fatal): {ce}")
             # Skip the finally-block cleanup — we just did it.
             abnormal = False
+            wait_seconds = max(
+                0,
+                int((e.reset_at - datetime.now(e.reset_at.tzinfo))
+                    .total_seconds())) + 30
+            log(f"  sleeping until {e.reset_at.isoformat()} "
+                f"(~{wait_seconds}s) then auto-resuming")
             interrupted_during_sleep = False
             try:
                 time.sleep(wait_seconds)
