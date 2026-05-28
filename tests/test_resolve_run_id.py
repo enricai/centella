@@ -104,3 +104,74 @@ def test_resolve_message_includes_available_runs(pila, tmp_path, capsys):
     err = capsys.readouterr().err
     assert "feat-foo-abc123" in err
     assert "fix-bar-def456" in err
+
+
+# --- disambiguation hint: status + last-activity per row -----------------
+
+def test_resolve_multiple_runs_message_includes_status(pila, tmp_path,
+                                                       capsys):
+    """The disambiguation message must show the derived status of each
+    run (from _derive_run_status) so the user can spot e.g. a
+    `done-pushed-pr` run versus an `in-progress` one without an extra
+    `pila --list` invocation."""
+    _make_run(tmp_path, "feat-a-aaaaaa",
+              {"task": "a", "started_at": "2026-05-26T10:00:00+00:00"})
+    _make_run(tmp_path, "feat-b-bbbbbb",
+              {"task": "b", "started_at": "2026-05-26T11:00:00+00:00"})
+    with pytest.raises(SystemExit):
+        pila.resolve_run_id(tmp_path, None)
+    err = capsys.readouterr().err
+    # Both runs have no run.json sidecar → in-progress.
+    assert "status=in-progress" in err
+
+
+def test_resolve_multiple_runs_message_includes_last_activity(pila, tmp_path,
+                                                              capsys):
+    """The disambiguation message must show how long ago each run's
+    state.json was last touched so the user can spot a hung or
+    abandoned run (last-activity hours/days ago) vs. a live one
+    (seconds-to-minutes). The exact format is fuzzy (it depends on
+    when the test runs vs. when the file was created), but the
+    `last-activity=` prefix is pinned."""
+    _make_run(tmp_path, "feat-a-aaaaaa",
+              {"task": "a", "started_at": "2026-05-26T10:00:00+00:00"})
+    _make_run(tmp_path, "feat-b-bbbbbb",
+              {"task": "b", "started_at": "2026-05-26T11:00:00+00:00"})
+    with pytest.raises(SystemExit):
+        pila.resolve_run_id(tmp_path, None)
+    err = capsys.readouterr().err
+    assert "last-activity=" in err
+    # Just-created file should be 0s or seconds ago — never "?".
+    assert "last-activity=?" not in err
+
+
+# --- _format_age: short human-friendly duration --------------------------
+
+def test_format_age_seconds(pila):
+    assert pila._format_age(0) == "0s ago"
+    assert pila._format_age(5) == "5s ago"
+    assert pila._format_age(59) == "59s ago"
+
+
+def test_format_age_minutes(pila):
+    assert pila._format_age(60) == "1m ago"
+    assert pila._format_age(180) == "3m ago"
+    assert pila._format_age(3599) == "59m ago"
+
+
+def test_format_age_hours(pila):
+    assert pila._format_age(3600) == "1h ago"
+    assert pila._format_age(3600 + 720) == "1h12m ago"
+    assert pila._format_age(2 * 3600 + 5 * 60) == "2h05m ago"
+
+
+def test_format_age_days(pila):
+    assert pila._format_age(86400) == "1d ago"
+    assert pila._format_age(86400 + 4 * 3600) == "1d4h ago"
+    assert pila._format_age(5 * 86400) == "5d ago"
+
+
+def test_format_age_negative_clamps_to_zero(pila):
+    """A negative duration (e.g. from clock skew) must not produce a
+    nonsense string — clamp to 0s rather than render "-12s ago"."""
+    assert pila._format_age(-10) == "0s ago"

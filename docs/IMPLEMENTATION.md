@@ -873,6 +873,25 @@ run branch, per-subtask branches, and implementer checkpoints all
 survive**; only worktrees are removed (and re-created idempotently on
 `--resume` via `scripts/new-worktree.sh`).
 
+Per-worktree removal has a 240s timeout — calibrated against a real
+868 MB / 41k-file worktree (npm install + Next.js build) which takes
+~45-90s uncontested, with several-fold growth under N-way concurrent
+disk contention. Per-worktree failures (timeout or OS error) are
+non-fatal and counted; if any failed, the cleanup emits one closing
+log line pointing the user at `scripts/cleanup.sh --run-id <id>` to
+finish manually. The pass is best-effort: a stale worktree on disk is
+the worst case, not a corrupted run.
+
+Per-worker `subprocess.TimeoutExpired` from `_invoke` (raised when the
+worker hits `worker_timeout_sec`, default 5400s / 90 min) is caught
+by both `run_implementer` (returns an `incomplete-handoff` envelope,
+matching the WorkerError handoff path so settle_subtask's existing
+machinery handles it) and `run_conformer` (logs + returns None,
+matching the WorkerError advisory-phase semantics). Without these
+catches the timeout escapes through the asyncio cancellation chain
+into `main()`'s catch-all and dumps a multi-KB traceback — including
+the entire `claude -p` command line — to the user's terminal.
+
 `RateLimitedExit` is raised by `detect_session_limit(text)` inside
 `_summarize_stream_event` when a worker stream contains the verbatim
 Claude Code subscription message

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worker timeout no longer dumps a 50-KB traceback.** When a worker
+  hit `worker_timeout_sec` (default 5400s / 90 min), `_invoke` raised
+  `subprocess.TimeoutExpired` which escaped `run_implementer`'s
+  `except WorkerError` catch and bubbled all the way to `main()`'s
+  catch-all, dumping the entire `claude -p` command line as a Python
+  traceback to the user's terminal. `run_implementer` now catches
+  `subprocess.TimeoutExpired` and returns an `incomplete-handoff`
+  envelope (same shape as the existing WorkerError path), so the
+  timeout becomes a routine handoff that `--resume` picks up cleanly.
+  `run_conformer` gets the same shield — a timed-out conformer
+  becomes a logged warning + returns None, matching the existing
+  WorkerError advisory-phase semantics. Observed three times in real
+  runs on 2026-05-28 (stackpulse × 2, navegando × 1) before the fix.
+
+- **Worktree-removal timeout raised 30s → 240s.** A real worker that
+  ran `npm install` left a 868 MB / 41k-file worktree; `git worktree
+  remove --force` did `rm -rf` on it, which took longer than the 30s
+  cap. The new 240s value is calibrated against that worktree
+  (~45-90s uncontested) with margin for N-way concurrent disk
+  contention (a six-worktree wave was observed timing out
+  concurrently). Still bounded so a genuinely hung git command
+  doesn't block cleanup indefinitely. Per-worktree failures are
+  still non-fatal, and the cleanup now emits a closing recovery
+  hint when any removal timed out: `cleanup: N worktree(s) not
+  removed within 240s — run scripts/cleanup.sh --run-id <id> to
+  finish manually`.
+
+- **`--resume` disambiguation now shows status + last-activity.**
+  When multiple in-flight runs exist in the same repo, the previous
+  error message listed only `run_id  (started <iso-timestamp>)` — no
+  hint which run was alive. Each row now includes `status=<derived>`
+  (from the same `_derive_run_status` `pila --list` uses) and
+  `last-activity=<age>` (humanized state.json mtime: e.g. `12s ago`,
+  `2h05m ago`, `1d4h ago`). Zero new shell-outs — both signals come
+  from data already in scope. The disambiguation stays a hint, not
+  an auto-pick; user still passes `--run-id`.
+
 ### Changed
 
 - **Ctrl-C is now resumable.** Earlier versions treated SIGINT as an

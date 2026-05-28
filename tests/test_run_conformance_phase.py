@@ -23,6 +23,23 @@ import pytest
 
 # --- shared fixtures -------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _restore_run_conformer(pila):
+    """Snapshot `pila.run_conformer` before each test and restore after.
+
+    `_stub_run_conformer` below rebinds `pila.run_conformer = _stub`
+    directly (not via monkeypatch). Without this autouse fixture, the
+    stub leaks into the shared session-scoped `pila` fixture and
+    breaks any later test that calls `inspect.getsource(pila.run_conformer)`
+    — it sees the stub's source, not the real one. This caught
+    `tests/test_worker_timeout_handoff.py::test_run_conformer_*`
+    failing under full-suite collection but passing when run in
+    isolation."""
+    original = pila.run_conformer
+    yield
+    pila.run_conformer = original
+
+
 def _run(cmd, cwd, check=True):
     """Run a git command, asserting success unless check=False."""
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)

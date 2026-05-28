@@ -931,7 +931,18 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     if full_purge or has_worktrees:
         log(f"cleanup: {'full purge' if full_purge else 'worktrees only'} "
             f"for run {st.run_id}")
-    # Remove worktrees.
+    # Remove worktrees. The 240s timeout is calibrated for realistic
+    # worker workloads: a 868 MB / 41k-file worktree (npm install +
+    # Next.js build) takes ~45-90s uncontested; under N-way concurrent
+    # cleanup (e.g. 6 worktrees from a multi-subtask wave), per-worktree
+    # time grows several-fold via disk contention. 240s covers the
+    # observed worst-case + room for a 2-3 GB monorepo. Still bounded
+    # so a genuinely hung git command (not just a slow rm-rf) doesn't
+    # block cleanup indefinitely. Per-worktree failures are non-fatal —
+    # the loop logs and continues — and a closing recovery-hint line
+    # tells the user how to finish manually.
+    worktree_remove_timeout = 240
+    failed_removals = 0
     if worktrees_dir.is_dir():
         for entry in worktrees_dir.iterdir():
             if not entry.is_dir():
@@ -939,10 +950,16 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             try:
                 subprocess.run(
                     ["git", "worktree", "remove", "--force", str(entry)],
-                    capture_output=True, check=False, timeout=30,
+                    capture_output=True, check=False,
+                    timeout=worktree_remove_timeout,
                 )
             except (OSError, subprocess.TimeoutExpired) as e:
+                failed_removals += 1
                 log(f"  cleanup: failed to remove worktree {entry}: {e}")
+    if failed_removals:
+        log(f"  cleanup: {failed_removals} worktree(s) not removed within "
+            f"{worktree_remove_timeout}s — run "
+            f"`scripts/cleanup.sh --run-id {st.run_id}` to finish manually")
     try:
         subprocess.run(["git", "worktree", "prune"],
                        capture_output=True, check=False, timeout=10)
@@ -1337,13 +1354,78 @@ def resolve_run_id(pila_root: Path, cli_run_id: str | None) -> str:
         )
     if len(runs) == 1:
         return runs[0]["run_id"]
-    available = "\n  ".join(
-        f"{r['run_id']}  (started {r.get('started_at', '?')})" for r in runs
-    )
+    available = "\n  ".join(_format_run_for_disambiguation(r, pila_root)
+                            for r in runs)
     die(
         "multiple runs present; pass --run-id <id> to disambiguate:\n  "
         f"{available}\nUse `pila --list` to see full details."
     )
+
+
+def _format_run_for_disambiguation(run: dict, pila_root: Path) -> str:
+    """Build the per-row hint string for `resolve_run_id`'s
+    multiple-runs error message. Combines run_id, derived status,
+    started_at, and a last-activity time so the user can tell which
+    run is live without an extra `pila --list` invocation.
+
+    Reads run.json from disk for `_derive_run_status` (same source
+    `pila --list` consults). Falls back gracefully when sidecar or
+    state.json is unreadable — disambiguation is best-effort UX, not
+    a correctness boundary."""
+    run_id = run["run_id"]
+    started = run.get("started_at") or "?"
+    # Derived status — uses run.json sidecar if present, falls back to
+    # state.json fields. Same pattern as list_runs().
+    run_dir = pila_root / "runs" / run_id
+    run_json: dict | None = None
+    sidecar = run_dir / "run.json"
+    if sidecar.is_file():
+        try:
+            parsed = json.loads(sidecar.read_text())
+            if isinstance(parsed, dict):
+                run_json = parsed
+        except (OSError, ValueError):
+            pass
+    status = _derive_run_status(run_json, run)
+    # Last-activity: mtime of state.json formatted as the elapsed
+    # duration from now. A live run shows seconds-to-minutes; a hung
+    # or abandoned run shows hours-to-days.
+    last_activity = "?"
+    state_path = run.get("path")
+    if state_path:
+        try:
+            mtime = os.path.getmtime(state_path)
+            last_activity = _format_age(datetime.now(timezone.utc).timestamp()
+                                        - mtime)
+        except (OSError, ValueError, OverflowError):
+            # OSError: state.json deleted between discover_runs and now.
+            # ValueError/OverflowError: pathological mtime (NaN, inf) that
+            # _format_age's int() would reject. Both are extremely unlikely
+            # in practice; this is defense-in-depth so a one-in-a-million
+            # filesystem quirk can't crash --resume startup.
+            pass
+    return (f"{run_id}  status={status}  started={started}  "
+            f"last-activity={last_activity}")
+
+
+def _format_age(seconds: float) -> str:
+    """Render a duration in seconds as a short human-friendly age:
+    "5s", "3m", "47m", "2h12m", "1d4h", "5d". Used by the --resume
+    disambiguation hint to show how stale each in-flight run is."""
+    if seconds < 0:
+        seconds = 0
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        h, m = divmod(s, 3600)
+        m //= 60
+        return f"{h}h{m:02d}m ago" if m else f"{h}h ago"
+    d, h = divmod(s, 86400)
+    h //= 3600
+    return f"{d}d{h}h ago" if h else f"{d}d ago"
 
 
 # --- run status (consumed by `pila --list`) -------------------------
@@ -4629,6 +4711,25 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         return {"subtask_id": sid, "status": "incomplete-handoff",
                 "checkpoint_path": str(pila_dir / "checkpoints" / f"{sid}.md"),
                 "summary": f"worker produced no schema-valid result: {e}"}
+    except subprocess.TimeoutExpired:
+        # worker hit the per-process wall-clock cap (`worker_timeout_sec`,
+        # default 5400s / 90 min). _invoke killed the claude -p child
+        # and re-raised TimeoutExpired. Without this catch the
+        # exception would escape settle_subtask → gather_or_cancel →
+        # phase_execute → orchestrate → main()'s catch-all and dump a
+        # 50KB traceback (with the entire claude -p command line) to
+        # the user's terminal. Same treatment as the WorkerError
+        # arm — a fresh implementer can continue from any partial
+        # checkpoint. If no checkpoint was written, the line-2314
+        # arm of _retryable_failure catches the empty-handoff and
+        # allows one retry; the failed_retries cap then bounds the
+        # chain.
+        timeout = caps.get("worker_timeout_sec", "?")
+        return {"subtask_id": sid, "status": "incomplete-handoff",
+                "checkpoint_path": str(pila_dir / "checkpoints" / f"{sid}.md"),
+                "summary": (f"worker timed out after {timeout}s "
+                            "(worker_timeout_sec cap) — fresh implementer "
+                            "can continue from any partial checkpoint")}
 
 
 def _retryable_failure(reason: str) -> bool:
@@ -4926,6 +5027,14 @@ async def run_conformer(sid: str, pila_dir: Path, worktree: str,
                               model=models["conformer"], sid=f"{sid}-conformer")
     except WorkerError as e:
         log(f"  {sid}: conformer crashed: {e}")
+        return None
+    except subprocess.TimeoutExpired:
+        # Same rationale as run_implementer's TimeoutExpired catch —
+        # don't let the worker-timeout traceback escape. The conformer
+        # phase is advisory; a timed-out conformer becomes one more
+        # warning, not a run-killer.
+        timeout = caps.get("worker_timeout_sec", "?")
+        log(f"  {sid}: conformer timed out after {timeout}s")
         return None
 
 
