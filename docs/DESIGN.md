@@ -634,8 +634,12 @@ A third compounding factor: `git worktree add` checks out tracked
 files only. Untracked artifacts — `node_modules`, `.venv`, build
 outputs — are *not* copied from the main checkout. Even if the host
 repo were fully installed, every per-subtask worktree would start
-empty. So provisioning has to land *in* the container, *before* a
-worker reaches a worktree.
+empty. The orchestrator handles this in two layers: runtime
+versions and the optional setup hook are pre-installed *in* the
+container before any worker runs, because they're cross-cutting
+state every worker shares; dependency installs (pnpm, pip, cargo,
+etc.) are deferred to each worker, which runs the install in its
+own worktree against shared package-manager caches.
 
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
@@ -686,21 +690,39 @@ classification and planning, layered top-to-bottom by determinism:
    it are restricted by an argv-allowlist, and any deviation
    from the schema rejects the worker. This is a *deliberate*
    exception to §12 — see below.
-5. **Per-worktree replay.** Each fresh worktree is dependency-
-   less by design. After `git worktree add`, the orchestrator
-   replays the install commands against the new worktree under
-   the same version-manager activation. The package-manager
-   caches are shared across worktrees of the same run, so the
-   second worktree's install is fast even though it's a fresh
-   command.
+5. **Worker-driven install.** Each fresh worktree is dependency-
+   less by design. The orchestrator does *not* pre-install
+   anything — neither at `repo_root` (which is bind-mounted from
+   the host and writing to it would clobber the host's checkout
+   with linux-built artifacts when the host is darwin) nor in
+   each worktree (which would be redundant work the worker often
+   doesn't need). Instead, the detected recipe is **persisted to
+   state and injected into the implementer and conformer prompts
+   as a `PROVISION_RECIPE:` advisory block**. Each worker reads
+   the recipe and decides whether its subtask actually needs the
+   install (a config-only or docs-only subtask doesn't; a "run
+   the tests" subtask does), then runs the command itself from
+   its own worktree via its Bash tool. The package-manager
+   caches (pnpm store, pip wheel cache, go module cache, cargo
+   registry) are shared across worktrees and across runs, so
+   re-running the install command in worktree N is fast.
+
+   This shape has three benefits over an orchestrator-driven
+   install: (a) the host's repo is never mutated by pila; (b) no
+   work is wasted on worktrees whose subtasks don't need built
+   deps; (c) the same `claude -p` event-streaming the workers
+   use for everything else makes install progress visible to
+   the user, without any special orchestrator plumbing.
 
 ### The §12 carve-out
 
-Step 4 is the only place in pila where a worker's output drives a
-binding decision instead of advising one. The central principle of
-§12 is that prompts are advisory and code enforces; an LLM recipe
-that the orchestrator then *runs* inverts that. The carve-out is
-justified by three constraints that contain it:
+Step 4 is the only place in pila where an LLM-generated artifact
+gets persisted and shown to other workers as authoritative content.
+The central principle of §12 is that prompts are advisory and code
+enforces; an LLM-generated install plan that the orchestrator
+then *renders verbatim into downstream worker prompts* needs the
+same containment any other LLM-to-code path would. The carve-out
+is justified by three constraints that contain it:
 
 1. **It only fires when the table returns empty.** The 80% of
    repos with conventional lockfiles never reach the worker. The
@@ -710,14 +732,19 @@ justified by three constraints that contain it:
    `argv[0]` must come from a fixed allowlist of package managers.
    Shell metacharacters and traversing working directories are
    rejected. The worker cannot emit `sudo`, cannot pipe into
-   `sh`, cannot reach outside the repo. The §12 principle ("any
-   guarantee that matters and can be checked mechanically lives
-   in code") still holds — the *guarantee* is in the validator.
+   `sh`, cannot reach outside the repo. This containment is
+   *what makes the prompt-injection safe* — the validator ensures
+   the rendered `PROVISION_RECIPE:` block carries only argv
+   sequences from a known-safe vocabulary, so a downstream worker
+   that copy-runs an entry can't accidentally execute something
+   harmful. The §12 principle ("any guarantee that matters and
+   can be checked mechanically lives in code") holds — the
+   *guarantee* is in the validator, not in any worker prompt.
 3. **It is the only documented exception.** Any future feature
-   that wants to lean on a worker's structured output for binding
-   decisions has to add its own §-level justification, not point
-   at this one. Documenting the carve-out explicitly is what
-   prevents it from becoming precedent.
+   that wants to render LLM-generated content into a downstream
+   worker prompt has to add its own §-level justification, not
+   point at this one. Documenting the carve-out explicitly is
+   what prevents it from becoming precedent.
 
 The alternative — refusing the run when the table doesn't match —
 would be strictly more §12-compliant but worse for the user. The

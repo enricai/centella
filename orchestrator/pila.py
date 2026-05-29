@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -787,8 +788,10 @@ SCHEMAS: dict[str, dict] = {
                         # repo). `install` is the dep-fetch step. `build`
                         # is a follow-on that prepares the workspace
                         # (e.g. `pnpm run build` for an app that only
-                        # functions after a build pass). Workers see both
-                        # install and build commands replayed in worktrees.
+                        # functions after a build pass). Both kinds are
+                        # rendered into the implementer/conformer prompts
+                        # by `_format_provision_recipe_section`; the
+                        # worker decides whether and when to run each.
                         "kind": {"enum": ["install", "build", "none"]},
                         # argv list (NOT a shell string). argv[0] must be
                         # in the allowlist enforced by
@@ -2358,6 +2361,125 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
         stdout.decode(errors="replace") if stdout else "",
         stderr.decode(errors="replace") if stderr else "",
     )
+
+
+async def run_streaming(
+    cmd: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+    log_path: Path | None = None,
+    label: str | None = None,
+    verbosity: str = "stream",
+    line_prefix: str = "  | ",
+    tail_lines: int = 40,
+) -> tuple[int, str]:
+    """Run a subprocess with stdout+stderr streamed live, persisted to a
+    log file, and tailed for error reporting. Use this instead of
+    `run_proc` for *long-running* commands where:
+
+      - the user should see progress in real time (no silent multi-minute
+        hangs while a buffered pipe fills),
+      - the full output should land on disk regardless of verbosity, and
+      - the last N lines should be available in any exception we raise.
+
+    Returns `(returncode, tail)`. On timeout raises
+    `subprocess.TimeoutExpired` (same shape `run_proc` raises) with
+    `output` populated with the captured tail so callers can include it
+    in their error message. On any other exception, terminates the
+    process tree via `_terminate_proc_tree` (same exception-safety
+    contract as `run_proc`).
+
+    `verbosity`:
+      - "quiet": no stdout echo; log file still gets every line.
+      - anything else ("normal", "stream", "debug"): echo each line
+        through `log()` with `line_prefix`.
+
+    `label` is appended to the persistent log's section header — useful
+    when multiple commands write to the same log file (provision.log
+    accumulates `mise install`, `.pila-setup.sh`, etc.).
+
+    The DRY counterpart to `run_proc`: identical contract for the
+    process-group/exception-safety story, different I/O shape. Pick
+    `run_proc` for short captures (git plumbing, smoke tests) where
+    the synchronous-collect shape is what the caller wants; pick
+    `run_streaming` for anything that might run long enough that a
+    silent terminal would mislead the user.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    tail: deque[str] = deque(maxlen=tail_lines)
+    log_fh = None
+    if log_path is not None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_fh = log_path.open("a", buffering=1)  # line-buffered
+            header = f"=== {label or ' '.join(cmd)} (cwd={cwd or '.'}) ==="
+            log_fh.write(header + "\n")
+        except OSError:
+            log_fh = None
+
+    echo = verbosity != "quiet"
+
+    async def read_loop() -> None:
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip("\r\n")
+            tail.append(line)
+            if log_fh is not None:
+                try:
+                    log_fh.write(line + "\n")
+                except OSError:
+                    pass
+            if echo:
+                log(f"{line_prefix}{line}")
+
+    try:
+        if timeout is None:
+            await asyncio.gather(read_loop(), proc.wait())
+        else:
+            await asyncio.wait_for(
+                asyncio.gather(read_loop(), proc.wait()),
+                timeout=timeout,
+            )
+    except asyncio.TimeoutError:
+        if log_fh is not None:
+            try:
+                log_fh.write(f"=== TIMEOUT after {timeout}s ===\n")
+            except OSError:
+                pass
+        await _terminate_proc_tree(proc)
+        captured = "\n".join(tail)
+        exc = subprocess.TimeoutExpired(cmd, timeout)
+        # Standard TimeoutExpired exposes `output` and `stderr`; populate
+        # `output` with the merged tail so callers can include it in
+        # their die() message without re-reading the log file.
+        exc.output = captured
+        if log_fh is not None:
+            log_fh.close()
+        raise exc
+    except BaseException:
+        await _terminate_proc_tree(proc)
+        if log_fh is not None:
+            log_fh.close()
+        raise
+
+    if log_fh is not None:
+        try:
+            log_fh.close()
+        except OSError:
+            pass
+
+    rc = proc.returncode if proc.returncode is not None else 0
+    return rc, "\n".join(tail)
 
 
 async def gather_or_cancel(*aws):
@@ -5033,23 +5155,21 @@ async def run_setup_hook(repo_root: Path, log_dir: Path,
     log("phase 1½: running .pila-setup.sh")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "setup-hook.log"
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     try:
-        proc = await run_proc(
+        rc, tail = await run_streaming(
             ["bash", str(hook)],
             cwd=str(repo_root),
             timeout=600,  # 10 minutes
+            log_path=log_path,
+            label=".pila-setup.sh",
+            verbosity=verbosity,
         )
-    except subprocess.TimeoutExpired:
-        die(".pila-setup.sh did not complete within 10 minutes")
-    # Persist combined output for inspection.
-    try:
-        log_path.write_text(
-            (proc.stdout or "") + (proc.stderr or ""))
-    except OSError:
-        pass
-    if proc.returncode != 0:
-        tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-40:])
-        die(f".pila-setup.sh exited {proc.returncode}\n{tail}")
+    except subprocess.TimeoutExpired as exc:
+        die(f".pila-setup.sh did not complete within 10 minutes\n"
+            f"(see {log_path})\n{exc.output or ''}")
+    if rc != 0:
+        die(f".pila-setup.sh exited {rc}\n(see {log_path})\n{tail}")
     prov["sh_hook_ran"] = True
     st.save()
 
@@ -5431,28 +5551,25 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
     # set from the repo's .tool-versions / .nvmrc / .python-version /
     # rust-toolchain.toml / .go-version (the last either committed or
     # synthesized by synth_mise_go_override).
-    proc = await asyncio.create_subprocess_exec(
-        "mise", "install",
-        cwd=str(repo_root),
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,
-    )
-    stdout, _ = await proc.communicate()
-    output = stdout.decode(errors="replace") if stdout else ""
+    #
+    # Stream output: a first-run install of Python 3.12 / Ruby 3.2 /
+    # Rust can take minutes; without streaming the user sees a silent
+    # `mise install` line and nothing else until it finishes (or hits
+    # whatever container-level wall-clock the user gives up at).
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     try:
-        # Append rather than overwrite — phase_provision may write
-        # multiple log entries across its steps.
-        with log_path.open("a") as f:
-            f.write("=== mise install ===\n")
-            f.write(output)
-            f.write("\n")
-    except OSError:
-        pass
-    if proc.returncode != 0:
-        tail = "\n".join(output.splitlines()[-40:])
-        die(f"mise install failed (exit {proc.returncode})\n{tail}")
+        rc, tail = await run_streaming(
+            ["mise", "install"],
+            cwd=str(repo_root),
+            env=env,
+            log_path=log_path,
+            label="mise install",
+            verbosity=verbosity,
+        )
+    except subprocess.TimeoutExpired as exc:
+        die(f"mise install timed out\n(see {log_path})\n{exc.output or ''}")
+    if rc != 0:
+        die(f"mise install failed (exit {rc})\n(see {log_path})\n{tail}")
 
     # Capture resolved versions. `mise ls --current --json` is the
     # documented machine-readable view; `mise current --json` does NOT
@@ -5467,8 +5584,9 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        # Not fatal — phase_provision can still execute install commands
-        # without knowing the resolved versions. Log and move on.
+        # Not fatal — workers run their own install commands via prompt
+        # injection (DESIGN §6½ "Worker-driven install"); they don't
+        # need the resolved-versions blob to do so. Log and move on.
         log(f"mise ls --current --json failed (exit {proc.returncode}); "
             "skipping version capture")
         return
@@ -5479,103 +5597,6 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
     prov = st.data.setdefault("provision", {})
     prov["mise_versions"] = versions
     st.save()
-
-
-def wrap_with_mise_exec(cmd: list[str]) -> list[str]:
-    """Prepend `mise exec --` to a command so the resolved toolchain is
-    active. Idempotent — if the command is already wrapped, returns it
-    unchanged.
-
-    `mise exec` is a true execvp (verified against `src/cli/exec.rs`),
-    so the wrapped command's children (postinstall scripts, node-gyp
-    builds, etc.) inherit the activated PATH and see the right runtime.
-    """
-    if cmd[:3] == ["mise", "exec", "--"]:
-        return cmd
-    return ["mise", "exec", "--"] + list(cmd)
-
-
-async def replay_provision_in_worktree(worktree: Path, st: "State") -> None:
-    """Replay the persisted provision recipe against a fresh worktree.
-
-    Called once per `new-worktree.sh` invocation, after the worktree is
-    created and before the implementer worker runs. Each install command
-    runs through `mise exec --` so the same toolchain resolved by
-    phase_provision is active in the new worktree (the version files —
-    `.nvmrc` etc. — are tracked, so they're already checked out).
-
-    Shared caches (pnpm store, pip wheels, go-mod, cargo registry) make
-    this fast on the second+ worktree because the warm-up pass in
-    phase_provision already populated them.
-
-    A failure during replay is non-fatal — logged, but the worker still
-    starts. The orchestrator's existing per-subtask gates (build/lint/
-    test in conformance) will catch a worktree that's genuinely broken
-    by a missing install. Treating replay failure as terminal here would
-    block runs in the rare case where a worktree-specific install hiccup
-    (concurrent cache write that lost a race, transient network blip)
-    can be tolerated; the conformance phase is the load-bearing check.
-    """
-    prov = st.data.get("provision") or {}
-    recipe = prov.get("recipe") or []
-    if not recipe:
-        return
-    log_path = st.run_dir / "logs" / "provision.log"
-
-    # The override env var is what bridges the gap when the synth fired
-    # for a polyglot repo (e.g. go.mod + .nvmrc, no .go-version). Without
-    # this, mise's discovery in the worktree wouldn't find the
-    # synthesized go pin (the override file lives under .pila/, which is
-    # not in the worktree's tracked-file set), and `mise exec -- go ...`
-    # would fall through to system PATH — no Go on PATH, command not
-    # found, attributed confusingly to the worker.
-    override_file = prov.get("override_file")
-    env = os.environ.copy()
-    if override_file:
-        env["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override_file)
-
-    for entry in recipe:
-        kind = entry.get("kind")
-        if kind == "none":
-            continue
-        if kind not in ("install", "build"):
-            continue
-        cmd = entry.get("command") or []
-        if not cmd:
-            continue
-        wrapped = wrap_with_mise_exec(cmd)
-        wd = entry.get("working_dir", ".")
-        timeout = entry.get("timeout_s") or 1800
-        cwd = worktree if wd in (".", "") else worktree / wd
-        # Direct asyncio.create_subprocess_exec (instead of run_proc) so
-        # we can pass env. Matches the pattern in run_mise_install.
-        proc = await asyncio.create_subprocess_exec(
-            *wrapped,
-            cwd=str(cwd),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await _terminate_proc_tree(proc)
-            log(f"  warning: worktree replay timed out: {' '.join(cmd)}")
-            continue
-        out = stdout.decode(errors="replace") if stdout else ""
-        err = stderr.decode(errors="replace") if stderr else ""
-        try:
-            with log_path.open("a") as f:
-                f.write(f"=== replay {worktree.name}: {' '.join(wrapped)} ===\n")
-                f.write(out + err)
-                f.write("\n")
-        except OSError:
-            pass
-        if proc.returncode != 0:
-            log(f"  warning: worktree replay exited {proc.returncode}: "
-                f"{' '.join(cmd)} (see {log_path})")
 
 
 # =========================================================================
@@ -5802,7 +5823,7 @@ def _format_provision_user_prompt(fixtures: dict, task: str) -> str:
 
 async def phase_provision(repo_root: Path, st: State, caps: dict,
                            models: dict[str, str]) -> None:
-    """Phase 1½: per-repo dependency provisioning.
+    """Phase 1½: per-repo dependency *detection*.
 
     Runs after classify so a docs-only run can short-circuit. Five
     ordered steps (DESIGN §6½):
@@ -5818,15 +5839,21 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
          resolved versions via `mise ls --current --json`.
       5. Detect install commands: deterministic lockfile table first
          (emits all matches for polyglot repos), LLM fallback if the
-         table abstains. Validate the recipe, then execute each
-         command through `mise exec --` so the resolved toolchain is
-         active. Persist recipe + per-command status to
-         st.data["provision"].
+         table abstains. Validate the recipe and persist it to
+         st.data["provision"]["recipe"] for downstream workers to
+         consult via prompt injection.
+
+    Phase 1½ deliberately does NOT execute the install recipe at
+    repo_root. The repo is bind-mounted from the host; writing
+    `node_modules/` / `.venv/` / `target/` into it would clobber the
+    host's checkout with linux-built artifacts on darwin hosts. Each
+    worker runs installs in its own worktree against the shared
+    cache instead (DESIGN §6½ "Worker-driven install").
 
     Naturally skipped on `--resume` because the entire fresh-run
     else-branch in `orchestrate()` is skipped.
     """
-    log("phase 1½: provisioning per-repo deps")
+    log("phase 1½: detecting per-repo deps")
     prov = st.data.setdefault("provision", {})
     log_dir = st.run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -5834,11 +5861,10 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # 1. Docs-only short-circuit.
     cats = set(st.data.get("categories") or [])
     if cats and cats <= _DOCS_ONLY_CATEGORIES:
-        log("  docs-only task: skipping dep install")
+        log("  docs-only task: skipping dep detection")
         prov["source"] = "skipped-docs-only"
         prov["recipe"] = [{"kind": "none", "command": [],
                            "working_dir": ".", "timeout_s": 0}]
-        prov["commands"] = []
         st.save()
         return
 
@@ -5850,14 +5876,21 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     if override is not None:
         log(f"  synthesized mise override at {override.name} "
             f"(go.mod → .go-version equivalent)")
-    # Persist so replay_provision_in_worktree can re-export
-    # MISE_OVERRIDE_CONFIG_FILENAMES against the same file when a fresh
-    # worktree replays the recipe. Without this, mise's discovery in
-    # the worktree wouldn't see the synthesized go pin (go.mod isn't
-    # parsed by mise) and `mise exec -- go ...` would fall through to
-    # system PATH where Go isn't installed — confusing failure.
+    # Persist so a `--resume` after this point can re-export the env
+    # var (orchestrate() re-reads provision state on resume).
     prov["override_file"] = str(override) if override is not None else None
     st.save()
+    # Export MISE_OVERRIDE_CONFIG_FILENAMES into the orchestrator's
+    # os.environ now so every downstream subprocess — `mise install`
+    # below, the implementer/conformer `claude -p` workers (which
+    # inherit os.environ via _invoke), and any `mise exec --` they
+    # invoke from their worktrees — sees the synthesized go pin.
+    # Without this, mise's discovery in the worktree wouldn't find the
+    # synth (the override file lives under .pila/, which isn't in the
+    # worktree's tracked-file set) and `mise exec -- go ...` would
+    # fall through to system PATH where Go isn't installed.
+    if override is not None:
+        os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
 
     # 4. mise install + version capture.
     await run_mise_install(repo_root, log_dir, st, override_file=override)
@@ -5899,77 +5932,21 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         recipe = result.get("recipe") or []
         prov["source"] = "llm"
 
-    # Validate before executing. This is the §12 carve-out's mechanical
-    # containment: any drift from the schema or allowlist is rejected
-    # here, not in the prompt.
+    # Validate the recipe shape. §12 carve-out: any drift from the
+    # schema or allowlist is rejected here, not in the prompt — even
+    # though we no longer execute the recipe ourselves, workers will
+    # see it via prompt injection and we don't want to ship them
+    # malformed entries.
     try:
         validate_provision_recipe(recipe)
     except ValueError as e:
         die(f"provision recipe failed validation: {e}")
 
     prov["recipe"] = recipe
-    prov["commands"] = []
     st.save()
 
-    # 5c. Execute each command through `mise exec --`. Persist per-
-    # command status as we go so a partial failure leaves a useful audit.
-    log_path = log_dir / "provision.log"
-    for i, entry in enumerate(recipe):
-        kind = entry["kind"]
-        if kind == "none":
-            prov["commands"].append({
-                "kind": "none", "cmd": [], "status": "skipped",
-                "log_tail": "",
-            })
-            st.save()
-            continue
-        wrapped = wrap_with_mise_exec(entry["command"])
-        wd = entry.get("working_dir", ".")
-        timeout = entry.get("timeout_s") or 1800
-        cwd = repo_root if wd in (".", "") else repo_root / wd
-        log(f"  [{i + 1}/{len(recipe)}] {' '.join(entry['command'])} "
-            f"(cwd={wd}, timeout={timeout}s)")
-        try:
-            proc = await run_proc(wrapped, cwd=str(cwd), timeout=timeout)
-        except subprocess.TimeoutExpired:
-            tail = ""
-            try:
-                with log_path.open("a") as f:
-                    f.write(f"=== TIMEOUT: {' '.join(wrapped)} (cwd={wd}) ===\n")
-            except OSError:
-                pass
-            prov["commands"].append({
-                "kind": kind, "cmd": entry["command"], "status": "timeout",
-                "log_tail": tail,
-            })
-            st.save()
-            die(f"provision command timed out after {timeout}s: "
-                f"{' '.join(entry['command'])}")
-        combined = (proc.stdout or "") + (proc.stderr or "")
-        try:
-            with log_path.open("a") as f:
-                f.write(f"=== {' '.join(wrapped)} (cwd={wd}) ===\n")
-                f.write(combined)
-                f.write("\n")
-        except OSError:
-            pass
-        tail = "\n".join(combined.splitlines()[-40:])
-        if proc.returncode != 0:
-            prov["commands"].append({
-                "kind": kind, "cmd": entry["command"],
-                "status": "failed", "log_tail": tail,
-            })
-            st.save()
-            die(f"provision command failed (exit {proc.returncode}): "
-                f"{' '.join(entry['command'])}\n{tail}")
-        prov["commands"].append({
-            "kind": kind, "cmd": entry["command"],
-            "status": "ok", "log_tail": "",
-        })
-        st.save()
-
-    log(f"  provision complete ({len(recipe)} command(s), "
-        f"source={prov['source']})")
+    log(f"  recipe detected ({len(recipe)} command(s), "
+        f"source={prov['source']}) — workers will run installs in their worktrees")
 
 
 async def phase_plan(task: str, st: State, caps: dict,
@@ -6375,6 +6352,62 @@ def write_plan(pila_dir: Path, task: str, st: State,
     st.save()
 
 
+def _format_provision_recipe_section(recipe: list[dict],
+                                      *, audience: str) -> str | None:
+    """Render the persisted provision recipe as a prompt section, or
+    return None if the recipe is empty / all-`none`.
+
+    `audience` controls the framing:
+      - "implementer": "decide whether your subtask needs them"
+      - "conformer": "ensure deps are installed before BUILD/LINT/TEST"
+
+    The recipe is detected in phase_provision but executed by workers
+    in their own worktrees (DESIGN §6½ "Worker-driven install"). This
+    function is the prompt-injection helper that hands the recipe to
+    workers verbatim — no per-worker variation, same string in every
+    prompt.
+    """
+    install_entries = [e for e in recipe
+                       if e.get("kind") in ("install", "build")
+                       and e.get("command")]
+    if not install_entries:
+        return None
+
+    lines = ["", "PROVISION_RECIPE:"]
+    if audience == "implementer":
+        lines.append(
+            "  The orchestrator detected the following install (and "
+            "follow-on build) commands for this repo. Your worktree "
+            "starts with NO installed dependencies and no build "
+            "outputs. Decide whether your subtask needs them — if yes, "
+            "run them via Bash in the order shown. The package-manager "
+            "caches (pnpm store, pip wheel cache, go module cache, cargo "
+            "registry) are warm and shared across worktrees, so "
+            "re-running these is fast. These are advisory: skip them if "
+            "your subtask is purely documentation, config, or otherwise "
+            "doesn't touch buildable code."
+        )
+    elif audience == "conformer":
+        lines.append(
+            "  Your worktree starts with NO installed dependencies "
+            "(or only those the implementer chose to install) and no "
+            "build outputs. Before running BUILD_CMD / LINT_CMD / "
+            "TEST_CMD, ensure deps and any required build artifacts are "
+            "present — either run the install (and follow-on build) "
+            "command(s) yourself first, in the order shown, or react to "
+            "a failing test/build that diagnoses missing deps and run "
+            "them then. The caches are warm so re-running is fast."
+        )
+    else:
+        raise ValueError(f"unknown audience {audience!r}")
+    for i, e in enumerate(install_entries, 1):
+        cmd_str = " ".join(e["command"])
+        wd = e.get("working_dir", ".")
+        timeout = e.get("timeout_s") or 1800
+        lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout}s)")
+    return "\n".join(lines)
+
+
 async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
                           models: dict[str, str],
                           continuation: bool = False, note: str = "") -> dict:
@@ -6387,11 +6420,14 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
     if proc.returncode != 0:
         raise WorkerError(f"worktree creation failed for {sid}: {proc.stderr.strip()}")
     worktree = proc.stdout.strip().splitlines()[-1]
-    # Replay the persisted provision recipe so this fresh worktree has
-    # its deps installed before the implementer worker starts. Shared
-    # caches (pnpm/Go/Cargo/pip wheels) make this fast on the second+
-    # worktree (DESIGN §6½).
-    await replay_provision_in_worktree(Path(worktree), st)
+    # The fresh worktree has NO installed deps. The implementer runs
+    # installs itself in its own worktree against the shared
+    # package-manager caches (DESIGN §6½ "Worker-driven install"); the
+    # recipe to follow is injected into its prompt below. We don't
+    # pre-install here because (a) it would clobber the host's
+    # repo_root checkout that this worktree shares the package cache
+    # with, and (b) workers correctly skip install when their subtask
+    # is config-only / docs-only.
 
     # DESIGN §11 mid-execution clarification: the worker may exit with
     # `needs-clarification` only when --clarify is in effect. Without
@@ -6413,6 +6449,11 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
           "exit `needs-clarification` for a genuine intent question that "
           "neither the codebase nor research can resolve; when false, you "
           "must make a best-effort decision and proceed)."]
+    recipe_section = _format_provision_recipe_section(
+        (st.data.get("provision") or {}).get("recipe") or [],
+        audience="implementer")
+    if recipe_section is not None:
+        up.append(recipe_section)
     if continuation:
         up.append(f"This is a CONTINUATION. Read the checkpoint at "
                   f"{pila_dir}/checkpoints/{sid}.md, validate it against the "
@@ -6740,6 +6781,11 @@ async def run_conformer(sid: str, pila_dir: Path, worktree: str,
           f"LINT_CMD: {blt_commands.get('lint') or '(none)'}",
           f"TEST_CMD: {blt_commands.get('test') or '(none)'}",
           f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
+    recipe_section = _format_provision_recipe_section(
+        (st.data.get("provision") or {}).get("recipe") or [],
+        audience="conformer")
+    if recipe_section is not None:
+        up.append(recipe_section)
 
     # bump_workers is inside the try block on purpose: it raises
     # WorkerError when max_total_workers is exhausted, and the conformance
@@ -7327,6 +7373,14 @@ async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
         # call the answers file was silently dropped — the re-spawned
         # worker would re-ask the same question forever. See P5-1.
         absorb_supplied_answers(args, st, pila_dir)
+        # Re-export the mise override env var if the original run
+        # synthesized one. phase_provision (which set it on os.environ
+        # the first time) is skipped on resume, but downstream
+        # implementer/conformer subprocesses still need it to find the
+        # synthesized go pin.
+        override = (st.data.get("provision") or {}).get("override_file")
+        if override:
+            os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
     else:
         if not args.task:
             die("a task description is required (or use --resume)")

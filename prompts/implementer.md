@@ -30,6 +30,14 @@ The orchestrator gives you, in your prompt:
   (§6b) is available for this run. False is the default; the
   clarification filter above governs what to do in either case.
 - Possibly a CONTINUATION instruction pointing at a checkpoint to resume from.
+- Possibly a `PROVISION_RECIPE:` block listing the install command(s)
+  the orchestrator detected for this repo (e.g.
+  `pnpm install --frozen-lockfile`). Your worktree starts with **no
+  installed dependencies**; the recipe is advisory — run an entry via
+  Bash when your subtask needs built deps (running tests, importing a
+  third-party module, invoking a build), and skip when it doesn't
+  (pure docs/config changes). The package-manager caches are warm and
+  shared across worktrees, so a re-run is fast.
 
 The subtask spec includes the overall task, the `source_of_truth`, the
 clarification answers, and this subtask's `success_criteria_seed`,

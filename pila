@@ -530,7 +530,12 @@ CACHE_MOUNTS=(
   -v "$HOME/.cache/pila/pip:/home/pila/.cache/pila/pip"
   -v "$HOME/.cache/pila/go-mod:/home/pila/.cache/pila/go-mod"
   -v "$HOME/.cache/pila/cargo:/home/pila/.cache/pila/cargo"
-  -e "PNPM_STORE_PATH=/home/pila/.cache/pila/pnpm-store"
+  # pnpm reads its store path from `npm_config_store_dir` (or `store-dir`
+  # in .npmrc, or `--store-dir` CLI). There is no `PNPM_STORE_PATH`; a
+  # prior version of this file set that and pnpm silently ignored it,
+  # falling back to ~/.local/share/pnpm/store inside the container —
+  # which is NOT bind-mounted, so every run paid full registry cost.
+  -e "npm_config_store_dir=/home/pila/.cache/pila/pnpm-store"
   -e "PIP_CACHE_DIR=/home/pila/.cache/pila/pip"
   -e "GOMODCACHE=/home/pila/.cache/pila/go-mod"
   -e "CARGO_HOME=/home/pila/.cache/pila/cargo"

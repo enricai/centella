@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Provisioning no longer mutates the host's repo.** Phase 1½ used
+  to execute `pnpm install` / `pip install` / etc. against
+  `repo_root`, which is bind-mounted from the host. On
+  darwin-host + linux-container setups (the common Colima case)
+  this clobbered the host's `node_modules` with linux-arm64 native
+  binaries — host `pnpm dev` would then crash with
+  "wrong architecture" until the developer ran `pnpm install` on
+  the host again to restore darwin-arm64 binaries. Phase 1½ now
+  only *detects* the install recipe; each worker runs the install
+  in its own worktree against the shared package-manager cache
+  (DESIGN §6½ "Worker-driven install"). Side effects: the
+  `replay_provision_in_worktree` function and its
+  `wrap_with_mise_exec` helper are removed; the recipe is now
+  injected into implementer and conformer prompts as a
+  `PROVISION_RECIPE:` advisory block.
+- **pnpm store cache mount was inert.** The launcher exported
+  `PNPM_STORE_PATH=/home/pila/.cache/pila/pnpm-store`, but that
+  env var does not exist in pnpm — pnpm reads `npm_config_store_dir`
+  (env), `store-dir` (`.npmrc`), or `--store-dir` (CLI). pnpm
+  silently fell back to its default
+  (`/home/pila/.local/share/pnpm/store`), which was NOT
+  bind-mounted, so every container run paid full registry cost on
+  every package. Fixed by setting `npm_config_store_dir` instead.
+  The host cache (`~/.cache/pila/pnpm-store`) now warms across
+  runs as intended.
+- **`mise install` and `.pila-setup.sh` no longer hang silently.**
+  Both ran through `run_proc` which buffered stdout/stderr until
+  the process exited — on a first-run Python 3.12 / Ruby 3.2 / Rust
+  install that meant the user could stare at one log line for
+  10+ minutes before seeing anything. A new `run_streaming()`
+  helper (next to `run_proc`) streams output line-by-line to both
+  the terminal and the persistent log, keeps a bounded tail for
+  error reporting, and on timeout populates `TimeoutExpired.output`
+  with the captured tail so callers can include it in their
+  diagnostic.
+
 ## [0.2.1] - 2026-05-29
 
 ### Fixed

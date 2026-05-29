@@ -221,8 +221,8 @@ exist** — finalize moved to the host (DESIGN §6 *Finalization*), so
 don't need to be forwarded into the container. The macOS-only "SSH agent
 forwarding is not available" note is gone for the same reason.
 | `~/.cache/pila/mise-data` | `/home/pila/.local/share/mise` | rw | Mise's `MISE_DATA_DIR` (per-repo runtime installs, plugins, cache). Lives in the user dir so the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). |
-| `~/.cache/pila/pnpm-store` | `/home/pila/.cache/pila/pnpm-store` | rw | pnpm content-addressable store. Safe for concurrent installs across worktrees (pnpm/discussions#10702). |
-| `~/.cache/pila/pip` | `/home/pila/.cache/pila/pip` | rw | pip HTTP + wheels cache. Wheel-build race pypa/pip#9034 is bypassed by pila's warm-once-then-replay pattern: phase_provision pre-builds wheels serially, worktree replays hit cache (DESIGN §6½). |
+| `~/.cache/pila/pnpm-store` | `/home/pila/.cache/pila/pnpm-store` | rw | pnpm content-addressable store. Pointed at via `npm_config_store_dir` (the pnpm-respected env var; `PNPM_STORE_PATH` doesn't exist and would be silently ignored). Safe for concurrent installs across worktrees (pnpm/discussions#10702). |
+| `~/.cache/pila/pip` | `/home/pila/.cache/pila/pip` | rw | pip HTTP + wheels cache. Each worker that needs Python deps runs `pip install` / `uv sync` itself in its own worktree against this shared cache; after the first install of a package the cache is warm and subsequent workers' installs are fast. Wheel-build race pypa/pip#9034 is still a theoretical concern but in practice rare given pila's small worker concurrency (DESIGN §6½). |
 | `~/.cache/pila/go-mod` | `/home/pila/.cache/pila/go-mod` | rw | `GOMODCACHE`. Concurrent-safe via per-module-version `flock` in `cmd/go/internal/modfetch`. |
 | `~/.cache/pila/cargo` | `/home/pila/.cache/pila/cargo` | rw | Whole `CARGO_HOME` (registry + bin + config.lock). Mounting only `registry/` breaks `config.lock` (cargo#11376). Concurrent-safe via cargo's documented flock semantics. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
@@ -912,7 +912,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 |-------|-------------|--------------|
 | Preflight | `preflight` | git identity, clean working tree, `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected later in the flow (filesystem side in `State.rename_to()` post-classify; git side in `setup-run.sh`'s branch-creation step) — they cannot be checked in preflight because the final `run_id` isn't known until phase_classify completes. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `--resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 8-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
-| 1½ Provision | `phase_provision` | per-repo dep provisioning (DESIGN §6½). Runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.pila-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss; recipe executed via `mise exec --` and persisted to `st.data["provision"]`. Skipped on `--resume` (whole fresh-run else-branch is). |
+| 1½ Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.pila-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.pila-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` (whole fresh-run else-branch is); the env var is re-exported from persisted state on resume. |
 | 0 Clarify | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `pila.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
 | 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5, §14). |
@@ -1446,16 +1446,16 @@ pila.py:5989). Step order:
    recipe (marked `source: "llm"` in state).
 8. **Validate.** `validate_provision_recipe(recipe)`. Reject →
    `die()`.
-9. **Execute.** Each command runs through `mise exec --` via
-   `wrap_with_mise_exec()` so the resolved toolchain is active.
-   Per-command timeout from the recipe (default 600s if absent).
-   Output streams to `.pila/runs/<id>/logs/provision.log`.
-   Per-command status persisted to
-   `st.data["provision"]["commands"] = [{cmd, status, log_tail}]`.
-   Failure → `die()` with last 40 lines of the failing command's
-   output.
-10. **Persist.** Full recipe + `source` + resolved versions saved
-    to `st.data["provision"]`.
+9. **Persist (do not execute).** Full recipe + `source` + resolved
+    versions saved to `st.data["provision"]`. The recipe is not
+    executed by `phase_provision` — the implementer and conformer
+    workers run install commands from their own worktrees, given the
+    recipe via prompt injection
+    (`_format_provision_recipe_section()`). See "Worker-driven
+    install" below.
+10. **Export env.** If `synth_mise_go_override()` created an override
+    file, `os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"]` is set to
+    its path so every downstream worker subprocess inherits it.
 
 ### Helper functions
 
@@ -1463,11 +1463,12 @@ pila.py:5989). Step order:
 |---|---|
 | `gather_provision_fixtures(repo_root) -> dict` | Assembles the LLM-worker input set under a 24KB total ceiling. README extracted by `extract_readme_sections()`; root manifests (`package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `Gemfile`, `Makefile`, `pom.xml`, `build.gradle*`) included if present; workspace child manifests capped at 3 (1KB each) for monorepos; up to 2 `.github/workflows/*.yml` files matching `(?i)ci\|test\|build\|release` (skip `codeql\|stale\|dependabot`); optional `CONTRIBUTING.md` / `docs/DEVELOPMENT.md` capped at 4KB. |
 | `extract_readme_sections(text) -> str` | Header-aware extractor. Strips leading emoji/punctuation before keyword match. Three header styles: ATX (`## ...`), setext (`...\n===` / `...\n---`), asciidoc (`== ...`). Keeps ≤1KB intro + matched sections (8KB post-extract budget). Section-match regex: `(?i)install\|getting[\s-]?started\|quick[\s-]?start\|setup\|usage\|\brun\b\|develop\|build(ing)?( from source\| instructions)?\|compil(e\|ing)( from source)?\|download\|from source\|requirements\|prerequisites\|dependenc(y\|ies)`. Fallback chain on no header match: code-fence detector (`pip install`, `npm install`, `cargo`, `brew`, `go install`, `apt-get`, `make` patterns, ±10 lines) → final top-6KB fallback. |
-| `run_setup_hook(repo_root, log_dir, st)` | Execs `<repo>/.pila-setup.sh` if present with a 10-min timeout; streams output to `<log_dir>/setup-hook.log`; sets `st.data["provision"]["sh_hook_ran"] = True` on success. |
+| `run_setup_hook(repo_root, log_dir, st)` | Execs `<repo>/.pila-setup.sh` if present with a 10-min timeout via `run_streaming` (live output to terminal + persistent log at `<log_dir>/setup-hook.log`); sets `st.data["provision"]["sh_hook_ran"] = True` on success. |
 | `synth_mise_go_override(repo_root, run_dir) -> Path \| None` | See step 3 above. Returns the absolute path to the override file or `None` if no synthesis was needed. |
-| `run_mise_install(repo_root, log_dir, st)` | See steps 4–5. |
-| `wrap_with_mise_exec(cmd: list[str]) -> list[str]` | Prepends `["mise", "exec", "--"]`; idempotent. |
-| `phase_provision(repo_root, st, models)` | Orchestrates all of the above. |
+| `run_mise_install(repo_root, log_dir, st)` | Runs `mise install` + `mise ls --current --json` at `repo_root`. The install streams via `run_streaming` so the user sees per-tool progress on a first-run Python/Ruby/Rust install. |
+| `_format_provision_recipe_section(recipe, *, audience) -> str \| None` | Renders the persisted recipe as a `PROVISION_RECIPE:` block for injection into implementer or conformer prompts. Audience-specific framing ("decide whether your subtask needs them" vs "ensure deps before BUILD/LINT/TEST"). Returns None when the recipe is empty or all-`none`. |
+| `phase_provision(repo_root, st, models)` | Orchestrates all of the above. Detects + persists the recipe; does NOT execute it (workers run installs in their worktrees per DESIGN §6½). Exports `MISE_OVERRIDE_CONFIG_FILENAMES` to `os.environ` if a synth override was created, so all downstream worker subprocesses inherit it. |
+| `run_streaming(cmd, ..., log_path, verbosity, ...)` | Async subprocess helper with live-streamed stdout+stderr, persistent log file, bounded tail deque, and `TimeoutExpired` carrying the tail in `.output`. Used by `run_mise_install` and `run_setup_hook`; replaces the previous `run_proc` calls that buffered output for the entire run duration. |
 
 ### Caches
 
@@ -1484,37 +1485,69 @@ Five host caches mounted into the container, all `rw`. Listed in §0.5
   `config.lock` (cargo#11376).
 - **pip** — Mixed. Most races fixed (pypa/pip#9470, #12361, #13540
   closed). The wheel-build race #9034 (concurrent `pip install` of
-  the same sdist into the same wheel-cache slot) is still open;
-  pila's pattern bypasses it: `phase_provision` runs the install
-  once serially (wheels land in the shared cache), per-worktree
-  replays hit cached wheels in parallel — no build, no race.
+  the same sdist into the same wheel-cache slot) is still open; in
+  practice pila runs a small number of concurrent workers and the
+  collision window is narrow. A worker that does hit the race retries
+  once via pip's own retry, and a persistent failure surfaces as a
+  conformer warning (DESIGN §9), not a silent corruption.
 
 Bundler is **not** mounted as a shared cache (open `unlink` races,
 rubygems/bundler#4519). Ruby repos route through `.pila-setup.sh`.
 
-### Worktree replay
+### Worker-driven install (replaces per-worktree replay)
 
-`scripts/new-worktree.sh` is unchanged — it still does just the
-`git worktree add` and prints the worktree path. The replay is
-handled in Python (`replay_provision_in_worktree(worktree, st)`,
-called from `run_implementer` immediately after the script returns)
-so it can use the same `mise exec --` wrapper, `provision.log` sink,
-and per-command timeout already in use by `phase_provision`. Keeping
-the bash script single-purpose also keeps its stdout clean (the
-orchestrator parses the worktree path from the script's last line).
+`scripts/new-worktree.sh` does just the `git worktree add` and prints
+the worktree path. There is **no orchestrator-driven install** after
+that — the implementer runs the install itself from its own worktree
+via its Bash tool, against the shared package-manager caches. The
+conformer does the same before running BUILD/LINT/TEST.
+
+How the recipe reaches the worker:
 
 1. `git worktree add` checks out the worktree (tracked files only).
+   It starts with no `node_modules/` / `.venv/` / `target/`, by
+   design.
 2. The orchestrator parses the worktree path from the script's stdout.
-3. `replay_provision_in_worktree` reads `st.data["provision"]["recipe"]`
-   and replays each `kind: install` or `kind: build` command via
-   `mise exec --` against the new worktree's path. The version files
-   (`.nvmrc` etc.) are tracked so mise picks them up automatically;
-   the shared caches make the install fast.
-4. If the recipe is missing or empty (docs-only run), the replay is
-   a no-op.
-5. Replay failures are logged but do NOT block the worker — the
-   per-subtask post-work conformance phase (DESIGN §9) is the
-   load-bearing check that the worktree is actually usable.
+3. `run_implementer` (and later `run_conformer`) read
+   `st.data["provision"]["recipe"]` and inject it as a
+   `PROVISION_RECIPE:` block in the worker's user prompt via
+   `_format_provision_recipe_section(...)`.
+4. The worker's prompt (see `prompts/implementer.md` §2 and
+   `prompts/conformer.md` §Input) instructs it to decide whether the
+   subtask needs the install and to run the command from its
+   worktree if yes. The shared store / cache makes re-runs across
+   worktrees fast.
+5. If the recipe is missing or empty (docs-only run), no
+   `PROVISION_RECIPE:` block is injected and the worker proceeds
+   without one.
+6. Install failures inside a worker surface through the worker's
+   normal exit machinery — a hard-failing build/test in the
+   implementer becomes a `failed` or `blocked` status; in the
+   conformer it surfaces as a `tests-failed: …` advisory warning
+   (DESIGN §9).
+
+Why this shape (vs. an orchestrator-driven install at `repo_root` or
+per-worktree replay):
+
+- The host's repo is bind-mounted at `repo_root`, so an
+  orchestrator-driven install there writes linux-arm64 native
+  binaries into the host's darwin `node_modules`, corrupting the
+  host's checkout.
+- Per-worktree pre-install is wasted work for subtasks that don't
+  need built deps (config-only, doc-only, pure-code refactors that
+  don't run tests). The barnacle reference run showed ~half of
+  implementer subtasks correctly skip install when given the choice.
+- `claude -p`'s built-in stream-event plumbing surfaces Bash tool
+  I/O to the orchestrator log live, so an install running inside a
+  worker is visible to the user without any special orchestrator
+  streaming code.
+
+The `MISE_OVERRIDE_CONFIG_FILENAMES` env var that `phase_provision`
+synthesizes for polyglot Go repos (go.mod with no `.go-version`
+sibling) is exported to `os.environ` once in `phase_provision` (and
+re-exported from persisted state on `--resume`); worker subprocesses
+inherit it without any per-worker plumbing because `_invoke` does
+not pass an explicit `env=` to `create_subprocess_exec`.
 
 ---
 
@@ -1703,7 +1736,7 @@ written somewhere in `orchestrator/pila.py`. The coupling test in
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
 | `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log) — keys are subtask ids, values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. Populated only on subtasks whose implementer reached `status: "complete"`. See DESIGN §9 *Post-work conformance* |
-| `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries), `commands` (per-command status log: `[{kind, cmd, status, log_tail}]`), `sh_hook_ran` (bool, set by `run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`). Read by `replay_provision_in_worktree` so each worktree replays the same recipe under the same mise-resolved toolchain. |
+| `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries, persisted for worker prompt injection — NOT executed by the orchestrator), `sh_hook_ran` (bool, set by `run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`), `override_file` (absolute path to a synthesized mise override when `phase_provision` had to bridge a polyglot Go repo; `None` otherwise — re-exported as `MISE_OVERRIDE_CONFIG_FILENAMES` on `--resume`). Read by `_format_provision_recipe_section()` so implementer/conformer prompts can inject the recipe as a `PROVISION_RECIPE:` advisory block. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/pila.md`):

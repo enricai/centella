@@ -41,6 +41,17 @@ The orchestrator gives you, in your prompt:
   `pila/runs/<run-id>`, but may be a commit SHA) the subtask
   branched from. The diff you are reviewing is `git diff
   <DIFF_BASE>..HEAD`.
+- Possibly a `PROVISION_RECIPE:` block listing the install command(s)
+  the orchestrator detected for this repo (e.g.
+  `pnpm install --frozen-lockfile`). Your worktree starts with **no
+  installed dependencies** (or only those the implementer chose to
+  install). Before running `BUILD_CMD` / `LINT_CMD` / `TEST_CMD`, make
+  sure deps are present — either run the install command(s) first, or
+  react to a failing build/test that diagnoses missing deps and run
+  install then. The shared package-manager caches make re-running
+  fast. If the block is absent, the orchestrator detected no install
+  command for this repo (or the run is docs-only) — proceed with
+  BUILD/LINT/TEST as given.
 
 ## The loop
 
