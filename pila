@@ -291,31 +291,14 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
-# 2. gh CLI authenticated + origin remote present (orchestrator's old
-#    _check_gh_cli at pila.py:1323). Skipped under --no-push.
+# 2. origin remote present (required for `git push`). Skipped under
+#    --no-push. We do NOT preflight `gh auth status` or even check `gh`
+#    presence here — both are needed only at PR-creation time, and
+#    `gh pr create` failure is non-fatal (the run branch is already
+#    pushed; the user can open the PR manually with the printed retry
+#    command). Preflighting gh auth surfaced false-positives without
+#    catching anything the post-push failure path doesn't handle.
 if [ "$NO_PUSH" = "false" ]; then
-  if ! command -v gh >/dev/null 2>&1; then
-    echo "pila: error: \`gh\` CLI not found on PATH." >&2
-    echo "  Install GitHub CLI (https://cli.github.com) or pass \`--no-push\`" >&2
-    echo "  to skip the push and PR step at finalize." >&2
-    exit 1
-  fi
-  # Run gh once, capture combined output (gh writes to stdout, not
-  # stderr — verified against gh 2.69.0). `set -e` is suppressed
-  # inside the condition of a compound command via `|| true`.
-  gh_auth_output="$(gh auth status 2>&1)" || gh_auth_rc=$?
-  gh_auth_rc=${gh_auth_rc:-0}
-  if [ "$gh_auth_rc" -ne 0 ]; then
-    echo "pila: error: \`gh\` is installed but not authenticated. Run" >&2
-    echo "  \`gh auth login\`, or pass \`--no-push\` to skip the push and" >&2
-    echo "  PR step at finalize." >&2
-    if [ -n "$gh_auth_output" ]; then
-      echo "gh auth status output:" >&2
-      printf '  %s\n' "$gh_auth_output" >&2
-    fi
-    exit 1
-  fi
-  unset gh_auth_output gh_auth_rc
   if ! git remote get-url origin >/dev/null 2>&1; then
     echo "pila: error: this repository has no \`origin\` remote — finalize cannot" >&2
     echo "  push without one. Add one with \`git remote add origin <url>\` or pass" >&2
