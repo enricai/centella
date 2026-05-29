@@ -36,12 +36,19 @@ dependencies on the user's behalf.
    ```
 
    The launcher spins up a container, mounts the user's repo at
-   `/work`, mounts `~/.claude/` read-write so workers can authenticate
-   and update Claude Code session state (history, sessions, plans),
-   bind-mounts `~/.config/gh`, `~/.git-credentials`, and `~/.ssh` so
-   the finalize-phase push + PR work with the user's existing GitHub
-   auth, and execs the orchestrator inside. Stdout streams back
-   through the Bash tool to this chat session.
+   `/work`, stages per-container copies of the user's Claude + git +
+   SSH + GPG config in a per-run host scratch dir, and mounts each
+   piece at its default in-container path (so the CLI / git see
+   normal locations with private contents — no shared host file to
+   race on). On macOS the OAuth token is extracted from Keychain at
+   launcher time and written to the staged credentials file, so
+   workers authenticate via the same file-based path the Linux CLI
+   uses. Finalize-phase `git push` and `gh pr create` run on the
+   host after the container exits, using the host's existing auth.
+   The scratch dir is reaped on container exit; container-side
+   writes (`numStartups++`, session transcripts) are intentionally
+   discarded. Stdout streams back through the Bash tool to this chat
+   session.
 
    Because the launcher detects this session has no TTY on its
    stdin, it runs the container with `-i` only (no pty). Inside the

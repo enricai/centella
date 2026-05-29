@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Per-container Claude config isolation eliminates the silent-hang
+  race.** Concurrent pila containers used to share a single host
+  `~/.claude.json` via bind mount, which exposed the well-documented
+  `claude-code` corruption race (anthropics/claude-code issues #28847,
+  #29217, #29395, #40226 — all open). When the file went missing
+  mid-rewrite, the CLI entered a "recovery loop with no backoff" —
+  `claude -p` never exited, pila's existing retry path never fired,
+  and the worker hung silently until the 90-min hard kill. The
+  launcher now stages a per-run scratch dir on the host with a
+  private copy of `~/.claude.json` (with `projects[]` stripped),
+  `~/.claude/` (with bulky / prior-session paths blacklisted), all
+  present `~/.git*` siblings, `~/.config/git/`, `~/.netrc`, `~/.ssh/`
+  (sockets filtered), and `~/.gnupg/` (sockets filtered). Each piece
+  mounts at its default in-container path so the CLI and git see
+  normal locations with private contents — no shared host state to
+  race on, no env-var redirection needed. On macOS the OAuth token
+  is now extracted from Keychain (`security find-generic-password`)
+  and written to the staged `~/.claude/.credentials.json` — the same
+  file-based path the Linux CLI reads — so authentication works
+  identically on both platforms without an env-var bridge. The host
+  scratch dir is reaped on container exit; container-side writes
+  (`numStartups++`, new session transcripts) are intentionally lost.
+- **Live stderr streaming surfaces worker failures in seconds, not
+  minutes.** `_invoke()`'s `_drain_stderr` used to silently buffer
+  every stderr byte into an in-memory list and surface it only on
+  exit (or when the idle watchdog flushed the last ~40 KB at 300 s).
+  When `claude -p` hit the recovery loop above, its repeated "Claude
+  configuration file not found" stderr lines were invisible to the
+  user for the full 5 minutes before the watchdog fired. Stderr now
+  streams line-by-line to the per-sid log file (with a `[ts] stderr`
+  header) and echoes to the orchestrator log at `stream` / `debug`
+  verbosity. Stderr activity also refreshes the watchdog clock, so a
+  worker that emits only stderr (recovery-loop scenarios) doesn't
+  falsely trip the idle watchdog. `stderr_chunks` is still populated
+  for the existing exit-time `WorkerError` message at `pila.py:4195`.
+
 - **Provisioning no longer mutates the host's repo.** Phase 1½ used
   to execute `pnpm install` / `pip install` / etc. against
   `repo_root`, which is bind-mounted from the host. On

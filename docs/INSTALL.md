@@ -150,7 +150,7 @@ nerdctl run --rm hello-world
 You should see "Hello from Docker!" (containerd uses the same image).
 If that fails, pila will too.
 
-## What pila bind-mounts into the container
+## What pila mounts into the container
 
 When the container starts, the launcher mounts the following:
 
@@ -158,21 +158,22 @@ When the container starts, the launcher mounts the following:
 |---|---|---|---|
 | `$(pwd)` (your repo) | `/work` | rw | Pila operates here. Worktrees and `.pila/` state are written to your host filesystem; `--resume` works across runs. |
 | `$PILA_HOME` (pila install) | `/work/.pila-image` | ro | Pila's source and Dockerfile. Edit `orchestrator/pila.py` on the host; next run picks it up without rebuilding the image. |
-| `~/.claude/` | `/home/pila/.claude` | **rw** | Claude Code session state. `claude` writes history, sessions, projects, caches during a run — read-only would break workers. |
-| `~/.claude.json` | `/home/pila/.claude.json` | rw | Same; `claude` updates it during sessions. |
-| `~/.gitconfig` | `/home/pila/.gitconfig` | ro | User/email attribution for commits made inside worktrees. |
-| `~/.config/gh` | `/home/pila/.config/gh` | rw | GitHub CLI auth token. Used by `gh pr create` at finalize. Mounted rw so `gh auth refresh` (if it fires mid-run) writes back to the host. Omitted if absent — pass `--no-push` to skip the PR step. |
-| `~/.git-credentials` | `/home/pila/.git-credentials` | rw | Git's credential-helper store for HTTPS push. Omitted if absent. |
-| `~/.ssh` | `/home/pila/.ssh` | ro | SSH keys + `known_hosts` for SSH push. Read-only — `$SSH_AUTH_SOCK` carries the actual key material when keys are passphrase-protected. Omitted if absent. |
-| `$SSH_AUTH_SOCK` | `/ssh-agent` (+ env var) | rw | SSH agent socket. Forwarded so passphrase-protected keys work inside the container. **Linux native only** — Colima on macOS does not forward AF_UNIX sockets across its VM boundary; the launcher prints a one-line note and skips this mount. macOS users with SSH-passphrase-protected keys should switch the remote to HTTPS (`gh auth setup-git`) or pass `--no-push`. Omitted if the env var is unset or the socket doesn't exist. |
+| Per-run host scratch dir (`$TMPDIR/pila-cfg-…/.claude.json`) | `/home/pila/.claude.json` | rw | Per-container copy of `~/.claude.json` with `projects[]` stripped. The shared host file is never directly mounted — it's a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226) that hangs workers in a recovery loop. Each container writes only its private copy. |
+| Per-run host scratch dir (`$TMPDIR/pila-cfg-…/.claude/`) | `/home/pila/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/`, `settings.json`, `mcp-needs-auth-cache.json`, `local/`, `statsig/`, `cache/`) ride along. |
+| Keychain (macOS only) → staged `.claude/.credentials.json` | `/home/pila/.claude/.credentials.json` | rw | The Claude CLI stores its OAuth token in Keychain on macOS (an IPC service the container can't reach). The launcher extracts it with `security find-generic-password -s "Claude Code-credentials" -w` and writes the JSON blob to the staged credentials file — the same path the Linux CLI reads — so authentication works identically on both platforms. |
+| Per-run host scratch copies of `~/.gitconfig`, `~/.gitconfig.local`, `~/.gitignore`, `~/.gitignore_global`, `~/.git-credentials`, `~/.netrc`, `~/.config/git/`, `~/.ssh/`, `~/.gnupg/` | `/home/pila/.<same>` | rw | Per-container copies of every present host config / auth file the worker might need. SSH and GPG copies exclude agent sockets (`agent/`, `S.*`, `*.sock`) — sockets are host-bound and not reachable from the container. Workers can `git config --local`, push over SSH, or `git commit -S` if signing is configured, all against private copies that vanish on container exit. |
 | Each `--inspect-dir` path | `/inspect/<basename>` | ro | Extra directories the inspect-bucket workers (classifier, planner, reconciler, provision) need read access to. |
 
-The `~/.claude/` mount gives the container full access to your Claude
-Code session state, conversation history, settings, and plugins. That's
-intentional: pila is your own tool running on your own machine, and
-`claude -p` workers genuinely need to read and update this state. If
-you want stronger isolation, run pila as a dedicated OS user with its
-own `~/.claude/`.
+Per-container isolation is the key design choice: each container sees
+a private copy of your Claude + git + SSH + GPG config at the default
+paths the CLI and git already look at, so nothing inside the container
+knows or cares that the files are private rather than the shared host
+originals. Container-side writes (incremented startup counters, new
+session transcripts, refreshed auth state) are intentionally lost when
+the container exits — pila's own telemetry (`.pila/runs/<id>/`) is the
+source of truth for run cost and structure. The host scratch dir is
+reaped on container exit; your host `~/.claude.json` and `~/.claude/`
+are never modified by a worker.
 
 ## Troubleshooting
 

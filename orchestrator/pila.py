@@ -4089,14 +4089,39 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     f"or text block: {e}") from e
 
     async def _drain_stderr():
-        # Drain stderr concurrently so a chatty worker doesn't block on
-        # a full pipe. stderr content surfaces only if the process
-        # exits with no envelope (used in the error message).
-        while True:
-            chunk = await proc.stderr.read(4096)
-            if not chunk:
-                return
-            stderr_chunks.append(chunk)
+        # Stream stderr live to the per-sid log file with a `[ts] stderr`
+        # header so it's distinguishable from stream-json events, and
+        # echo selectively to the orchestrator log at stream/debug
+        # verbosity. Continues to buffer raw bytes into stderr_chunks
+        # so the existing exit-time error path (line ~4195) and the
+        # idle-watchdog stderr-tail flush still work unchanged.
+        #
+        # Solves the failure class where a worker emits a fatal message
+        # to stderr (e.g. "Claude configuration file not found" from
+        # the claude-code recovery-loop bug) but pila doesn't surface
+        # it until the 300s watchdog fires (or never, if the recovery
+        # loop spins indefinitely with no exit).
+        nonlocal last_event_at  # stderr activity counts as liveness
+        with log_path.open("a", buffering=1) as log_file:
+            try:
+                async for raw in proc.stderr:
+                    if not raw:
+                        continue
+                    last_event_at = time.monotonic()
+                    stderr_chunks.append(raw)
+                    line = raw.decode(errors="replace").rstrip("\n")
+                    log_file.write(f"[{now()}] stderr\n{line}\n\n")
+                    if verbosity in ("stream", "debug"):
+                        log(f"  [{sid}] stderr: {line}")
+            except ValueError as e:
+                # Mirror _read_stream's overlong-line protection
+                # (line ~4082): asyncio's StreamReader raises
+                # ValueError when a single line exceeds the 10 MiB
+                # buffer limit. Convert to WorkerError so callers see
+                # a pila-shaped error consistent with the stdout path.
+                raise WorkerError(
+                    "claude -p stderr emitted a line exceeding the "
+                    f"10 MiB buffer limit: {e}") from e
 
     async def _idle_watchdog():
         # Observation-only stall detector. Wakes every `warn_sec` seconds

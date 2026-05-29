@@ -71,13 +71,23 @@ class _DelayedStream:
 class _StderrStream:
     """Asyncio stderr mock that emits a single bytes payload (optionally
     after a delay) then EOF. Used to verify the watchdog's stderr-tail
-    flushing surfaces CLI-internal debug output."""
+    flushing and live-streaming surfacing of CLI-internal debug output.
+
+    `_drain_stderr` iterates the stream with `async for raw in
+    proc.stderr` (line-by-line), so the mock yields its payload via
+    `__anext__` as a single line followed by EOF."""
     def __init__(self, payload: bytes = b"", delay_sec: float = 0.0):
+        # Ensure payload terminates with a newline so the async-for
+        # iteration treats it as a complete line.
+        if payload and not payload.endswith(b"\n"):
+            payload = payload + b"\n"
         self._payload = payload
         self._delay = delay_sec
         self._yielded = False
 
     async def read(self, n: int = -1) -> bytes:
+        # Kept for compatibility with any code path that still uses
+        # chunked reads on stderr.
         if self._yielded:
             return b""
         self._yielded = True
@@ -89,7 +99,12 @@ class _StderrStream:
         return self
 
     async def __anext__(self):
-        raise StopAsyncIteration
+        if self._yielded or not self._payload:
+            raise StopAsyncIteration
+        self._yielded = True
+        if self._delay > 0:
+            await asyncio.sleep(self._delay)
+        return self._payload
 
 
 class _DelayedProc:
@@ -555,3 +570,154 @@ def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
         "DEFAULT_CAPS value to _invoke (not None, not zero); got "
         f"idle_warn_sec={captured.get('idle_warn_sec')!r}"
     )
+
+
+# ---- Live stderr streaming (Fix 2) ------------------------------------
+
+def test_stderr_written_to_log_file_live(pila, pila_dir, monkeypatch):
+    """Each stderr line must be written to the per-sid log file with a
+    `[ts] stderr` header, regardless of verbosity. This is the property
+    that lets `tail -f .pila/logs/<sid>.log` show stderr as it arrives,
+    instead of (today) buffering silently until the worker exits or the
+    watchdog fires."""
+    events = [json.dumps({"type": "result", "subtype": "success",
+                          "num_turns": 1, "is_error": False})]
+    stderr_payload = b"Claude configuration file not found at: /home/pila/.claude.json"
+
+    async def fake(*cmd, **kwargs):
+        return _DelayedProc(events, stderr_payload=stderr_payload)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    asyncio.run(pila._invoke(
+        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
+        timeout=60, sid="t-stderr-file", pila_dir=pila_dir,
+        verbosity="quiet"))
+
+    log_text = (pila_dir / "logs" / "t-stderr-file.log").read_text()
+    assert "stderr" in log_text, (
+        "per-sid log file must contain a `stderr` header for each "
+        "stderr line; got log text:\n" + log_text)
+    assert "Claude configuration file not found" in log_text, (
+        "per-sid log file must contain the stderr payload verbatim; "
+        "got log text:\n" + log_text)
+
+
+def test_stderr_echoed_to_orchestrator_at_stream(pila, pila_dir,
+                                                  monkeypatch, capsys):
+    """At `stream` verbosity, each stderr line must be echoed to the
+    orchestrator log as `[<sid>] stderr: <line>` so the user sees worker
+    failures live instead of waiting for the 300s watchdog or
+    process exit."""
+    events = [json.dumps({"type": "result", "subtype": "success",
+                          "num_turns": 1, "is_error": False})]
+    stderr_payload = b"DEBUG anthropic: retrying token refresh (attempt 3)"
+
+    async def fake(*cmd, **kwargs):
+        return _DelayedProc(events, stderr_payload=stderr_payload)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    asyncio.run(pila._invoke(
+        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
+        timeout=60, sid="t-stderr-stream", pila_dir=pila_dir,
+        verbosity="stream"))
+
+    out = capsys.readouterr().out
+    assert "[t-stderr-stream] stderr: " in out, (
+        "expected `[<sid>] stderr: ...` echo at stream verbosity; "
+        "got:\n" + out)
+    assert "retrying token refresh" in out, (
+        "expected the stderr payload in the orchestrator echo; got:\n"
+        + out)
+
+
+def test_stderr_not_echoed_at_quiet(pila, pila_dir, monkeypatch, capsys):
+    """At `quiet` verbosity, stderr lines must NOT appear in the
+    orchestrator's stdout. The per-sid log file still gets them — that
+    invariant is covered by `test_stderr_written_to_log_file_live`."""
+    events = [json.dumps({"type": "result", "subtype": "success",
+                          "num_turns": 1, "is_error": False})]
+    stderr_payload = b"DEBUG anthropic: chatty progress message"
+
+    async def fake(*cmd, **kwargs):
+        return _DelayedProc(events, stderr_payload=stderr_payload)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    asyncio.run(pila._invoke(
+        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
+        timeout=60, sid="t-stderr-quiet", pila_dir=pila_dir,
+        verbosity="quiet"))
+
+    out = capsys.readouterr().out
+    assert "stderr:" not in out, (
+        "stderr must not echo to the orchestrator at `quiet` verbosity; "
+        f"got:\n{out}")
+    # File still gets it.
+    log_text = (pila_dir / "logs" / "t-stderr-quiet.log").read_text()
+    assert "chatty progress message" in log_text, (
+        "per-sid log file must still capture stderr even at quiet; got "
+        f"log text:\n{log_text}")
+
+
+def test_stderr_activity_resets_idle_watchdog(pila, pila_dir,
+                                               monkeypatch, capsys):
+    """A worker that emits stderr but no stdout is `recovery-loop`
+    shaped — the worker is alive, talking, just stuck before its first
+    stream-json event. Stderr activity must refresh `last_event_at` so
+    the idle watchdog does NOT falsely fire on it. Without this, the
+    watchdog would spam warnings every `worker_idle_warn_sec` even
+    though the worker is clearly emitting output."""
+    events = [json.dumps({"type": "result", "subtype": "success",
+                          "num_turns": 1, "is_error": False})]
+    stderr_payload = b"DEBUG continuous output"
+
+    async def fake(*cmd, **kwargs):
+        # stderr arrives quickly; stdout (the result event) is delayed
+        # long enough that the watchdog WOULD fire if stderr weren't
+        # counted as liveness.
+        return _DelayedProc(events,
+                            pre_delay_sec=0.5,
+                            stderr_payload=stderr_payload,
+                            stderr_delay_sec=0.1)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    # Watchdog window: 0.3s. stderr arrives at 0.1s; stdout at 0.5s.
+    # Without the nonlocal refresh, the watchdog would wake at 0.3s
+    # with a 0.3s-since-spawn gap and warn. With the refresh, the
+    # 0.1s stderr arrival resets the clock so the watchdog wake at
+    # 0.4s sees only 0.3s of silence — under the 0.3s threshold by
+    # the tightest margin; bump warn to 0.4 to be safe.
+    monkeypatch.setitem(pila.DEFAULT_CAPS, "worker_idle_warn_sec", 0.4)
+    asyncio.run(pila._invoke(
+        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
+        timeout=10, sid="t-stderr-liveness", pila_dir=pila_dir,
+        verbosity="quiet"))
+
+    out = capsys.readouterr().out
+    assert "no stdout events in" not in out, (
+        "watchdog should not fire when stderr is arriving; got:\n"
+        + out)
+
+
+def test_stderr_chunks_preserved_for_exit_error(pila, pila_dir,
+                                                 monkeypatch):
+    """The exit-time WorkerError path (pila.py ~line 4195) decodes the
+    full `stderr_chunks` buffer and includes it in the error message.
+    Live streaming must NOT consume the buffer — it has to keep
+    appending so the existing error path still works."""
+    # No `result` event → triggers WorkerError-on-no-envelope path.
+    stderr_payload = b"FATAL: authentication failed for tenant Z"
+
+    async def fake(*cmd, **kwargs):
+        return _DelayedProc([], stderr_payload=stderr_payload)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    with pytest.raises(pila.WorkerError) as excinfo:
+        asyncio.run(pila._invoke(
+            ["claude", "-p", "x"], cwd=str(pila_dir.parent),
+            timeout=60, sid="t-stderr-exiterr", pila_dir=pila_dir,
+            verbosity="quiet"))
+    msg = str(excinfo.value)
+    assert "authentication failed for tenant Z" in msg, (
+        "exit-time WorkerError must still surface the full stderr "
+        f"content (stderr_chunks not consumed by live streaming); "
+        f"got: {msg!r}")

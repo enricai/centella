@@ -445,27 +445,181 @@ for arg in "$@"; do
 done
 
 # --- assemble auth/config mounts ----------------------------------------
-# ~/.claude/ should always exist by the time pila runs (the user already
-# uses Claude Code), but ~/.claude.json and ~/.gitconfig are files: nerdctl
-# silently creates a directory at the target if the source file is missing,
-# which would break claude / git. Skip with a warning instead.
+# Per-container config isolation. The shared host ~/.claude.json is a
+# documented corruption race (anthropics/claude-code issues #28847,
+# #29217, #29395, #40226 — all open). Each container gets its own copy
+# of every claude/git/ssh/gpg config file it needs, staged on the host
+# in a per-run scratch dir and mounted at the default in-container
+# paths. Container sees normal locations; no shared host state to race.
 AUTH_MOUNTS=()
-if [ -d "$HOME/.claude" ]; then
-  AUTH_MOUNTS+=(-v "$HOME/.claude:/home/pila/.claude")
-else
+
+if [ ! -d "$HOME/.claude" ]; then
   echo "pila: $HOME/.claude not found — run \`claude\` at least once first" >&2
   exit 1
 fi
-if [ -f "$HOME/.claude.json" ]; then
-  AUTH_MOUNTS+=(-v "$HOME/.claude.json:/home/pila/.claude.json")
-else
-  echo "pila: warning — $HOME/.claude.json not found; some Claude Code state may not persist" >&2
+if [ ! -f "$HOME/.claude.json" ]; then
+  echo "pila: $HOME/.claude.json not found — run \`claude\` at least once first" >&2
+  exit 1
 fi
-if [ -f "$HOME/.gitconfig" ]; then
-  AUTH_MOUNTS+=(-v "$HOME/.gitconfig:/home/pila/.gitconfig:ro")
+
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/pila-cfg-XXXXXX")"
+
+# -- .claude.json: copy with projects[] stripped. --
+# The projects[] block stores prior-session per-project state
+# (lastSessionId, lastCost, MCP allowlists). Stripping it gives the
+# worker a clean slate on /work as a brand-new project.
+python3 - "$HOME/.claude.json" "$STAGE/.claude.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.pop("projects", None)
+json.dump(d, open(sys.argv[2], "w"))
+PY
+
+# -- .claude/: copy with prior-session / history / bulk dirs skipped. --
+# Blacklist (not whitelist) so a newly-added capability dir Anthropic
+# ships in a future release rides along by default. Update this list
+# only when something *bulky and session-shaped* lands.
+mkdir "$STAGE/.claude"
+CLAUDE_SKIP=(
+  history.jsonl     # global prompt history (22+ MB)
+  projects          # per-project session transcripts
+  sessions          # session metadata
+  tasks plans todos # prior-session task state
+  file-history      # per-session file-edit snapshots
+  paste-cache       # per-session paste tracking
+  shell-snapshots   # per-shell snapshots
+  session-env       # per-session env snapshots
+  telemetry         # CLI telemetry (we own our own)
+  stats-cache.json  # per-session stats cache
+  debug             # debug dumps
+  downloads         # downloaded files
+  backups           # .claude.json backups (we own our copy)
+  chrome            # Chrome integration state
+  ralph-state       # plugin state from prior sessions
+  .last-cleanup     # cleanup marker (regenerates)
+)
+if command -v rsync >/dev/null 2>&1; then
+  EXCLUDES=()
+  for s in "${CLAUDE_SKIP[@]}"; do EXCLUDES+=(--exclude="$s"); done
+  rsync -a "${EXCLUDES[@]}" --exclude='settings.json.*' \
+    "$HOME/.claude/" "$STAGE/.claude/"
 else
-  echo "pila: warning — $HOME/.gitconfig not found; in-worktree commits will use defaults" >&2
+  cp -aR "$HOME/.claude/." "$STAGE/.claude/"
+  for s in "${CLAUDE_SKIP[@]}"; do
+    rm -rf "$STAGE/.claude/$s"
+  done
+  rm -f "$STAGE"/.claude/settings.json.*
 fi
+
+# -- macOS-only: extract OAuth credentials from Keychain. --
+# On macOS the CLI stores its OAuth token in the Keychain (service
+# `Claude Code-credentials`), not in a file. The Linux CLI reads the
+# same JSON from ~/.claude/.credentials.json, so writing the Keychain
+# blob to that path inside the container's staged .claude/ makes the
+# Linux file-based code path work transparently on both platforms.
+#
+# MUST run AFTER the .claude/ copy above, otherwise the rsync would
+# overwrite the credentials file.
+#
+# `security find-generic-password -w` succeeds silently when the
+# caller is in the user's login session (which `./pila` always is);
+# outside that (SSH-without-tty, daemons) it would prompt or fail.
+# Best-effort: if extraction fails, fall back to the legacy
+# CLAUDE_CODE_OAUTH_TOKEN env-var bridge so workers still authenticate.
+if [ "$OS" = "Darwin" ]; then
+  if security find-generic-password -s "Claude Code-credentials" \
+       -w >"$STAGE/.claude/.credentials.json" 2>/dev/null && \
+     [ -s "$STAGE/.claude/.credentials.json" ]; then
+    chmod 600 "$STAGE/.claude/.credentials.json"
+  else
+    rm -f "$STAGE/.claude/.credentials.json"
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+      AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+    else
+      echo "pila: note — could not extract Claude credentials from Keychain." >&2
+      echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
+      echo "  Keychain access (the prompt that pops up the first time)." >&2
+    fi
+  fi
+fi
+
+# -- ~/.git* dotfiles + XDG ~/.config/git/. --
+# Copy every host-side ~/.git* sibling that exists (.gitconfig,
+# .gitconfig.local, .gitignore_global, .gitignore, .git-credentials)
+# plus the XDG config dir. Each lands in $STAGE at the path that maps
+# to its default in-container location.
+for f in "$HOME"/.git*; do
+  [ -e "$f" ] || continue
+  cp -aR "$f" "$STAGE/"
+done
+if [ -d "$HOME/.config/git" ]; then
+  mkdir -p "$STAGE/.config"
+  cp -aR "$HOME/.config/git" "$STAGE/.config/"
+fi
+
+# -- ~/.netrc, ~/.ssh/, ~/.gnupg/ (auth/signing material). --
+# Workers may need to push (SSH), authenticate over HTTPS (.netrc),
+# or sign commits (GPG). Colima runs the VM on the same machine the
+# host user already controls, so the trust boundary doesn't widen by
+# exposing these to a container that user already owns. Exposure is
+# per-container and the staging dir is reaped on exit. CRITICAL:
+# filter out sockets and ephemeral runtime files — the agent sockets
+# (S.gpg-agent, ssh-agent's UNIX sockets) are host-bound, can't be
+# `cp -a`'d cleanly, and aren't reachable from inside the container.
+if [ -f "$HOME/.netrc" ]; then
+  cp -a "$HOME/.netrc" "$STAGE/.netrc"
+fi
+if [ -d "$HOME/.ssh" ]; then
+  mkdir -p "$STAGE/.ssh"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a \
+      --exclude='agent' --exclude='S.*' --exclude='*.sock' \
+      "$HOME/.ssh/" "$STAGE/.ssh/"
+  else
+    cp -aR "$HOME/.ssh/." "$STAGE/.ssh/"
+    rm -rf "$STAGE/.ssh/agent"
+    find "$STAGE/.ssh" -name 'S.*' -delete 2>/dev/null
+    find "$STAGE/.ssh" -name '*.sock' -delete 2>/dev/null
+  fi
+  chmod 700 "$STAGE/.ssh"
+fi
+if [ -d "$HOME/.gnupg" ]; then
+  mkdir -p "$STAGE/.gnupg"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --exclude='S.*' --exclude='*.sock' \
+      "$HOME/.gnupg/" "$STAGE/.gnupg/"
+  else
+    cp -aR "$HOME/.gnupg/." "$STAGE/.gnupg/"
+    find "$STAGE/.gnupg" -name 'S.*' -delete 2>/dev/null
+    find "$STAGE/.gnupg" -name '*.sock' -delete 2>/dev/null
+  fi
+  chmod 700 "$STAGE/.gnupg"
+fi
+
+# -- Mount each staged file/dir at its default in-container path. --
+# Files mount as files; dirs mount as dirs. The container sees the
+# normal default paths — no env-var redirection needed.
+AUTH_MOUNTS+=(-v "$STAGE/.claude.json:/home/pila/.claude.json")
+AUTH_MOUNTS+=(-v "$STAGE/.claude:/home/pila/.claude")
+for relpath in .gitconfig .gitconfig.local .gitignore \
+               .gitignore_global .git-credentials .netrc; do
+  if [ -e "$STAGE/$relpath" ]; then
+    AUTH_MOUNTS+=(-v "$STAGE/$relpath:/home/pila/$relpath")
+  fi
+done
+if [ -d "$STAGE/.config/git" ]; then
+  AUTH_MOUNTS+=(-v "$STAGE/.config/git:/home/pila/.config/git")
+fi
+if [ -d "$STAGE/.ssh" ]; then
+  AUTH_MOUNTS+=(-v "$STAGE/.ssh:/home/pila/.ssh")
+fi
+if [ -d "$STAGE/.gnupg" ]; then
+  AUTH_MOUNTS+=(-v "$STAGE/.gnupg:/home/pila/.gnupg")
+fi
+
+# Best-effort host cleanup. Container is --rm; its writes inside the
+# mounts vanish with the container. This removes the host scratch.
+trap 'rm -rf "$STAGE"' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
 # Previous versions of pila bind-mounted ~/.config/gh, ~/.git-credentials,
@@ -474,39 +628,6 @@ fi
 # host launcher (post-container-exit), those mounts are no longer
 # necessary — git/gh/ssh run with the host's own auth state, where they
 # already work. The host preflight above verified gh auth + origin.
-
-# --- forward Claude Code OAuth token ------------------------------------
-# On macOS, Claude Code stores its OAuth token in Keychain (an IPC
-# service the container can't reach) rather than in the bind-mounted
-# ~/.claude/ files. Without forwarding, `claude -p` inside the container
-# fails preflight with "Not logged in" even though the host is logged in.
-#
-# The user extracts the token once and exports CLAUDE_CODE_OAUTH_TOKEN
-# in the shell they run pila from. We forward it with explicit =value
-# form. NOTE: Colima/nerdctl does NOT honor the pass-through `-e VAR`
-# form (no =value) the way Docker does — verified empirically:
-# `nerdctl run -e PILA_TEST_VAR alpine ...` forwards an EMPTY string,
-# not the launcher's PILA_TEST_VAR value. So we have to expand the
-# value ourselves. The token briefly appears in `ps -ef` while the
-# nerdctl process is starting — acceptable trade-off: on a single-user
-# macOS dev box only the same user can read their own process argv,
-# and the existing ~/.claude/ bind mount already exposes that trust
-# boundary. Multi-user host is out of scope.
-#
-# On Linux native, Claude Code stores credentials at
-# ~/.claude/credentials.json — the existing -v $HOME/.claude bind mount
-# carries that file through. The env var is typically unset there and
-# this block is a no-op; the container falls back to file-based creds.
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
-elif [ "$OS" = "Darwin" ]; then
-  echo "pila: note — CLAUDE_CODE_OAUTH_TOKEN is not set." >&2
-  echo "  macOS keeps the Claude Code OAuth token in Keychain, which the" >&2
-  echo "  container can't read. Export it in the shell you run pila from:" >&2
-  echo "    export CLAUDE_CODE_OAUTH_TOKEN=\"\$(security find-generic-password \\" >&2
-  echo "      -s 'Claude Code-credentials' -w | python3 -c \\" >&2
-  echo "      'import sys,json; print(json.load(sys.stdin)[\"claudeAiOauth\"][\"accessToken\"])')\"" >&2
-fi
 
 # --- per-repo dependency caches (DESIGN §6½, IMPLEMENTATION §0.5) -------
 # Five host-side cache dirs survive across runs so:
