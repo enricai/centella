@@ -6,7 +6,8 @@
 # What this does, in order:
 #   1. Verifies `git`, `claude`, and `curl` are on PATH.
 #   2. Runtime: installs the container runtime if missing AND starts it.
-#      - macOS:    `brew install colima` + `colima start --runtime containerd --mount-type virtiofs`
+#      - macOS:    `brew install colima` + `colima start --runtime containerd --mount-type virtiofs --cpu N --memory M`
+#                  (N/M auto-detected: half host CPU/RAM, clamped 2..8 / 4..16 GB — see _runtime_colima_size_flags)
 #      - Debian:   `apt-get install containerd` + pinned nerdctl binary + `systemctl enable --now containerd`
 #      - Fedora:   `dnf install containerd` + pinned nerdctl binary + `systemctl enable --now containerd`
 #      - Arch:     `pacman -S containerd nerdctl` + `systemctl enable --now containerd`

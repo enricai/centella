@@ -40,7 +40,10 @@ Or, to do the runtime install by hand:
 
 ```bash
 brew install colima
-colima start --runtime containerd --mount-type virtiofs
+# Pick `--cpu N --memory M` matching half your host CPU/RAM (bounds
+# 2..8 / 4..16 GB — same as the installer's auto-sizing above). On an
+# 8/16 host: --cpu 4 --memory 8. Colima's 2/2 default is not enough.
+colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8
 
 # Then run the installer with the opt-out flag (or env var):
 curl -fsSL https://raw.githubusercontent.com/enricai/pila/main/scripts/install.sh | bash -s -- --no-runtime-install
@@ -200,12 +203,16 @@ dotfiles managers, or any environment where package installs are
 tracked elsewhere.
 
 **"Colima VM is not running"** (macOS) — start it:
-`colima start --runtime containerd --mount-type virtiofs`.
+`colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8`
+(pick `--cpu` / `--memory` matching half your host CPU/RAM; see the
+auto-sizing section at the top of this doc for the bounds).
 
 **"nerdctl cannot reach the container runtime"** — on macOS, you
 probably started Colima with the default `docker` runtime. Restart
 with containerd: `colima stop && colima start --runtime containerd
---mount-type virtiofs`. On Linux, check `systemctl status containerd`.
+--mount-type virtiofs --cpu 4 --memory 8` (carry your half-of-host
+sizing through the restart; the bare command would re-default to
+2/2). On Linux, check `systemctl status containerd`.
 
 **"$HOME/.claude not found"** — you haven't run `claude` yet on this
 machine. Run `claude --version` at least once so the directory is

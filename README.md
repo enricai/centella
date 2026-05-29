@@ -119,7 +119,10 @@ steps manually then pass `--no-runtime-install` (or set
 
 ```bash
 brew install colima
-colima start --runtime containerd --mount-type virtiofs
+# Size the VM at ~half your host's CPU/RAM (Colima's 2-CPU / 2-GB
+# default OOMs under parallel pila workloads — see docs/INSTALL.md
+# for the auto-sizing the installer applies). On an 8/16 host:
+colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8
 curl -fsSL https://raw.githubusercontent.com/enricai/pila/main/scripts/install.sh | bash -s -- --no-runtime-install
 ```
 
