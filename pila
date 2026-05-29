@@ -68,7 +68,18 @@ OS="$(uname -s)"
 print_install_hint() {
   case "$OS" in
     Darwin)
-      cat >&2 <<'EOF'
+      if ! command -v brew >/dev/null 2>&1; then
+        cat >&2 <<'EOF'
+
+You need Homebrew first (pila uses brew to install Colima):
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+Or see https://brew.sh/ for alternatives.
+
+After installing Homebrew, re-run pila — it will auto-install Colima.
+EOF
+      else
+        cat >&2 <<'EOF'
 
 Install on macOS:
   brew install colima
@@ -82,6 +93,7 @@ shim that proxies to it.)
 
 See docs/INSTALL.md for details.
 EOF
+      fi
       ;;
     Linux)
       cat >&2 <<'EOF'
@@ -111,9 +123,61 @@ require() {
   }
 }
 
+# --- runtime auto-install opt-out --------------------------------------
+# Same flag/env shape as scripts/install.sh: --no-runtime-install on the
+# CLI or PILA_NO_RUNTIME_INSTALL=1 in the env disables auto-install. We
+# don't shift the flag off $@ — the orchestrator's argparse rejects
+# unknown flags, so we just consume it before the orchestrator sees it
+# (in the REWRITTEN_ARGS pass-through below).
+case "${PILA_NO_RUNTIME_INSTALL:-}" in
+  1|true|TRUE|yes|YES) NO_RUNTIME_INSTALL=true ;;
+  *)                   NO_RUNTIME_INSTALL=false ;;
+esac
+for arg in "$@"; do
+  if [ "$arg" = "--no-runtime-install" ]; then
+    NO_RUNTIME_INSTALL=true
+  fi
+done
+
+# DRY_RUN is referenced by scripts/runtime-install.sh; default to false
+# in the launcher (the launcher has no --dry-run flag — that's install.sh).
+DRY_RUN=false
+
+# Source the shared runtime-install helpers. PILA_REPO points at the
+# pila install directory (where scripts/ lives) — already resolved at
+# the top of this script via the symlink walk.
+if [ -f "$PILA_REPO/scripts/runtime-install.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PILA_REPO/scripts/runtime-install.sh"
+fi
+
 case "$OS" in
   Darwin)
-    require colima
+    # Auto-install Colima if missing, with a TTY guard. The brew install
+    # step may prompt for sudo; in plugin mode (no TTY) the prompt would
+    # hang. Mirror the pattern at line ~135 (nerdctl-shim install).
+    if ! command -v colima >/dev/null 2>&1; then
+      if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
+        echo "pila: Colima is missing (auto-install skipped via --no-runtime-install)." >&2
+        print_install_hint
+        exit 1
+      fi
+      if [ -t 0 ]; then
+        echo "[pila] Colima is missing — installing now (one-time; may prompt for sudo)..." >&2
+        if ! runtime_install_macos; then
+          print_install_hint
+          exit 1
+        fi
+      else
+        echo "pila: Colima is not installed and we have no terminal to" >&2
+        echo "  prompt for sudo / brew install. Run pila once from a" >&2
+        echo "  terminal so the one-time install can complete:" >&2
+        echo "    pila --version" >&2
+        echo "  Or install Colima manually:" >&2
+        echo "    brew install colima" >&2
+        exit 1
+      fi
+    fi
     # Don't auto-start Colima — if the user has an existing setup with
     # dockerd we'd clobber their preference. Give a clear hint instead.
     if ! colima status >/dev/null 2>&1; then
@@ -166,7 +230,28 @@ case "$OS" in
     check_under_home "$PILA_REPO" || true
     ;;
   Linux)
-    require nerdctl
+    # Auto-install nerdctl + containerd if missing, with a TTY guard.
+    # `sudo apt-get install` etc. would hang in plugin mode without TTY.
+    if ! command -v nerdctl >/dev/null 2>&1; then
+      if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
+        echo "pila: nerdctl is missing (auto-install skipped via --no-runtime-install)." >&2
+        print_install_hint
+        exit 1
+      fi
+      if [ -t 0 ]; then
+        echo "[pila] nerdctl is missing — installing containerd + nerdctl (one-time; may prompt for sudo)..." >&2
+        if ! runtime_install_linux; then
+          print_install_hint
+          exit 1
+        fi
+      else
+        echo "pila: nerdctl is not installed and we have no terminal to" >&2
+        echo "  prompt for sudo. Run pila once from a terminal so the" >&2
+        echo "  one-time install can complete:" >&2
+        echo "    pila --version" >&2
+        exit 1
+      fi
+    fi
     if ! nerdctl info >/dev/null 2>&1; then
       echo "pila: nerdctl cannot reach containerd." >&2
       echo "  Ensure containerd is running:  systemctl status containerd" >&2
@@ -180,6 +265,69 @@ case "$OS" in
     exit 1
     ;;
 esac
+
+# --- host preflight: git repo + gh + jq ---------------------------------
+# These checks moved out of the orchestrator (DESIGN §6 *Finalization*).
+# The launcher does the host-side push + PR after the container exits,
+# so the auth state needs to be valid on the host BEFORE we spin up the
+# container. Fast-fail with actionable messages.
+#
+# `--no-push` shortcuts the gh + origin checks (the launcher will skip
+# the host-side finalize entirely). The flag is also passed through to
+# the orchestrator so phase_finalize knows not to do its own bookkeeping.
+NO_PUSH=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-push) NO_PUSH=true ;;
+  esac
+done
+case "${PILA_NO_PUSH:-}" in
+  1|true|TRUE|yes|YES) NO_PUSH=true ;;
+esac
+
+# 1. cwd is a git repo (orchestrator's old check at pila.py:7652).
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "pila: error: not inside a git repository" >&2
+  exit 1
+fi
+
+# 2. gh CLI authenticated + origin remote present (orchestrator's old
+#    _check_gh_cli at pila.py:1323). Skipped under --no-push.
+if [ "$NO_PUSH" = "false" ]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "pila: error: \`gh\` CLI not found on PATH." >&2
+    echo "  Install GitHub CLI (https://cli.github.com) or pass \`--no-push\`" >&2
+    echo "  to skip the push and PR step at finalize." >&2
+    exit 1
+  fi
+  if ! gh_auth_stderr="$(gh auth status 2>&1 1>/dev/null)"; gh auth status >/dev/null 2>&1; then
+    echo "pila: error: \`gh\` is installed but not authenticated. Run" >&2
+    echo "  \`gh auth login\`, or pass \`--no-push\` to skip the push and" >&2
+    echo "  PR step at finalize." >&2
+    echo "gh auth status stderr:" >&2
+    printf '  %s\n' "$gh_auth_stderr" >&2
+    exit 1
+  fi
+  if ! git remote get-url origin >/dev/null 2>&1; then
+    echo "pila: error: this repository has no \`origin\` remote — finalize cannot" >&2
+    echo "  push without one. Add one with \`git remote add origin <url>\` or pass" >&2
+    echo "  \`--no-push\`." >&2
+    exit 1
+  fi
+fi
+
+# 3. jq is needed for the host-side finalize to read run.json /
+#    state.json. Hard-fail on macOS (brew install jq) and Linux (distro
+#    package manager); we use jq for the body composition + state writes.
+if [ "$NO_PUSH" = "false" ] && ! command -v jq >/dev/null 2>&1; then
+  echo "pila: error: \`jq\` not found on PATH." >&2
+  case "$OS" in
+    Darwin) echo "  Install with: brew install jq" >&2 ;;
+    Linux)  echo "  Install with your distro package manager (apt install jq / dnf install jq / pacman -S jq)." >&2 ;;
+  esac
+  echo "  Or pass --no-push to skip the host-side finalize." >&2
+  exit 1
+fi
 
 # --- build image if not present (one-time, ~60-120s) --------------------
 if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
@@ -295,6 +443,10 @@ for arg in "$@"; do
     --inspect-dir=*)
       collect_inspect_path "${arg#--inspect-dir=}"
       ;;
+    --no-runtime-install)
+      # Launcher-only flag; consumed by the runtime preflight above.
+      # The orchestrator's argparse doesn't know it.
+      ;;
     *)
       REWRITTEN_ARGS+=("$arg")
       ;;
@@ -324,42 +476,13 @@ else
   echo "pila: warning — $HOME/.gitconfig not found; in-worktree commits will use defaults" >&2
 fi
 
-# --- finalize-phase auth: gh, git credentials, ssh agent -----------------
-# The orchestrator's default behavior at finalize is `git push` + `gh pr
-# create` (pila.py:5797, :5828). These need credentials the host has and the
-# container otherwise wouldn't. Each mount is conditional on the host source
-# existing — `--no-push` runs without any of these.
-if [ -d "$HOME/.config/gh" ]; then
-  # rw so `gh auth refresh` (if it fires) writes back to the host token store
-  AUTH_MOUNTS+=(-v "$HOME/.config/gh:/home/pila/.config/gh")
-fi
-if [ -f "$HOME/.git-credentials" ]; then
-  # HTTPS push via git's credential helper
-  AUTH_MOUNTS+=(-v "$HOME/.git-credentials:/home/pila/.git-credentials")
-fi
-if [ -d "$HOME/.ssh" ]; then
-  # SSH push: keys + known_hosts. Read-only — the agent socket below carries
-  # actual key material when keys are passphrase-protected.
-  AUTH_MOUNTS+=(-v "$HOME/.ssh:/home/pila/.ssh:ro")
-fi
-if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-  # macOS: SSH_AUTH_SOCK is set by launchd to a /private/tmp/com.apple.launchd.*
-  # path, outside Colima's /Users/$USER auto-share. Even if the user manually
-  # added that path to colima.yaml's `mounts:`, AF_UNIX socket forwarding
-  # across the Lima VM boundary doesn't work reliably — the agent inside the
-  # container can't reach the host's launchd agent. Skip the mount and tell
-  # the user to use HTTPS push (gh + ~/.git-credentials / ~/.config/gh) or
-  # pass --no-push. On Linux native there's no VM, so the socket mount works.
-  if [ "$OS" = "Darwin" ]; then
-    echo "pila: note — SSH agent forwarding is not available on macOS Colima." >&2
-    echo "  If your origin uses SSH and your keys are passphrase-protected," >&2
-    echo "  switch the remote to HTTPS (gh auth setup-git) or pass --no-push." >&2
-  else
-    # Forward the SSH agent so passphrase-protected keys work inside the
-    # container. The container sees the agent at a stable path /ssh-agent.
-    AUTH_MOUNTS+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e "SSH_AUTH_SOCK=/ssh-agent")
-  fi
-fi
+# --- finalize-phase auth is host-side now -------------------------------
+# Previous versions of pila bind-mounted ~/.config/gh, ~/.git-credentials,
+# ~/.ssh, and $SSH_AUTH_SOCK into the container so finalize could push
+# and open a PR. After DESIGN §6 *Finalization* moved that step to the
+# host launcher (post-container-exit), those mounts are no longer
+# necessary — git/gh/ssh run with the host's own auth state, where they
+# already work. The host preflight above verified gh auth + origin.
 
 # --- forward Claude Code OAuth token ------------------------------------
 # On macOS, Claude Code stores its OAuth token in Keychain (an IPC
@@ -444,7 +567,11 @@ TTY_FLAGS="-i"
 
 # Use ${arr[@]+"${arr[@]}"} so empty arrays expand to nothing under
 # `set -u` (bash 3.2, the macOS system default, otherwise errors).
-exec nerdctl run \
+#
+# Note: NOT `exec` — we need control to return to the launcher after the
+# container exits so the host-side finalize block (below) can run.
+container_rc=0
+nerdctl run \
   --rm $TTY_FLAGS \
   --name "pila-$(date +%s)-$$" \
   -e PILA_INSPECT_DIRS= \
@@ -454,4 +581,181 @@ exec nerdctl run \
   ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
   ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
   -w /work \
-  "$IMAGE_TAG" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}
+  "$IMAGE_TAG" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} || container_rc=$?
+
+# --- host-side finalize (push + PR) -------------------------------------
+# DESIGN §6 *Finalization*: the container's phase_finalize writes
+# `finished_at` to .pila/runs/<run-id>/run.json and exits 0. The
+# launcher takes over from here, doing `git push` + `gh pr create` on
+# the HOST so the host's working auth state (gh token, ssh-agent,
+# Keychain) is what authenticates — no in-container forwarding required.
+#
+# Skip if:
+#   - container exited non-zero (run failed; nothing to push)
+#   - --no-push set (the user explicitly opted out)
+#   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
+#     plugin re-runs pila with --answers after the user responds.
+if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
+  exit "$container_rc"
+fi
+
+# Locate the most-recent run dir under .pila/runs/ that has a run.json
+# with finished_at set. The orchestrator writes run.json at finalize.
+# `find` + sort isn't portable with -printf; iterate and pick newest.
+LATEST_RUN_DIR=""
+LATEST_RUN_MTIME=0
+if [ -d "$USER_REPO/.pila/runs" ]; then
+  for run_json in "$USER_REPO"/.pila/runs/*/run.json; do
+    [ -f "$run_json" ] || continue
+    # finished_at must be present and non-null.
+    if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then
+      continue
+    fi
+    # pushed_at must be absent or null — otherwise this run was already
+    # pushed (e.g. on a previous launcher invocation).
+    if [ "$(jq -r '.pushed_at // ""' "$run_json")" != "" ]; then
+      continue
+    fi
+    # Use mtime of run.json as the recency proxy.
+    mtime="$(stat -f %m "$run_json" 2>/dev/null || stat -c %Y "$run_json" 2>/dev/null || echo 0)"
+    if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
+      LATEST_RUN_MTIME=$mtime
+      LATEST_RUN_DIR="$(dirname "$run_json")"
+    fi
+  done
+fi
+
+if [ -z "$LATEST_RUN_DIR" ]; then
+  # No run finished this invocation — nothing to push.
+  exit 0
+fi
+
+RUN_ID="$(basename "$LATEST_RUN_DIR")"
+RUN_BRANCH="$(jq -r '.branch // ""' "$LATEST_RUN_DIR/run.json")"
+WORKING_BRANCH="$(jq -r '.working_branch // ""' "$LATEST_RUN_DIR/run.json")"
+
+if [ -z "$RUN_BRANCH" ] || [ -z "$WORKING_BRANCH" ]; then
+  echo "pila: error — run.json at $LATEST_RUN_DIR/run.json is missing branch info." >&2
+  echo "  Skipping push + PR. Push the run branch manually if it exists." >&2
+  exit 1
+fi
+
+# Detect --no-verify from $@ (CLI-only; not an env var).
+NO_VERIFY_PUSH=false
+for arg in "$@"; do
+  if [ "$arg" = "--no-verify" ]; then
+    NO_VERIFY_PUSH=true
+  fi
+done
+
+# Helper: merge fields into run.json atomically via jq + temp + mv.
+# Each call takes one or more `key=value` pairs. Empty string for value
+# becomes JSON null (matches Python's `None`-as-null).
+update_run_json() {
+  local sidecar tmp
+  sidecar="$LATEST_RUN_DIR/run.json"
+  tmp="$sidecar.tmp"
+  local jq_filter='.'
+  for kv in "$@"; do
+    local key="${kv%%=*}"
+    local val="${kv#*=}"
+    if [ -z "$val" ]; then
+      jq_filter="${jq_filter} | .${key} = null"
+    else
+      # Use jq's --arg for safe string interpolation.
+      jq_filter="${jq_filter} | .${key} = \$${key}"
+    fi
+  done
+  local args=()
+  for kv in "$@"; do
+    local key="${kv%%=*}"
+    local val="${kv#*=}"
+    [ -z "$val" ] || args+=(--arg "$key" "$val")
+  done
+  jq "${args[@]+"${args[@]}"}" "$jq_filter" "$sidecar" > "$tmp"
+  mv "$tmp" "$sidecar"
+}
+
+# --- step 1: push -------------------------------------------------------
+PUSH_ARGS=(git -C "$USER_REPO" push -u origin "$RUN_BRANCH")
+[ "$NO_VERIFY_PUSH" = "true" ] && PUSH_ARGS+=(--no-verify)
+
+echo "[pila] finalize: pushing $RUN_BRANCH to origin$([ "$NO_VERIFY_PUSH" = "true" ] && echo " (--no-verify)")" >&2
+if ! push_stderr="$("${PUSH_ARGS[@]}" 2>&1 >/dev/null)"; then
+  update_run_json "pushed_at=" "push_error=${push_stderr:-git push failed}" \
+                  "pr_url=" "pr_error="
+  echo "pila: error: git push failed for branch \`$RUN_BRANCH\`." >&2
+  echo "  Local state is intact:" >&2
+  echo "    - run branch:     $RUN_BRANCH (holds all wave merges)" >&2
+  echo "    - working branch: $WORKING_BRANCH (unchanged from run start; the intended PR base)" >&2
+  echo "  Resolve and retry manually:" >&2
+  echo "    git push -u origin $RUN_BRANCH$([ "$NO_VERIFY_PUSH" = "true" ] && echo " --no-verify")" >&2
+  echo "  Push stderr was:" >&2
+  printf '    %s\n' "$push_stderr" >&2
+  exit 1
+fi
+PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+update_run_json "pushed_at=$PUSHED_AT" "push_error="
+echo "[pila] finalize: pushed $RUN_BRANCH" >&2
+
+# --- step 2: PR creation ------------------------------------------------
+# Compose the PR body deterministically from state.json — same shape as
+# the previous compose_pr_body in pila.py (DESIGN §6 *Finalization*).
+STATE_JSON="$LATEST_RUN_DIR/state.json"
+
+# Extract fields with safe defaults (n/a for missing/null).
+or_na() { [ -n "$1" ] && [ "$1" != "null" ] && printf '%s' "$1" || printf 'n/a'; }
+
+TASK="$(jq -r '.task // ""' "$STATE_JSON")"
+FIRST_CAT="$(or_na "$(jq -r '.categories[0] // ""' "$STATE_JSON")")"
+SOURCE_OF_TRUTH="$(or_na "$(jq -r '.answers.source_of_truth // ""' "$STATE_JSON")")"
+STARTED_AT="$(or_na "$(jq -r '.started_at // ""' "$STATE_JSON")")"
+FINISHED_AT="$(or_na "$(jq -r '.finished_at // ""' "$STATE_JSON")")"
+WAVE_COUNT="$(jq -r '.waves | length' "$STATE_JSON")"
+SUBTASK_COUNT="$(jq -r '[.waves[] | length] | add // 0' "$STATE_JSON")"
+WORKER_COUNT="$(or_na "$(jq -r '.worker_count // ""' "$STATE_JSON")")"
+WORKING_BRANCH_DISPLAY="$(or_na "$WORKING_BRANCH")"
+
+PR_BODY="$(cat <<EOF
+## Task
+
+$TASK
+
+## Classification
+
+- Category: $FIRST_CAT
+- Source of truth: $SOURCE_OF_TRUTH
+
+## Run summary
+
+- Run ID: $RUN_ID
+- Started: $STARTED_AT
+- Finished: $FINISHED_AT
+- Waves: $WAVE_COUNT, subtasks: $SUBTASK_COUNT
+- Workers: $WORKER_COUNT
+- Generated by pila on \`$WORKING_BRANCH_DISPLAY\`.
+
+See \`.pila/runs/$RUN_ID/state.json\` for full run state.
+EOF
+)"
+
+echo "[pila] finalize: opening PR against $WORKING_BRANCH" >&2
+if ! pr_output="$(echo "$PR_BODY" | gh pr create \
+                  --base "$WORKING_BRANCH" \
+                  --head "$RUN_BRANCH" \
+                  --title "pila: $RUN_ID" \
+                  --body-file - 2>&1)"; then
+  # PR-creation failure is NON-fatal — the push succeeded.
+  update_run_json "pr_url=" "pr_error=${pr_output:-gh pr create failed}"
+  echo "⚠  \`gh pr create\` failed; branch was pushed successfully." >&2
+  echo "  Pushed branch: $RUN_BRANCH (on origin)" >&2
+  echo "  Open the PR manually:" >&2
+  echo "    gh pr create --base $WORKING_BRANCH --head $RUN_BRANCH" >&2
+  echo "  Or via the GitHub web UI for the repo." >&2
+  echo "  gh stderr was:" >&2
+  printf '    %s\n' "$pr_output" >&2
+  exit 0
+fi
+PR_URL="$(printf '%s' "$pr_output" | tail -n 1)"
+update_run_json "pr_url=$PR_URL" "pr_error="
+echo "[pila] finalize: opened PR $PR_URL" >&2

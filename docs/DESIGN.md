@@ -380,13 +380,38 @@ branch in a state the user did not request. The working branch is the same
 ref at the end of a run as it was at the start; the PR is the proposal to
 change that.
 
-**Push and PR.** The run branch is pushed to `origin` and a pull request
-is opened via `gh pr create` against the working branch (the branch
+**Push and PR happen on the host, after the container exits.** The
+container's job is the LLM work plus the deterministic integration
+of every wave into `pila/runs/<run-id>`. Once integration is done,
+the container exits cleanly and the launcher takes over: it reads
+`run.json`'s `finished_at` sentinel, then runs `git push` and
+`gh pr create` on the host.
+
+This boundary is load-bearing. The container exists to bound worker
+subprocess subtrees (DESIGN §6 *Worker subtree termination*), not to
+be a git/gh client. Auth state — gh tokens, SSH agent sockets,
+Claude Code's OAuth token in macOS Keychain — lives in host
+processes that don't traverse the Lima VM boundary cleanly. Trying
+to bind-mount that state into the container was a leaky workaround
+for a structural mismatch: on macOS the SSH agent socket can't cross
+the Lima VM boundary, the gh token bind mount catches stale states,
+and Claude Code's OAuth token is in Keychain rather than any
+mountable file. Moving the network-y phases to the host eliminates
+all of that — the host has working auth for git, gh, and ssh
+because the user already uses them daily.
+
+The container hands off through `run.json`. The orchestrator writes
+`finished_at` and exits with status 0; the launcher polls for that
+field and proceeds with push + PR. If the container exits non-zero
+(an unrecoverable error mid-run), the launcher does not push —
+nothing changed on disk that the user didn't already see in the
+worker logs.
+
+The run branch is pushed to `origin` and a pull request is opened
+via `gh pr create` against the working branch (the branch
 HEAD-at-run-start). The PR title is the run id; the body is generated
 deterministically from the run state — task, category, source-of-truth,
-wave count, worker count, run timestamps. This is the single point at
-which pila reaches the network; everything before is local. Two flags
-control it:
+wave count, worker count, run timestamps. Two flags control it:
 
 - `--no-push` skips both the push and the PR; the run completes with the
   run branch local-only. The user can inspect, push, or open a PR manually

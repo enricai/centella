@@ -212,11 +212,14 @@ The launcher passes the following mounts to `nerdctl run`:
 | `~/.claude` | `/home/pila/.claude` | **rw** | Claude Code session state (history, sessions, projects, stats-cache, caches). `claude` actively writes here during runs — read-only would break workers. |
 | `~/.claude.json` | `/home/pila/.claude.json` | rw | Same — `claude` updates it during sessions. |
 | `~/.gitconfig` | `/home/pila/.gitconfig` | ro | User/email for in-worktree commits. Pila has no business modifying it. |
-| `~/.config/gh` | `/home/pila/.config/gh` | rw | GitHub CLI token. `gh pr create` at finalize (pila.py:5828) reads it. rw so `gh auth refresh` (if it fires) propagates back to the host. Mount omitted if the host dir is absent — `--no-push` then runs the rest of the run without it. |
-| `~/.git-credentials` | `/home/pila/.git-credentials` | rw | Git credential-helper store for HTTPS push (pila.py:5797). Mount omitted if absent. |
-| `~/.ssh` | `/home/pila/.ssh` | ro | SSH keys + `known_hosts` for SSH push. ro because keyfile content is read-only by definition; mutation via `$SSH_AUTH_SOCK`. Mount omitted if absent. |
-| `$SSH_AUTH_SOCK` | `/ssh-agent` + env var | rw | SSH agent socket. Forwarded so passphrase-protected keys work inside the container. **Linux native only** — the launcher detects `Darwin` and skips this mount, printing a one-line note pointing users at HTTPS push (via `gh` + `~/.git-credentials` / `~/.config/gh`) or `--no-push`. AF_UNIX socket forwarding across the Colima/Lima VM boundary is not supported. Mount omitted if the env var is unset or the socket file is missing. |
 | `$CLAUDE_CODE_OAUTH_TOKEN` (env var) | `CLAUDE_CODE_OAUTH_TOKEN` env var | — | Pass-through env forwarding (`-e CLAUDE_CODE_OAUTH_TOKEN` with no `=value`, so the token never appears in `ps -ef` on the host). Bridges the macOS-only gap where Claude Code keeps its OAuth token in Keychain (an IPC service the container can't reach) rather than in the bind-mounted `~/.claude/` files. On Linux native the token lives in `~/.claude/credentials.json` and rides the existing `~/.claude` bind mount, so this forwarding is typically unset and a no-op. If unset on macOS the launcher prints a one-line note with the Keychain-extraction command. |
+
+The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`,
+`$SSH_AUTH_SOCK`) that earlier versions of pila bind-mounted **no longer
+exist** — finalize moved to the host (DESIGN §6 *Finalization*), so
+`git push` and `gh pr create` run with the host's working auth state and
+don't need to be forwarded into the container. The macOS-only "SSH agent
+forwarding is not available" note is gone for the same reason.
 | `~/.cache/pila/mise-data` | `/home/pila/.local/share/mise` | rw | Mise's `MISE_DATA_DIR` (per-repo runtime installs, plugins, cache). Lives in the user dir so the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). |
 | `~/.cache/pila/pnpm-store` | `/home/pila/.cache/pila/pnpm-store` | rw | pnpm content-addressable store. Safe for concurrent installs across worktrees (pnpm/discussions#10702). |
 | `~/.cache/pila/pip` | `/home/pila/.cache/pila/pip` | rw | pip HTTP + wheels cache. Wheel-build race pypa/pip#9034 is bypassed by pila's warm-once-then-replay pattern: phase_provision pre-builds wheels serially, worktree replays hit cache (DESIGN §6½). |
@@ -916,7 +919,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
 | 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `pila/runs/<run-id>` and its worktree (per-run, isolated from any other run) |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then run a deterministic conflict-marker scan on the integrated worktree. `settle_subtask` runs the **post-work conformance phase** (DESIGN §9 *Post-work conformance*) on the success path before returning — `discover_rules_files` → `run_conformer` loop (≤ `conformance_rounds`) → re-run the per-subtask mechanical-precondition gates (`check_branch_has_commits`, dirty-worktree, `check_diff_scope`) against the conformer's commits → attach `conformance_warnings` to the result. The phase is advisory: residuals, build/lint/test failures, gate violations on conformer commits, and `WorkerError` all surface as warnings, never as `failed`/`blocked`. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume`. There is no LLM wave-level re-validation; the §8 confidence gate is the load-bearing per-subtask signal, and `scan_conflict_markers` is the deterministic post-integration safety net |
-| 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh` | verify the run branch is non-empty; push the run branch and open a PR (unless `--no-push`); record push / PR outcome in `run.json`; delete the per-subtask branches `pila/subtasks/<run-id>/*` (the run branch is **kept** as the PR head; state dir is kept as audit). The working branch is **not** modified locally — the PR is the proposed integration. |
+| 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh`; launcher then pushes on host | verify the run branch is non-empty; record `finished_at` in `run.json`; delete the per-subtask branches `pila/subtasks/<run-id>/*` (the run branch is **kept** as the PR head; state dir is kept as audit). **The push + PR step has moved to the host launcher** (DESIGN §6 *Finalization*) — `phase_finalize` writes the sentinel and exits; the launcher polls `run.json`, then runs `git push pila/runs/<run-id>` + `gh pr create` on the host using the host's own auth (no in-container forwarding of gh tokens, SSH keys, or agent sockets). The working branch is **not** modified locally — the PR is the proposed integration. |
 | Post-run Judge | `phase_judge`, `judge_capture` | standalone post-run phase (not part of main orchestrate flow): reads `calls.ndjson`, runs one `judge_capture()` per record in parallel under `asyncio.Semaphore(max_parallel)`, writes per-record verdicts to `<judge-dir>/<call_id>.json` and a summary `INDEX.json`; uses `prompts/judge.md` rubric |
 | Post-run Heal | `HealState`, `heal_baseline`, `heal_apply_patch`, `heal_replay_patched`, `request_patch`, `phase_heal` | heal-loop phases: `HealState` persists failing_samples / baseline / history / best_so_far at `<heal-dir>/<call_type>/state.json`; `heal_baseline(call_type, failing_records, n, heal_dir, caps, st, models)` runs n unpatched replays per record + judge, writes baseline verdicts + state; `heal_apply_patch(call_type, iter_n, patch_text, anchor_match, heal_dir, failing_records)` materialises patched prompts under `iter-<N>/patched-prompts/`; `heal_replay_patched(call_type, iter_n, n, heal_dir, caps, st, models)` runs n patched replays per record + judge, appends iteration record to state.history; `request_patch(state, iter_n, st, caps, models)` invokes the `patch_generator` worker (schema `SCHEMAS["patch_generator"]`, SID `heal-patch-<call_type>-iter<N>`, prompt from `prompts/patch_generator.md`) and returns `(anchor, replacement)` — raises `ValueError` if the returned anchor is not a literal substring of the resolved prompt body (code-enforced per the prompts-are-advisory principle); `phase_heal(call_type, failing_records, heal_dir, caps, st, models, request_patch_fn=None, n, config)` drives the full baseline→loop→report cycle; `request_patch_fn` defaults to the real `request_patch` when `None`, or accepts a sync/async 2-arg stub for testing |
 
@@ -1524,23 +1527,55 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 | `setup-run.sh <run-id>` | Creates `pila/runs/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `.pila/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `.pila/runs/<run-id>/worktrees/staging` if missing. Appends `.pila/` to the repo's `.git/info/exclude` (idempotent). Safe on `--resume`. |
 | `new-worktree.sh <id> <run-id>` | Creates `pila/subtasks/<run-id>/<id>` worktree at `.pila/runs/<run-id>/worktrees/<id>` branched off the current `pila/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`pila/runs/…`) and subtask-branch (`pila/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
 | `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.pila/runs/<run-id>/worktrees/staging`): `git merge --no-ff pila/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
-| `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/pila/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — pila does not merge into it locally; the PR (opened by `push_and_open_pr()`) is the proposed integration. The push and PR step lives in `push_and_open_pr()` in `pila.py` (see below) so it can compose the PR body with `compose_pr_body()`, write `run.json`, and emit Python-style multi-line failure messages. |
+| `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/pila/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — pila does not merge into it locally; the PR is the proposed integration. The push and PR step lives in the **host launcher** (`pila` bash script), not in the container — it runs after `nerdctl run` exits cleanly, using the host's own `git push` + `gh pr create` against the host's auth state. See "Host-side finalize" below. |
 | `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `.pila/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.pila/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`pila/runs/<id>` and `pila/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `pila/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
 
 A run branch `pila/runs/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
-### Push and PR (Python; called from `phase_finalize`)
+### Host-side finalize (bash + jq in the `pila` launcher)
 
-The push + PR step is implemented in Python rather than in `finalize.sh`. It runs after `finalize.sh`'s verifier check succeeds, unless `--no-push` is in effect.
+The push + PR step runs on the **host** in the launcher, after `nerdctl
+run` exits cleanly. The container's `phase_finalize` writes
+`finished_at` to `run.json` and exits 0; the launcher polls that
+sentinel and proceeds. See DESIGN.md §6 *Finalization* for the
+architecture (auth state lives in host processes the container can't
+reach; the boundary is structural).
 
-| Function (pila.py) | Behavior |
-|--------|----------|
-| `push_and_open_pr(st, no_verify)` | Pushes `pila/runs/<run-id>` to `origin` (with `--no-verify` appended if the CLI flag was set), then opens a PR via `gh pr create --base <working-branch> --head pila/runs/<run-id> --title pila: <run-id> --body-file -` piping `compose_pr_body(st.data, st.run_id)`. Push failure dies non-zero with a multi-line message naming the run branch (where the work lives) and the working branch (unchanged from run start; the intended PR base), the captured stderr, and the exact retry command; updates `.pila/runs/<run-id>/run.json` with `push_error`. PR-creation failure is **non-fatal**: logs a warning with the pushed-branch URL and the retry command; updates `run.json` with `pr_error` and returns 0 (the run is complete; only the PR is missing). |
-| `_check_gh_cli(no_push)` | Preflight gate. Short-circuits silently when `--no-push` is set. Else verifies `shutil.which("gh")`, `gh auth status` exits 0, and `git remote get-url origin` succeeds. Each failure dies with an actionable message + the `--no-push` escape hatch. |
+The launcher's finalize block in `pila` (bash) does, in order:
 
-`--no-push` skips the entire push + PR step (the run completes with the run branch local-only; the working branch is unchanged). CLI flag, `PILA_NO_PUSH` env, `no_push = true` in `pila.toml` — same precedence pattern as `--source-of-truth`. `--no-verify` is CLI-only and only affects the push step (worker `git commit`s inside worktrees still run all hooks).
+1. **Skip if `--no-push`.** Same opt-out as before.
+2. **Read run state** via `jq` from `.pila/runs/<run-id>/run.json` and
+   `state.json` (run branch, working branch, finished_at).
+3. **Push the run branch.** `git push -u origin pila/runs/<run-id>`
+   (with `--no-verify` if the flag was set). On failure: print the
+   same multi-line message as the old Python path (names run branch +
+   working branch, captured stderr, exact retry command), update
+   `run.json` with `push_error`, exit non-zero.
+4. **Compose PR body** via a bash heredoc that reads `state.json`
+   fields with `jq` — same deterministic body shape as the previous
+   Python `compose_pr_body` (task, category, source-of-truth, run
+   timestamps, wave + subtask + worker counts).
+5. **Open PR.** `gh pr create --base <working-branch> --head
+   pila/runs/<run-id> --title pila: <run-id> --body-file -` with the
+   composed body piped on stdin. On failure: log a warning with the
+   pushed-branch URL and the retry command; update `run.json` with
+   `pr_error`. **Non-fatal** — exit 0 (the run is complete; only the
+   PR is missing).
 
-Maps to `DESIGN.md`: §6 (Finalization — Push and PR).
+**Preflight (`pila` bash, before `nerdctl run`):** the launcher
+checks `git rev-parse --is-inside-work-tree`, `shutil.which gh`,
+`gh auth status`, and `git remote get-url origin` BEFORE spinning up
+the container. Each failure dies with the same actionable message
+the orchestrator's `_check_gh_cli` used to print, plus the `--no-push`
+escape hatch. The orchestrator no longer runs these checks; they
+moved to the host where the auth state actually lives.
+
+`--no-push` skips the entire push + PR step. CLI flag, `PILA_NO_PUSH`
+env, `no_push = true` in `pila.toml`. `--no-verify` is CLI-only and
+only affects the push step (worker `git commit`s inside worktrees
+still run all hooks).
+
+Maps to `DESIGN.md`: §6 (Finalization).
 
 ---
 

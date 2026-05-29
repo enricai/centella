@@ -61,7 +61,8 @@ case "${PILA_NO_RUNTIME_INSTALL:-}" in
   *)                   NO_RUNTIME_INSTALL=false ;;
 esac
 # Pinned nerdctl version used by the Linux Debian/Fedora paths. Matches
-# the version documented in docs/INSTALL.md.
+# the version documented in docs/INSTALL.md. Set BEFORE sourcing
+# runtime-install.sh so the helper inherits it.
 NERDCTL_VERSION=2.3.1
 
 # --- helpers -------------------------------------------------------------
@@ -141,38 +142,10 @@ remediate_curl() {
   esac
 }
 
-# Emit one of debian | fedora | arch | unknown by reading /etc/os-release.
-# Uses ID first, falls through to ID_LIKE so derivatives map to their parents:
-#   Pop!_OS / Linux Mint → debian
-#   AlmaLinux / Rocky    → fedora
-#   Manjaro / EndeavourOS → arch
-detect_distro() {
-  if [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    case " ${ID:-} ${ID_LIKE:-} " in
-      *' debian '*|*' ubuntu '*) echo debian ;;
-      *' fedora '*|*' rhel '*|*' centos '*) echo fedora ;;
-      *' arch '*) echo arch ;;
-      *) echo unknown ;;
-    esac
-  else
-    echo unknown
-  fi
-}
-
-# Map host architecture to nerdctl's release-asset suffix (amd64 | arm64).
-nerdctl_arch() {
-  if command -v dpkg >/dev/null 2>&1; then
-    dpkg --print-architecture
-  else
-    case "$(uname -m)" in
-      x86_64|amd64) echo amd64 ;;
-      aarch64|arm64) echo arm64 ;;
-      *) echo unknown ;;
-    esac
-  fi
-}
+# Runtime-install helpers (runtime_install_macos, runtime_install_linux,
+# _runtime_detect_distro, _runtime_nerdctl_arch) live in
+# scripts/runtime-install.sh — sourced below after argument parsing so
+# DRY_RUN / NERDCTL_VERSION are already set in the environment.
 
 # --- argument parsing ----------------------------------------------------
 
@@ -191,6 +164,14 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# --- source runtime-install helpers --------------------------------------
+# DRY_RUN and NERDCTL_VERSION are already set above; runtime-install.sh
+# inherits them. The helper defines underscore-prefixed log/err/run
+# functions so they don't shadow this installer's own helpers.
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+. "$INSTALL_DIR/runtime-install.sh"
 
 # --- 1. preflight: git + claude + curl -----------------------------------
 # curl is required to download the repo (and for the runtime preflight's
@@ -234,20 +215,11 @@ case "$(uname -s)" in
         err " Colima provides nerdctl inside its VM and installs a host-side shim;"
         err " pila auto-runs 'colima nerdctl install' on first launch if needed.)"
         runtime_ok=false
-      elif ! have_runnable brew; then
-        err "Homebrew is needed to auto-install Colima but isn't on PATH."
-        err "Install Homebrew from https://brew.sh, then re-run this installer,"
-        err "or pass --no-runtime-install and install Colima yourself."
-        runtime_ok=false
       else
-        log "installing Colima via Homebrew"
-        run brew install colima
+        runtime_install_macos || runtime_ok=false
       fi
-    fi
-    # If colima is now installed (either from auto-install above or
-    # already present), make sure the VM is running.
-    if [ "$runtime_ok" = "true" ] && [ "$DRY_RUN" = "false" ] \
-       && have_runnable colima && ! colima status >/dev/null 2>&1; then
+    elif [ "$DRY_RUN" = "false" ] && ! colima status >/dev/null 2>&1; then
+      # Already installed but VM not running — start it.
       log "starting Colima VM (first start may take 30-60s)"
       run colima start --runtime containerd --mount-type virtiofs
     fi
@@ -262,60 +234,9 @@ case "$(uname -s)" in
         err "See docs/INSTALL.md for rootless mode and other distros."
         runtime_ok=false
       else
-        distro="$(detect_distro)"
-        arch="$(nerdctl_arch)"
-        nerdctl_url="https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${arch}.tar.gz"
-        case "$distro" in
-          debian)
-            log "installing containerd via apt-get"
-            run sudo apt-get update
-            run sudo apt-get install -y containerd
-            if [ "$arch" = "unknown" ]; then
-              err "could not detect host arch for the nerdctl binary download."
-              err "Install nerdctl manually from https://github.com/containerd/nerdctl/releases"
-              runtime_ok=false
-            else
-              log "installing nerdctl ${NERDCTL_VERSION} (linux-${arch}) from upstream"
-              if [ "$DRY_RUN" = "false" ]; then
-                curl -L "$nerdctl_url" | sudo tar -C /usr/local/bin -xz nerdctl
-              else
-                printf '  $ curl -L %s | sudo tar -C /usr/local/bin -xz nerdctl\n' "$nerdctl_url"
-              fi
-            fi
-            ;;
-          fedora)
-            log "installing containerd via dnf"
-            run sudo dnf install -y containerd
-            if [ "$arch" = "unknown" ]; then
-              err "could not detect host arch for the nerdctl binary download."
-              err "Install nerdctl manually from https://github.com/containerd/nerdctl/releases"
-              runtime_ok=false
-            else
-              log "installing nerdctl ${NERDCTL_VERSION} (linux-${arch}) from upstream"
-              if [ "$DRY_RUN" = "false" ]; then
-                curl -L "$nerdctl_url" | sudo tar -C /usr/local/bin -xz nerdctl
-              else
-                printf '  $ curl -L %s | sudo tar -C /usr/local/bin -xz nerdctl\n' "$nerdctl_url"
-              fi
-            fi
-            ;;
-          arch)
-            log "installing containerd + nerdctl via pacman"
-            run sudo pacman -S --noconfirm containerd nerdctl
-            ;;
-          *)
-            err "unsupported Linux distro (detected: ${distro}). Auto-install"
-            err "only supports debian/ubuntu, fedora/rhel, and arch."
-            err "Install nerdctl + containerd manually (see docs/INSTALL.md) or"
-            err "pass --no-runtime-install to skip the auto-install step."
-            runtime_ok=false
-            ;;
-        esac
+        runtime_install_linux || runtime_ok=false
       fi
-    fi
-    # If nerdctl is now installed but containerd isn't running, start it.
-    if [ "$runtime_ok" = "true" ] && [ "$DRY_RUN" = "false" ] \
-       && have_runnable nerdctl && ! nerdctl info >/dev/null 2>&1; then
+    elif [ "$DRY_RUN" = "false" ] && ! nerdctl info >/dev/null 2>&1; then
       log "enabling + starting containerd via systemd"
       run sudo systemctl enable --now containerd
     fi

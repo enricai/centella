@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Finalize moved to the host launcher.** `git push` and `gh pr create`
+  now run on the host after the container exits cleanly, not inside the
+  container. Removes the entire bind-mount of `~/.config/gh`,
+  `~/.git-credentials`, `~/.ssh`, and `$SSH_AUTH_SOCK` — those auth
+  states live in host processes (Keychain, ssh-agent under launchd,
+  gh's local token store) that don't cross the Lima/Colima VM boundary
+  cleanly on macOS. The container's job is the LLM work + deterministic
+  integration into `pila/runs/<run-id>`; the host's job is everything
+  network-y, using its own working auth. Side effects: the macOS-only
+  "SSH agent forwarding is not available" note is gone (irrelevant
+  now); `gh auth status` runs as a host preflight before the container
+  starts (fast-fails in milliseconds, not after a 60-second cold
+  container launch); SSH push works on macOS via the host's
+  `ssh-agent`; the `_check_gh_cli` and `push_and_open_pr` Python
+  functions and the in-container cwd-is-git-repo check are removed.
+  `compose_pr_body` is kept as the canonical reference for the PR body
+  shape; the launcher reimplements its body composition in bash + jq.
+  New host dependency: `jq` (brew/apt/dnf/pacman). DESIGN §6
+  *Finalization* and IMPLEMENTATION §0.5 + §7 updated.
+
+- **Auto-install the container runtime on first run.** If Colima
+  (macOS) or nerdctl (Linux) is missing when the launcher runs, the
+  launcher now installs it instead of erroring out with a hint.
+  Behavior mirrors `scripts/install.sh` exactly: `brew install colima`
+  + `colima start --runtime containerd --mount-type virtiofs` on
+  macOS; distro-appropriate `apt-get`/`dnf`/`pacman` + pinned upstream
+  nerdctl binary on Linux. A new shared helper at
+  `scripts/runtime-install.sh` defines the install functions; both
+  `install.sh` and the `pila` launcher source it (DRY). Opt-out via
+  `--no-runtime-install` (CLI) or `PILA_NO_RUNTIME_INSTALL=1` (env) —
+  same flag/env as the installer. TTY-guarded: when stdin is not a
+  terminal (Claude Code plugin mode), the launcher prints a clear
+  "run from a terminal once" message instead of hanging on a sudo
+  prompt. `print_install_hint` gains a brew-detection branch on macOS
+  so users without Homebrew get the right two-step path
+  (install brew → re-run pila).
+
 ### Added
 
 - **Per-repo dependency provisioning — Phase 1½** (DESIGN §6½). The

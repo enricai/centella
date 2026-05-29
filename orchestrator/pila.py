@@ -1320,33 +1320,10 @@ def _check_claude_cli_version() -> None:
         )
 
 
-def _check_gh_cli(no_push: bool) -> None:
-    """Preflight gate for the push + PR finalize step (DESIGN §6
-    "Finalization"). Short-circuits silently when --no-push is set;
-    otherwise verifies that `gh` is installed, authenticated, and the
-    repo has an `origin` remote — all things `push_and_open_pr` will
-    need. Without this, a 40-worker run could complete successfully and
-    then fail at the very last step, leaving the user with a green run
-    branch but no PR."""
-    if no_push:
-        return
-    if not shutil.which("gh"):
-        die("`gh` CLI not found on PATH. Either install GitHub CLI "
-            "(https://cli.github.com) or pass `--no-push` to skip the "
-            "push and PR step at finalize.")
-    auth = subprocess.run(["gh", "auth", "status"],
-                          capture_output=True, text=True, check=False)
-    if auth.returncode != 0:
-        die("`gh` is installed but not authenticated. Run "
-            "`gh auth login`, or pass `--no-push` to skip the push and "
-            "PR step at finalize.\n"
-            f"gh auth status stderr:\n  {auth.stderr.strip()}")
-    remote = subprocess.run(["git", "remote", "get-url", "origin"],
-                            capture_output=True, text=True, check=False)
-    if remote.returncode != 0:
-        die("this repository has no `origin` remote — finalize cannot "
-            "push the run branch. Either `git remote add origin <url>` "
-            "or pass `--no-push` to skip the push and PR step.")
+# `_check_gh_cli` was removed when finalize moved to the host launcher
+# (DESIGN §6 *Finalization*). The launcher does `gh auth status` + the
+# origin check itself, before spinning up the container — auth state
+# lives on the host, so the check belongs there.
 
 
 # --- run identifier (DESIGN §6 "The run identifier") --------------------
@@ -2456,12 +2433,10 @@ async def preflight(pila_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     #    'unknown option' that tells the user nothing actionable.
     _check_claude_cli_version()
 
-    # 5. gh CLI installed + authenticated + origin remote present (DESIGN §6
-    #    "Push + PR"). Short-circuited when --no-push is set; otherwise
-    #    catches the case where a 40-worker run completes and then fails at
-    #    the very last step (no PR opened, user has merged work but no
-    #    review surface).
-    _check_gh_cli(no_push)
+    # 5. gh CLI preflight moved to the host launcher (DESIGN §6
+    #    *Finalization*). The launcher checks `gh auth status` + origin
+    #    remote presence before spinning up this container; if they
+    #    fail, the container never starts.
 
     # 6. live smoke-test: auth + --output-format stream-json + --json-schema inline.
     #    Catches auth failures before a 40-worker run starts. Streams so a slow
@@ -7226,90 +7201,32 @@ async def phase_execute(pila_dir: Path, st: State, caps: dict,
         st.save()
 
 
-async def push_and_open_pr(st: State, no_verify: bool) -> None:
-    """Push the run branch to `origin` and open a PR via `gh pr create`.
-
-    Called from `phase_finalize` when `--no-push` is NOT in effect. The
-    run branch is the integration artifact; the PR is the proposed
-    integration into the working branch. Pila does not merge into
-    the working branch locally. See DESIGN §6 "Finalization" for the
-    failure-handling contract:
-
-    - Push failure: capture stderr, write `push_error` to run.json,
-      log a multi-line message naming the run branch (where the work
-      lives) and the working branch (unchanged), exit non-zero (die).
-      User can retry the push manually.
-    - PR-creation failure: capture stderr, write `pr_error` to run.json,
-      log a multi-line *warning* with the pushed-branch URL and the
-      retry command, exit success (the run is complete; the PR is a
-      courtesy).
-
-    The body for `gh pr create` is generated deterministically by
-    `compose_pr_body(st.data, st.run_id)`."""
-    run_branch = compute_run_branch(st.run_id)
-    working_branch = (st.run_dir / "working-branch").read_text().strip()
-
-    # ----- step 1: push --------------------------------------------------
-    push_cmd = ["git", "push", "-u", "origin", run_branch]
-    if no_verify:
-        push_cmd.append("--no-verify")
-    log(f"finalize: pushing {run_branch} to origin"
-        f"{' (--no-verify)' if no_verify else ''}")
-    push = subprocess.run(push_cmd, capture_output=True, text=True, check=False)
-    if push.returncode != 0:
-        stderr = (push.stderr or "").strip()
-        _write_run_json(
-            st.run_dir,
-            pushed_at=None, push_error=stderr or "git push failed",
-            pr_url=None, pr_error=None,
-        )
-        die(
-            f"git push failed for branch `{run_branch}`.\n"
-            f"  Local state is intact:\n"
-            f"    - run branch:     {run_branch}     (holds all wave merges)\n"
-            f"    - working branch: {working_branch}      (unchanged from run start; the intended PR base)\n"
-            f"  Resolve and retry manually:\n"
-            f"    git push -u origin {run_branch}"
-            f"{' --no-verify' if no_verify else ''}\n"
-            f"  Push stderr was:\n"
-            + "\n".join(f"    {line}" for line in stderr.splitlines())
-        )
-    pushed_at = now()
-    _write_run_json(st.run_dir, pushed_at=pushed_at, push_error=None)
-    log(f"finalize: pushed {run_branch}")
-
-    # ----- step 2: PR creation ------------------------------------------
-    body = compose_pr_body(st.data, st.run_id)
-    title = f"pila: {st.run_id}"
-    pr_cmd = ["gh", "pr", "create",
-              "--base", working_branch,
-              "--head", run_branch,
-              "--title", title,
-              "--body-file", "-"]
-    log(f"finalize: opening PR against {working_branch}")
-    pr = subprocess.run(pr_cmd, input=body, capture_output=True,
-                        text=True, check=False)
-    if pr.returncode != 0:
-        # Non-fatal: the run is complete; only the PR is missing.
-        stderr = (pr.stderr or "").strip()
-        _write_run_json(st.run_dir, pr_url=None, pr_error=stderr or "gh pr create failed")
-        log(
-            f"⚠  `gh pr create` failed; branch was pushed successfully.\n"
-            f"  Pushed branch: {run_branch} (on origin)\n"
-            f"  Open the PR manually:\n"
-            f"    gh pr create --base {working_branch} --head {run_branch}\n"
-            f"  Or via the GitHub web UI for the repo.\n"
-            f"  gh stderr was:\n"
-            + "\n".join(f"    {line}" for line in stderr.splitlines())
-        )
-        return
-    pr_url = (pr.stdout or "").strip()
-    _write_run_json(st.run_dir, pr_url=pr_url or None, pr_error=None)
-    log(f"finalize: opened PR {pr_url}")
+# `push_and_open_pr` was removed when finalize moved to the host
+# launcher (DESIGN §6 *Finalization*). The launcher does `git push` +
+# `gh pr create` in bash + jq after this container exits — auth state
+# lives on the host where it works without forwarding.
+#
+# `compose_pr_body` is kept (above) as the canonical reference for the
+# PR body shape; the launcher's bash composition is structurally
+# equivalent. Keeping the Python version makes future audits cheap
+# (one file to read).
 
 
 async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
                          no_verify: bool) -> None:
+    """Phase 6: verify the run branch and record finalize state.
+
+    The push + PR step has moved to the host launcher (DESIGN §6
+    *Finalization*); this phase no longer makes network calls. It runs
+    `finalize.sh` to verify the run branch is non-empty, runs
+    `cleanup.sh` to drop subtask branches, writes `finished_at` to
+    state.json + run.json, and exits. The launcher polls run.json's
+    `finished_at` sentinel and does `git push` + `gh pr create` on the
+    host using the host's own auth state.
+
+    `no_verify` is passed through into the run.json sidecar so the
+    launcher knows whether to add `--no-verify` to its `git push`.
+    """
     log("phase 6: finalizing")
     proc = await run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
@@ -7321,27 +7238,26 @@ async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
     tel = st.data.get("telemetry", {})
     st.data["finished_at"] = now()
     st.save()
-    # Record finalize success in the run.json sidecar before push/PR.
-    # If push fails, the sidecar still shows the run completed locally;
-    # the user can read run.json's finished_at + push_error to know
-    # exactly where things stand.
-    _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
+    # Record finalize success in the run.json sidecar. The launcher
+    # uses `finished_at` as the "ready for push" sentinel; `no_push`
+    # and `no_verify` propagate intent the launcher needs.
+    _write_run_json(
+        st.run_dir,
+        finished_at=st.data["finished_at"],
+        no_push=no_push,
+        no_verify=no_verify,
+    )
 
     if no_push:
         log(f"skipped push and PR (--no-push); the run branch "
             f"{compute_run_branch(st.run_id)} is local-only; "
             "your working branch is unchanged")
     else:
-        await push_and_open_pr(st, no_verify=no_verify)
+        log(f"work is on {compute_run_branch(st.run_id)}; the host "
+            "launcher will push and open the PR after this container exits")
 
-    pr_url = None
-    sidecar = st.run_dir / "run.json"
-    if sidecar.exists():
-        try:
-            pr_url = json.loads(sidecar.read_text()).get("pr_url")
-        except (OSError, ValueError):
-            pr_url = None
-    pr_suffix = f" PR: {pr_url}." if pr_url else ""
+    pr_url = None  # the launcher writes pr_url to run.json after gh pr create
+    pr_suffix = ""
     log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
         f"{wc} worker invocations.{pr_suffix} Work is on "
         f"{compute_run_branch(st.run_id)}; working branch unchanged.")
@@ -7649,9 +7565,8 @@ def main() -> None:
         die("`claude` CLI not found on PATH. Install Claude Code (native, "
             "recommended): `curl -fsSL https://claude.ai/install.sh | bash`. "
             "Docs: https://docs.claude.com/en/docs/claude-code/setup")
-    if subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                      capture_output=True).returncode != 0:
-        die("not inside a git repository")
+    # The cwd-is-git-repo check moved to the host launcher (DESIGN §6).
+    # If the launcher started us, we're already in a git repo by then.
 
     caps = dict(DEFAULT_CAPS)
     # Resolve max_total_workers across CLI / env / TOML / default. The
