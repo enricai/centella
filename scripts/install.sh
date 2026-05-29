@@ -63,6 +63,7 @@ esac
 # Pinned nerdctl version used by the Linux Debian/Fedora paths. Matches
 # the version documented in docs/INSTALL.md. Set BEFORE sourcing
 # runtime-install.sh so the helper inherits it.
+# shellcheck disable=SC2034  # consumed by runtime-install.sh (sourced below)
 NERDCTL_VERSION=2.3.1
 
 # --- helpers -------------------------------------------------------------
