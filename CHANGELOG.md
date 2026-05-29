@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-29
+
+### Fixed
+
+- **`/home/pila` is now writable by the runtime user inside the
+  container.** Observed images had `/home/pila` owned by `root:root`
+  (despite `useradd -m -u $HOST_UID -g $HOST_GID pila` having run),
+  which meant the runtime `pila` user couldn't create any new dotfile
+  under its own `$HOME`. The visible failure was `gpg: Fatal: can't
+  create directory '/home/pila/.gnupg': Permission denied` during
+  `phase 1½` when mise tried to verify a Node download. The
+  Dockerfile now explicitly `chown pila:${HOST_GID} /home/pila`,
+  pre-creates `/home/pila/.gnupg` at mode 0700 (which GPG requires),
+  and chowns it to the pila user. Other dotfile-writing tools (npm,
+  ssh known_hosts, cargo, etc.) also benefit. Version bumped to
+  0.2.1 to force a rebuild of the cached image (the launcher's
+  image-presence check would otherwise skip the rebuild).
+
 ### Changed
 
 - **Finalize moved to the host launcher.** `git push` and `gh pr create`

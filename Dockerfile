@@ -121,13 +121,21 @@ RUN mkdir -p /inspect && chown pila:"${HOST_GID}" /inspect
 
 # Pre-create the pila user's MISE_DATA_DIR and the per-tool cache
 # mount targets so the launcher's bind-mounts attach cleanly and the
-# user dir owns the right metadata for mise's first run.
+# user dir owns the right metadata for mise's first run. Also chown
+# /home/pila itself — `useradd -m` produces /home/pila with mode 0755
+# but observed images have it as root:root, so the runtime user can't
+# create new dotfiles (e.g. `mise install` invokes gpg, which mkdirs
+# ~/.gnupg and fails with EACCES). The .gnupg subdir is pre-created
+# at mode 0700, which GPG requires.
 RUN mkdir -p /home/pila/.local/share/mise \
              /home/pila/.cache/pila/pnpm-store \
              /home/pila/.cache/pila/pip \
              /home/pila/.cache/pila/go-mod \
              /home/pila/.cache/pila/cargo \
-    && chown -R pila:"${HOST_GID}" /home/pila/.local /home/pila/.cache
+             /home/pila/.gnupg \
+    && chown pila:"${HOST_GID}" /home/pila \
+    && chown -R pila:"${HOST_GID}" /home/pila/.local /home/pila/.cache /home/pila/.gnupg \
+    && chmod 700 /home/pila/.gnupg
 
 USER pila
 WORKDIR /work
