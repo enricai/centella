@@ -135,7 +135,7 @@ CATEGORIES = [
 # enforced by tests/test_run_id.py::test_category_abbrev_coverage.
 CATEGORY_ABBREV = {
     "feature-implementation": "feat",
-    "bug-fixing": "fix",
+    "bug-fixing": "bugfix",
     "refactoring": "refactor",
     "performance-optimization": "perf",
     "testing": "test",
@@ -2592,10 +2592,7 @@ async def preflight(pila_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         log("preflight: ok")
 
 
-_ID_PREFIXES = frozenset({
-    "bugfix-", "feat-", "refactor-", "perf-",
-    "test-", "deps-", "config-", "docs-",
-})
+_ID_PREFIXES = frozenset(f"{v}-" for v in CATEGORY_ABBREV.values())
 
 
 def validate_plan(subtasks: dict) -> None:

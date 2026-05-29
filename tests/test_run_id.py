@@ -48,6 +48,18 @@ def test_category_abbrev_values_are_short_and_safe(pila):
         )
 
 
+def test_id_prefixes_derive_from_category_abbrev(pila):
+    """The validator's allowlist must equal `{abbrev + "-"}` for every
+    category. Drift between these two maps is what aborted the
+    bug-fixing run that motivated commit 6b824c4's follow-up: the
+    planner faithfully used the injected `ID_PREFIX` (`fix-`) but
+    validate_plan only accepted `bugfix-`. They are now derived from
+    one source; this test fails if a future contributor restates the
+    set by hand and forgets a category."""
+    expected = frozenset(f"{v}-" for v in pila.CATEGORY_ABBREV.values())
+    assert pila._ID_PREFIXES == expected
+
+
 # --- _sanitize_slug --------------------------------------------------------
 
 def test_sanitize_slug_typical(pila):
@@ -151,7 +163,7 @@ def test_compute_run_id_shape(pila):
     rid = pila.compute_run_id(
         ["bug-fixing"], "fix the login timeout", "2026-05-26T10:00:00+00:00"
     )
-    assert rid.startswith("fix-")
+    assert rid.startswith("bugfix-")
     parts = rid.rsplit("-", 1)
     # Last segment is 6 hex chars.
     assert len(parts[1]) == 6

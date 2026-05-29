@@ -404,7 +404,7 @@ pila path/to/task.md
 # Resume an interrupted run. Auto-picks if exactly one in-flight run exists;
 # requires --run-id otherwise (see `pila --list` to enumerate).
 pila --resume
-pila --resume --run-id fix-login-timeout-bug-b81e90
+pila --resume --run-id bugfix-login-timeout-bug-b81e90
 
 # List in-flight and completed runs in this repository:
 pila --list
@@ -494,8 +494,8 @@ export PILA_HEAL_SUCCESS_THRESHOLD=0.9
 # --phase heal: read the judge index for failing call_types and run the
 #   self-heal loop for each; if no judge index exists yet, runs judge first.
 # Use --run-id to select a run when multiple exist; auto-picks when only one.
-pila --phase judge --run-id fix-login-timeout-bug-b81e90
-pila --phase heal  --run-id fix-login-timeout-bug-b81e90
+pila --phase judge --run-id bugfix-login-timeout-bug-b81e90
+pila --phase heal  --run-id bugfix-login-timeout-bug-b81e90
 # Combine with heal-loop knobs:
 pila --phase heal --heal-max-rounds 5 --heal-success-threshold 0.8
 

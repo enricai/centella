@@ -240,7 +240,7 @@ two of them touch the same file.
 Every run has a unique identifier `run_id`, derived deterministically from
 three inputs known by the end of Phase 1:
 
-- the first classified category (a short abbreviation — `feat`, `fix`,
+- the first classified category (a short abbreviation — `feat`, `bugfix`,
   `refactor`, etc.),
 - a sanitized kebab-case slug of the task description (≤30 chars, word-
   boundary truncated),
