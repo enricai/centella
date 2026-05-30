@@ -400,12 +400,37 @@ mountable file. Moving the network-y phases to the host eliminates
 all of that — the host has working auth for git, gh, and ssh
 because the user already uses them daily.
 
-The container hands off through `run.json`. The orchestrator writes
-`finished_at` and exits with status 0; the launcher polls for that
-field and proceeds with push + PR. If the container exits non-zero
-(an unrecoverable error mid-run), the launcher does not push —
-nothing changed on disk that the user didn't already see in the
-worker logs.
+**Local runs** hand off through `run.json` on the bind-mounted host
+filesystem. The orchestrator writes `finished_at` and exits with status 0;
+the launcher reads that field from the bind-mounted path and proceeds with
+push + PR. If the container exits non-zero (an unrecoverable error
+mid-run), the launcher does not push — nothing changed on disk that the
+user didn't already see in the worker logs.
+
+**Remote runs** (Fly.io `--runtime fly`) face the same auth boundary from
+the other direction: the run branch and `.pila/runs/<run-id>/` state live
+on the Fly Machine's filesystem, not on the host. The launcher resolves
+this with a **stream-back** step before the host-side finalize runs:
+
+1. The orchestrator inside the Machine writes `finished_at` to `run.json`
+   and exits 0, exactly as in local mode.
+2. The launcher calls `scripts/remote/fetch-branch.sh`, which:
+   - discovers the completed run-id by scanning `.pila/runs/*/run.json` on
+     the Machine for a `finished_at`-bearing, unpushed entry;
+   - creates a `git bundle` of `pila/runs/<run-id>` on the Machine and
+     pipes it to the host, where `git fetch` materialises the branch in the
+     host's local repo;
+   - tars `.pila/runs/<run-id>/` on the Machine and extracts it under
+     `$USER_REPO/.pila/runs/` on the host.
+3. The existing host-side finalize block (push + `gh pr create`) then runs
+   unchanged with the host's own auth — it finds `run.json` (now on the
+   host) and the run branch (now in the host repo) just as it would after a
+   local run.
+
+The orchestrator inside the Machine is always invoked with `--no-push` so
+it never attempts a push itself; push is always the launcher's job. The
+stream-back step is the remote equivalent of the bind-mount: it makes the
+same state visible on the host so the same finalize code path runs.
 
 The run branch is pushed to `origin` and a pull request is opened
 via `gh pr create` against the working branch (the branch
