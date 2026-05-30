@@ -213,11 +213,15 @@ export PILA_VERBOSITY=normal  # sticky default
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_source_of_truth`, `resolve_runtime`,
 `gather_answers` validation gate, `_retryable_failure`,
-`check_merge_committed`, `validate_result`, `validate_plan`) including
-a coupling test that the
-retry-policy markers match the live check-function strings. No coverage
-target is set — the suite was introduced from scratch and a number now
-would be arbitrary.
+`check_merge_committed`, `validate_result`, `validate_plan`,
+`_validate_run_json`, `_derive_run_status`, `list_paused_runs`)
+including a coupling test that the
+retry-policy markers match the live check-function strings. The
+remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
+`stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
+`update_run_json` — is tested via bash-harness subprocess tests with
+stubbed `flyctl`. No coverage target is set — the suite was
+introduced from scratch and a number now would be arbitrary.
 
 The worker invocation path (`claude_p`) is not unit-tested; meaningful
 testing requires a stub or live `claude` binary and lives in a separate

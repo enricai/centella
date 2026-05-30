@@ -60,6 +60,52 @@ case "${1:-}" in
     echo "pila $PILA_VERSION"
     exit 0
     ;;
+  --attach)
+    # Fast-path: open a PTY into a running/paused Fly Machine.
+    # (DESIGN §6 *Interactive attach over PTY in remote mode*.)
+    # Routed before any runtime preflight — attach doesn't need a
+    # local container, only flyctl + WireGuard reachability.
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    exec "$PILA_REPO/scripts/remote/attach.sh" "$@"
+    ;;
+  --re-seed)
+    # Fast-path: re-rsync the host's working tree into a paused/running
+    # Fly Machine. (Phase 4: mid-run re-rsync correction.) Runs before
+    # runtime preflight since it doesn't need a local container.
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    _re_seed_run_id=""
+    _re_seed_force=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --force) _re_seed_force=1; shift ;;
+        --*) echo "pila: unknown --re-seed flag: $1" >&2; exit 1 ;;
+        *)
+          if [ -z "$_re_seed_run_id" ]; then _re_seed_run_id="$1"; shift
+          else echo "pila: unexpected --re-seed arg: $1" >&2; exit 1
+          fi
+          ;;
+      esac
+    done
+    if [ -z "$_re_seed_run_id" ]; then
+      echo "pila: --re-seed requires a <run-id>" >&2
+      echo "  Usage: pila --re-seed <run-id> [--force]" >&2
+      exit 1
+    fi
+    export PILA_RUN_ID="$_re_seed_run_id"
+    [ "$_re_seed_force" = "1" ] && export PILA_RE_SEED_FORCE=1
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/provision.sh"
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/seed-repo.sh"
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/re-seed.sh"
+    re_seed
+    exit $?
+    ;;
 esac
 
 # --- platform preflight --------------------------------------------------
@@ -138,6 +184,53 @@ for arg in "$@"; do
     NO_RUNTIME_INSTALL=true
   fi
 done
+
+# --- remote image auto-publish opt-out ---------------------------------
+# Same shape: --no-auto-publish on the CLI or PILA_NO_AUTO_PUBLISH=1 in the
+# env disables ensure_image() for the remote (Fly) path. The orchestrator
+# never sees this flag — it's consumed in REWRITTEN_ARGS below.
+case "${PILA_NO_AUTO_PUBLISH:-}" in
+  1|true|TRUE|yes|YES) NO_AUTO_PUBLISH=true ;;
+  *)                   NO_AUTO_PUBLISH=false ;;
+esac
+for arg in "$@"; do
+  if [ "$arg" = "--no-auto-publish" ]; then
+    NO_AUTO_PUBLISH=true
+  fi
+done
+
+# --- auto re-seed on --resume (Phase 4) --------------------------------
+# Default behaviour: when resuming a paused remote run, automatically
+# re-rsync the host's dirty set before re-exec'ing the orchestrator.
+# --no-re-seed opts out (rate-limit auto-resume case where nothing changed).
+# --force bypasses the safety check that refuses to clobber machine-side
+# uncommitted edits.
+NO_RE_SEED=false
+RE_SEED_FORCE=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-re-seed) NO_RE_SEED=true ;;
+    --force)      RE_SEED_FORCE=true ;;
+  esac
+done
+
+# --- extract --run-id (passed through to orchestrator) -----------------
+# The launcher needs the run-id early in the RUNTIME=fly branch so the
+# remote provision step can write fly_machine_id to the sidecar
+# (DESIGN §6 Remote pause-on-failure). We don't shift the arg off $@ —
+# it's still forwarded via REWRITTEN_ARGS to the orchestrator's argparse.
+PILA_RUN_ID=""
+_prev=""
+for arg in "$@"; do
+  if [ "$_prev" = "--run-id" ]; then
+    PILA_RUN_ID="$arg"
+  fi
+  case "$arg" in
+    --run-id=*) PILA_RUN_ID="${arg#--run-id=}" ;;
+  esac
+  _prev="$arg"
+done
+export PILA_RUN_ID
 
 # --- runtime-mode knob ---------------------------------------------------
 # Resolves RUNTIME=local|fly. Precedence: CLI --runtime > PILA_RUNTIME env
@@ -529,6 +622,16 @@ for arg in "$@"; do
       # Launcher-only flag; consumed by the runtime preflight above.
       # The orchestrator's argparse doesn't know it.
       ;;
+    --no-auto-publish)
+      # Launcher-only flag; consumed by ensure_image() in the remote path.
+      ;;
+    --no-re-seed)
+      # Launcher-only flag (Phase 4); consumed by the auto-re-seed-on-resume
+      # block. The orchestrator's argparse doesn't know it.
+      ;;
+    --force)
+      # Launcher-only flag (Phase 4); bypasses re_seed's safety check.
+      ;;
     --remote)
       # Launcher-only flag (legacy alias for --runtime fly); consumed by
       # the runtime-mode knob above. The orchestrator's argparse doesn't know it.
@@ -783,6 +886,39 @@ resolve_fly_image_tag() {
   echo "${PILA_FLY_IMAGE:-$tag}"
 }
 
+# --- remote: ensure published image -------------------------------------
+# Closes the operator-step gap where the first remote run fails because
+# the registry tag wasn't built/pushed yet. Strategy: cache positive hits
+# in ~/.cache/pila/published-tags.txt; on miss, invoke build-push.sh
+# --push (which is idempotent at the registry — pushing an already-
+# present manifest just no-ops the layers). The cache is a *positive*
+# list only, so a manual `flyctl image` deletion is self-healing.
+#
+# Skipped entirely when NO_AUTO_PUBLISH=true (the operator manages
+# publishes themselves and accepts the manifest-not-found failure mode).
+ensure_image() {
+  local tag="$1" cache_dir cache_file
+  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pila"
+  cache_file="$cache_dir/published-tags.txt"
+  if [ -f "$cache_file" ] && grep -Fxq "$tag" "$cache_file" 2>/dev/null; then
+    return 0
+  fi
+  local build_push="$PILA_REPO/scripts/remote/build-push.sh"
+  if [ ! -x "$build_push" ]; then
+    echo "pila: error: $build_push not found or not executable" >&2
+    return 1
+  fi
+  local fly_app="${PILA_FLY_APP:-pila}"
+  echo "[pila] remote: ensuring image $tag is published (cache miss)" >&2
+  if ! "$build_push" --app "$fly_app" --push; then
+    echo "pila: error: build-push.sh failed; remote run cannot proceed" >&2
+    return 1
+  fi
+  mkdir -p "$cache_dir"
+  printf '%s\n' "$tag" >> "$cache_file"
+  return 0
+}
+
 # --- run -----------------------------------------------------------------
 container_rc=0
 if [ "$RUNTIME" = "fly" ]; then
@@ -803,12 +939,25 @@ if [ "$RUNTIME" = "fly" ]; then
   FLY_IMAGE_TAG="$(resolve_fly_image_tag)"
   export FLY_IMAGE_TAG
 
+  # Ensure the image is published before flyctl machine run attempts to pull
+  # it. Skipped if --no-auto-publish / PILA_NO_AUTO_PUBLISH=1 — the operator
+  # is responsible for the build-push in that mode.
+  if [ "$NO_AUTO_PUBLISH" != "true" ]; then
+    if ! ensure_image "$FLY_IMAGE_TAG"; then
+      exit 1
+    fi
+  fi
+
   PROVISION_SCRIPT="$PILA_REPO/scripts/remote/provision.sh"
+  RESUME_SCRIPT="$PILA_REPO/scripts/remote/resume-machine.sh"
   SEED_AUTH_SCRIPT="$PILA_REPO/scripts/remote/seed-auth.sh"
   SEED_SCRIPT="$PILA_REPO/scripts/remote/seed-repo.sh"
   FETCH_SCRIPT="$PILA_REPO/scripts/remote/fetch-branch.sh"
   if [ ! -f "$PROVISION_SCRIPT" ]; then
     echo "pila: error: $PROVISION_SCRIPT not found" >&2
+    container_rc=1
+  elif [ ! -f "$RESUME_SCRIPT" ]; then
+    echo "pila: error: $RESUME_SCRIPT not found" >&2
     container_rc=1
   elif [ ! -f "$SEED_AUTH_SCRIPT" ]; then
     echo "pila: error: $SEED_AUTH_SCRIPT not found" >&2
@@ -823,26 +972,75 @@ if [ "$RUNTIME" = "fly" ]; then
     # shellcheck disable=SC1090
     . "$PROVISION_SCRIPT"
     # shellcheck disable=SC1090
+    . "$RESUME_SCRIPT"
+    # shellcheck disable=SC1090
     . "$SEED_AUTH_SCRIPT"
     # shellcheck disable=SC1090
     . "$SEED_SCRIPT"
     # shellcheck disable=SC1090
     . "$FETCH_SCRIPT"
 
-    if provision_machine; then
+    # Pause-on-failure resume path: if --run-id <id> is set and the run
+    # sidecar has paused_at set, resume the existing Fly Machine instead
+    # of provisioning a new one. (DESIGN §6 Remote pause-on-failure.)
+    _paused_mid=""
+    if [ -n "$PILA_RUN_ID" ]; then
+      _sidecar="$USER_REPO/.pila/runs/$PILA_RUN_ID/run.json"
+      if [ -f "$_sidecar" ]; then
+        _paused_mid="$(python3 -c "
+import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    if d.get('paused_at') and d.get('fly_machine_id'):
+        print(d['fly_machine_id'])
+except Exception:
+    pass
+" "$_sidecar" 2>/dev/null || true)"
+      fi
+    fi
+
+    _provisioned=false
+    _resumed=false
+    if [ -n "$_paused_mid" ]; then
+      if resume_machine "$_paused_mid"; then
+        _provisioned=true
+        _resumed=true
+      fi
+    elif provision_machine; then
+      _provisioned=true
+    fi
+
+    if [ "$_provisioned" = "true" ]; then
       # Machine is running and reachable. Seed Claude config + git identity
       # so `claude -p` workers can authenticate and commit, then seed the
       # working tree (git clone + rsync uncommitted delta).  Then run the
       # orchestrator inside the machine and stream the completed run branch
       # back to the host for the host-side finalize (push + gh pr create).
       export USER_REPO
+      _seed_ok=true
       if ! seed_auth; then
         echo "pila: error: seed_auth failed — aborting remote run" >&2
         container_rc=1
+        _seed_ok=false
+      elif [ "$_resumed" = "true" ]; then
+        # Resume path: machine already has /work, just refresh the dirty
+        # delta unless --no-re-seed was passed. (Phase 4 auto-re-seed.)
+        if [ "$NO_RE_SEED" != "true" ]; then
+          # shellcheck disable=SC1091
+          . "$PILA_REPO/scripts/remote/re-seed.sh"
+          [ "$RE_SEED_FORCE" = "true" ] && export PILA_RE_SEED_FORCE=1
+          if ! re_seed; then
+            echo "pila: error: re_seed failed — aborting remote run" >&2
+            container_rc=1
+            _seed_ok=false
+          fi
+        fi
       elif ! seed_repo; then
         echo "pila: error: repo seeding failed for machine $PILA_MACHINE_ID" >&2
         container_rc=1
-      else
+        _seed_ok=false
+      fi
+      if [ "$_seed_ok" = "true" ]; then
         # Run the orchestrator inside the machine.  Pass all REWRITTEN_ARGS
         # so the remote run receives the same flags as a local run (task,
         # --runtime fly already there, --no-push if set, etc.).
@@ -872,13 +1070,29 @@ if [ "$RUNTIME" = "fly" ]; then
             container_rc=1
           else
             container_rc=0
+            # Phase 3: promote the PID-keyed attach pointer to a run-keyed
+            # one so post-run `pila --attach <run-id>` works. fetch_branch
+            # sets PILA_REMOTE_RUN_ID; if it's set and the PID record is
+            # still present, move it into the run dir.
+            if [ -n "${PILA_REMOTE_RUN_ID:-}" ]; then
+              _pid_record="$USER_REPO/.pila/remote/$$.json"
+              _run_record="$USER_REPO/.pila/runs/$PILA_REMOTE_RUN_ID/fly-machine.json"
+              if [ -f "$_pid_record" ] && [ -d "$USER_REPO/.pila/runs/$PILA_REMOTE_RUN_ID" ]; then
+                mv "$_pid_record" "$_run_record" || true
+              fi
+            fi
           fi
         fi
       fi
     else
       container_rc=1
     fi
-    # destroy_machine() is called by the EXIT trap registered in provision.sh.
+    # The EXIT trap registered in provision.sh (decide_teardown) reads
+    # PILA_REMOTE_EXIT_RC to classify the orchestrator's exit code.
+    # Pause-worthy: any non-zero other than EXIT_NEEDS_ANSWERS=10,
+    # EX_TEMPFAIL=75 (rate-limit), SIGINT=130, SIGTERM=143.
+    # (DESIGN §6 Remote pause-on-failure.)
+    export PILA_REMOTE_EXIT_RC="$container_rc"
   fi
 else
   # --- local container execution path ----------------------------------

@@ -47,12 +47,13 @@ machine_exec() {
 }
 
 # ---------------------------------------------------------------------------
-# seed_repo
+# _seed_repo_preflight
 #
-# Step 1: git clone --filter=blob:none <origin_url> /work on the remote.
-# Step 2: compute dirty set locally, tar it, stream to the remote.
+# Common validation for both seed_repo_clone and seed_repo_dirty. Returns 0
+# when all required env vars and binaries are present; 1 with an actionable
+# stderr message otherwise.
 # ---------------------------------------------------------------------------
-seed_repo() {
+_seed_repo_preflight() {
   if [ -z "${PILA_MACHINE_ID:-}" ]; then
     echo "pila: seed_repo: PILA_MACHINE_ID is not set" >&2
     return 1
@@ -65,8 +66,18 @@ seed_repo() {
     echo "pila: seed_repo: flyctl not found on PATH" >&2
     return 1
   fi
+}
 
-  # --- Step 1: full-history partial clone on the remote -------------------
+# ---------------------------------------------------------------------------
+# seed_repo_clone
+#
+# Step 1 of two-channel seeding: full-history partial clone on the remote.
+# Always wipes /work and reclones — call this only on a fresh provision,
+# never on resume (the existing /work has run state worth preserving).
+# ---------------------------------------------------------------------------
+seed_repo_clone() {
+  _seed_repo_preflight || return 1
+
   local origin_url
   origin_url="$(git -C "$USER_REPO" remote get-url "$GIT_REMOTE" 2>/dev/null || true)"
   if [ -z "$origin_url" ]; then
@@ -76,35 +87,40 @@ seed_repo() {
   fi
 
   echo "[pila] remote: seeding — cloning $origin_url (full history, --filter=blob:none)..." >&2
-  # Ensure /work is empty before cloning; the image may have left an empty dir.
   machine_exec sh -c "rm -rf /work && mkdir -p /work" >&2
-  # --filter=blob:none: partial clone — full history, lazy blob backfill on demand.
-  # This satisfies the worktree constraint (full history required) while keeping
-  # the initial clone fast over the reliable cloud connection.
   machine_exec git clone --filter=blob:none "$origin_url" /work >&2
 
-  # Checkout the same branch/commit the developer is on.
   local current_ref
   current_ref="$(git -C "$USER_REPO" symbolic-ref --short HEAD 2>/dev/null \
                   || git -C "$USER_REPO" rev-parse HEAD)"
   echo "[pila] remote: checking out $current_ref..." >&2
   machine_exec git -C /work checkout "$current_ref" >&2 || true
+}
 
-  # --- Step 2: rsync the uncommitted delta --------------------------------
+# ---------------------------------------------------------------------------
+# seed_repo_dirty
+#
+# Step 2 of two-channel seeding: tar the host's `git status --porcelain`
+# dirty set and stream it into /work on the remote. Reusable on its own
+# — Phase 4 re-seed.sh calls it (without seed_repo_clone) when the user
+# resumes a paused run after editing files locally.
+#
+# Defensive excludes (.pila/runs/*/worktrees/* and .git/*) protect against
+# a future change that lets the dirty set name worktree paths — currently
+# the host can't produce those paths because worktrees live only on the
+# machine, but the safety belt prevents silent clobbering.
+# ---------------------------------------------------------------------------
+seed_repo_dirty() {
+  _seed_repo_preflight || return 1
+
   # Compute the dirty set: modified tracked files + untracked files,
   # excluding git-ignored entries.
-  # `git status --porcelain` output:
-  #   XY PATH   (XY = index/worktree status codes; PATH is relative to repo root)
-  # We want any file where the worktree column (Y, position 2) is non-blank,
-  # plus untracked files (?? prefix).  Ignored files are excluded by default.
   local dirty_files
   dirty_files="$(git -C "$USER_REPO" status --porcelain 2>/dev/null \
                   | awk '
                       # Untracked files (including untracked dirs — trailing /)
                       /^\?\? / {
                         f = substr($0, 4)
-                        # Strip trailing / from directory entries — tar handles
-                        # them recursively when listed as a path.
                         gsub(/\/$/, "", f)
                         print f
                         next
@@ -112,7 +128,6 @@ seed_repo() {
                       # Modified/deleted/renamed/copied in worktree (column 2)
                       length($0) >= 2 && substr($0,2,1) != " " {
                         f = substr($0, 4)
-                        # Rename format: "old -> new"; take the destination.
                         if (index(f, " -> ")) {
                           f = substr(f, index(f, " -> ") + 4)
                         }
@@ -130,33 +145,36 @@ seed_repo() {
   file_count="$(printf '%s\n' "$dirty_files" | wc -l | tr -d ' ')"
   echo "[pila] remote: seeding — syncing $file_count dirty file(s)/dir(s)..." >&2
 
-  # Pack the dirty set into a tar archive and pipe it to the remote.
-  # `tar -C "$USER_REPO"` makes all paths relative to the repo root so they
-  # land at /work/<relative-path> on the remote (tar -C /work -xzf -).
-  # Filenames are newline-separated from git status; printf them as NUL-
-  # separated for tar --null -T - so spaces/special chars are handled.
-  # We disable pipefail for the pipe chain: the stub (and sometimes the real
-  # flyctl machine exec) may close stdin early, causing SIGPIPE on the tar
-  # producer side; the remote tar still receives and extracts the full stream
-  # before writing EOF, so a broken-pipe on the producer is benign here.
+  # Defensive --exclude flags: structural protection in case a future
+  # change lets host-side dirty paths cross the boundary.
   local tar_rc=0
   {
     printf '%s\n' "$dirty_files" \
       | while IFS= read -r f; do printf '%s\0' "$f"; done \
       | tar -C "$USER_REPO" \
+            --exclude='.pila/runs/*/worktrees/*' \
+            --exclude='.git/*' \
             --null -T - \
             -czf - 2>/dev/null
   } | machine_exec tar -C /work -xzf - >/dev/null 2>&1 || tar_rc=$?
 
-  # SIGPIPE on the producer side exits as 141 (128+13) or 1 depending on the
-  # shell; only fail if the remote tar itself reported an error (non-zero from
-  # flyctl machine exec). We treat 141/1 producer exit as benign when the
-  # overall exit is from the consumer side.
   if [ "$tar_rc" -ne 0 ] && [ "$tar_rc" -ne 141 ]; then
     echo "pila: seed_repo: tar delta transfer failed (exit $tar_rc)" >&2
     return 1
   fi
 
   echo "[pila] remote: seeding complete" >&2
+}
+
+# ---------------------------------------------------------------------------
+# seed_repo
+#
+# Thin wrapper preserving the public contract: clone then dirty-rsync.
+# Used on fresh provisions. Resume + mid-run re-rsync (Phase 4) call
+# seed_repo_dirty directly.
+# ---------------------------------------------------------------------------
+seed_repo() {
+  seed_repo_clone || return 1
+  seed_repo_dirty || return 1
   return 0
 }
