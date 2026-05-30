@@ -228,6 +228,13 @@ SOURCE_OF_TRUTH_VALUES = ("codebase", "research", "both")
 SOURCE_OF_TRUTH_ENV = "PILA_SOURCE_OF_TRUTH"
 SOURCE_OF_TRUTH_FILE = "pila.toml"
 
+# Runtime mode — see IMPLEMENTATION.md §2 "Runtime mode". Resolution order:
+# --runtime CLI flag → PILA_RUNTIME env var → per-repo pila.toml → 'local'.
+# CLI/env are session knobs and outrank the committed file default.
+RUNTIME_VALUES = ("local", "fly")
+RUNTIME_ENV = "PILA_RUNTIME"
+RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
+
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
 # PILA_CONFIDENCE_ROUNDS env var → pila.toml → DEFAULT_CAPS
@@ -1877,6 +1884,31 @@ def resolve_source_of_truth(repo_root: Path,
                 f"{SOURCE_OF_TRUTH_VALUES}")
         return file_val
     return "both"
+
+
+def resolve_runtime(repo_root: Path,
+                    cli_value: str | None = None) -> str:
+    """Resolve the runtime mode. Order:
+    --runtime CLI flag → PILA_RUNTIME env var → pila.toml → default 'local'.
+    argparse validates `cli_value` via choices=, so it is trusted when set.
+    env and file values are rejected via die() if not in RUNTIME_VALUES — a
+    bad config is caught at startup, not during a worker run."""
+    if cli_value:
+        return cli_value
+    env = os.environ.get(RUNTIME_ENV, "").strip()
+    if env:
+        if env not in RUNTIME_VALUES:
+            die(f"{RUNTIME_ENV}={env!r} is not one of "
+                f"{RUNTIME_VALUES}")
+        return env
+    cfg = repo_root / RUNTIME_FILE
+    file_val = _read_toml_key(cfg, "runtime")
+    if file_val is not None:
+        if file_val not in RUNTIME_VALUES:
+            die(f"{cfg}: runtime={file_val!r} is not one of "
+                f"{RUNTIME_VALUES}")
+        return file_val
+    return "local"
 
 
 def resolve_confidence_rounds(repo_root: Path,
@@ -7858,6 +7890,11 @@ def main() -> None:
                     help=f"source-of-truth preference "
                          f"({'|'.join(SOURCE_OF_TRUTH_VALUES)}, default both); "
                          f"overrides {SOURCE_OF_TRUTH_ENV} and pila.toml")
+    ap.add_argument("--runtime", choices=RUNTIME_VALUES,
+                    metavar="MODE",
+                    help=f"execution runtime "
+                         f"({'|'.join(RUNTIME_VALUES)}, default local); "
+                         f"overrides {RUNTIME_ENV} and pila.toml")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
@@ -8021,6 +8058,7 @@ def main() -> None:
     # --source-of-truth / --model[-*] before we got here.
     repo_root = Path(os.getcwd())
     sot_pref = resolve_source_of_truth(repo_root, args.source_of_truth)
+    args.runtime = resolve_runtime(repo_root, args.runtime)
     models = resolve_models(repo_root, args)
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
 
