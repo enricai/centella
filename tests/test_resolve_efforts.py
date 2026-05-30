@@ -251,7 +251,8 @@ def test_judgment_workers_pinned_set(pila):
     Acting workers (implementer, conformer) must stay absent — their
     reasoning depth is bounded by the DESIGN §8 evidence gate."""
     assert set(pila.EFFORT_DEFAULT_PER_WORKER) == {
-        "classifier", "planner", "reconciler", "provision", "integrator"
+        "classifier", "planner", "reconciler", "provision", "integrator",
+        "pr_writer",
     }
     assert "implementer" not in pila.EFFORT_DEFAULT_PER_WORKER
     assert "conformer" not in pila.EFFORT_DEFAULT_PER_WORKER

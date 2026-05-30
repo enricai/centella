@@ -334,6 +334,16 @@ CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 DANGEROUS_SKIP_PERMS_ENV = "PILA_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 
+# --pr-template selector. When the target repo has multiple PR templates
+# in a PULL_REQUEST_TEMPLATE/ directory, pick this one by name (the
+# basename, with or without .md). When unset, the alphabetically first
+# .md in the directory wins. Has no effect when the repo uses a single
+# top-level template (pull_request_template.md / .github/...) or when
+# no template exists at all. Resolution order: --pr-template CLI flag →
+# PILA_PR_TEMPLATE env → pr_template in pila.toml → None.
+PR_TEMPLATE_ENV = "PILA_PR_TEMPLATE"
+PR_TEMPLATE_FILE = SOURCE_OF_TRUTH_FILE
+
 # Verbosity — see IMPLEMENTATION.md §2 "Verbosity". Four levels with
 # stackable -v/-q shortcuts following the clig.dev / cargo / kubectl
 # convention. Default is `stream` because the user invoking pila
@@ -368,6 +378,7 @@ MODEL_DEFAULT_PER_WORKER = {
     "conformer": "sonnet",
     "judge": "sonnet",
     "heal": "sonnet",
+    "pr_writer": "sonnet",
 }
 MODEL_ENV = "PILA_MODEL"
 MODEL_FILE = "pila.toml"
@@ -386,6 +397,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "reconciler": "high",
     "provision": "high",
     "integrator": "high",
+    "pr_writer": "high",
 }
 EFFORT_ENV = "PILA_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "provision",
@@ -395,6 +407,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "provision",
 # --judge-model / --heal-model (and their env / TOML mirrors).
 MODEL_JUDGE_ENV = "PILA_MODEL_JUDGE"
 MODEL_HEAL_ENV = "PILA_MODEL_HEAL"
+MODEL_PR_WRITER_ENV = "PILA_MODEL_PR_WRITER"
 
 # Telemetry enabled/disabled — see IMPLEMENTATION.md §2 "Telemetry".
 # Resolution order: --telemetry/--no-telemetry CLI → PILA_TELEMETRY env →
@@ -897,6 +910,21 @@ SCHEMAS: dict[str, dict] = {
             "replacement": {"type": "string"},
             "strategy": {"type": "string"},
             "pivot_reason": {"type": ["string", "null"]},
+        },
+    },
+    "pr_writer": {
+        # DESIGN §6 *Finalization*: LLM-written PR title + body that
+        # respects the target repo's PR template when one exists. The
+        # launcher prepends "pila: " to the title (the worker must NOT)
+        # so pila-opened PRs stay easy to spot in lists. `used_template`
+        # is the repo-relative path of the template that was filled out,
+        # or null when no template was found.
+        "type": "object",
+        "required": ["title", "body", "used_template"],
+        "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+            "body": {"type": "string", "minLength": 1},
+            "used_template": {"type": ["string", "null"]},
         },
     },
     "provision": {
@@ -1646,10 +1674,17 @@ def _validate_run_json(data: dict) -> None:
 # --- PR body composition (DESIGN §6 "Finalization") ---------------------
 
 def compose_pr_body(state: dict, run_id: str) -> str:
-    """Generate the PR body from run state + run_id. Deterministic given
-    the inputs; no I/O. Used by `push_and_open_pr()`, piped to
-    `gh pr create --body-file -` to avoid passing 4kb of body as a
-    shell argument.
+    """Generate the deterministic fallback PR body from run state +
+    run_id. No I/O.
+
+    DESIGN §6 *Finalization*: this is the **fail-open fallback**. The
+    primary PR body is now written by the `pr_writer` LLM worker (see
+    `_compose_pr_via_llm`) and lives in `run.json` under `pr_body`; the
+    host launcher uses that when present and only falls back to this
+    deterministic shape when the worker errored or returned nothing.
+    The bash launcher carries a structurally equivalent fallback inline
+    so the launcher does not need to call back into Python; this
+    function remains the canonical reference for the fallback's shape.
 
     Missing optional fields render as 'n/a' rather than the literal
     string 'None' — Python's f-string default would produce 'None' for
@@ -2097,6 +2132,27 @@ def resolve_runtime(repo_root: Path,
     return "local"
 
 
+def resolve_pr_template(repo_root: Path,
+                        cli_value: str | None = None) -> str | None:
+    """Resolve the --pr-template selector. Order:
+    --pr-template CLI flag → PILA_PR_TEMPLATE env → pila.toml → None.
+    Returns the basename of the desired template inside a
+    PULL_REQUEST_TEMPLATE/ directory (case preserved, .md optional).
+    No validation against MODEL_VALUES-style enum since the choice is
+    free-form (depends on the target repo's directory contents); the
+    template-discovery helper validates existence later."""
+    if cli_value:
+        return cli_value
+    env = os.environ.get(PR_TEMPLATE_ENV, "").strip()
+    if env:
+        return env
+    cfg = repo_root / PR_TEMPLATE_FILE
+    file_val = _read_toml_key(cfg, "pr_template")
+    if file_val is not None:
+        return file_val
+    return None
+
+
 def resolve_confidence_rounds(repo_root: Path,
                               cli_value: int | None = None) -> int:
     """Resolve the confidence-rounds cap. Order:
@@ -2503,6 +2559,14 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
     models["heal"] = (heal_cli or heal_env or global_cli or global_env
                       or heal_file or global_file
                       or MODEL_DEFAULT_PER_WORKER.get("heal", MODEL_DEFAULT))
+    pr_writer_cli = getattr(args, "pr_writer_model", None)
+    pr_writer_env = from_env(MODEL_PR_WRITER_ENV)
+    pr_writer_file = from_file("model_pr_writer")
+    models["pr_writer"] = (pr_writer_cli or pr_writer_env
+                           or global_cli or global_env
+                           or pr_writer_file or global_file
+                           or MODEL_DEFAULT_PER_WORKER.get(
+                               "pr_writer", MODEL_DEFAULT))
     return models
 
 
@@ -2561,6 +2625,9 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
                         or EFFORT_DEFAULT_PER_WORKER.get("judge", EFFORT_DEFAULT))
     efforts["heal"] = (global_cli or global_env or global_file
                        or EFFORT_DEFAULT_PER_WORKER.get("heal", EFFORT_DEFAULT))
+    efforts["pr_writer"] = (global_cli or global_env or global_file
+                            or EFFORT_DEFAULT_PER_WORKER.get(
+                                "pr_writer", EFFORT_DEFAULT))
     return efforts
 
 
@@ -5021,7 +5088,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # allowed set is WORKER_TYPES plus the two post-run skill schemas
     # (`judge`, `patch_generator`) that are not main-loop workers but
     # do invoke claude_p with their own schema.
-    _allowed_schema_keys = set(WORKER_TYPES) | {"judge", "patch_generator"}
+    _allowed_schema_keys = set(WORKER_TYPES) | {
+        "judge", "patch_generator", "pr_writer"}
     if schema_key not in _allowed_schema_keys:
         raise ValueError(
             f"claude_p called with unknown schema_key {schema_key!r}; "
@@ -8405,8 +8473,329 @@ async def phase_execute(pila_dir: Path, st: State, caps: dict,
 # (one file to read).
 
 
+# --- PR template discovery + LLM body composition -----------------------
+# DESIGN §6 *Finalization* hands the PR title/body to a `claude -p`
+# worker (pr_writer) so the body respects the target repo's PR template
+# when one is present. The deterministic bash composition in the host
+# launcher (and `compose_pr_body` above) remains the fail-open fallback.
+
+# GitHub's canonical search order for a single top-level PR template,
+# in the priority the GitHub web UI uses.
+_PR_TEMPLATE_SINGLE_LOCATIONS = (
+    ".github/pull_request_template.md",
+    "pull_request_template.md",
+    "docs/pull_request_template.md",
+)
+# Directories where GitHub looks for *multiple* templates. Any .md
+# inside any of these counts; pila defaults to the alphabetically
+# first basename, with --pr-template overriding the choice.
+_PR_TEMPLATE_MULTI_DIRS = (
+    ".github/PULL_REQUEST_TEMPLATE",
+    "PULL_REQUEST_TEMPLATE",
+    "docs/PULL_REQUEST_TEMPLATE",
+)
+
+
+def find_pr_template(repo_root: Path,
+                     override: str | None = None) -> tuple[Path, str] | None:
+    """Locate the PR template the worker should fill out, or None when
+    the repo has no template.
+
+    Returns `(absolute_path, relative_path_from_repo_root)` so the caller
+    can both read the file and report which template was used (the
+    relative path goes into run.json under `pr_template_used`).
+
+    Discovery order:
+      1. The four single-template locations in
+         `_PR_TEMPLATE_SINGLE_LOCATIONS` (GitHub's canonical order).
+      2. Any `PULL_REQUEST_TEMPLATE/` directory in
+         `_PR_TEMPLATE_MULTI_DIRS`. When `override` matches a basename
+         inside one of these directories (with or without `.md`), that
+         template wins; otherwise the alphabetically first `.md` wins.
+
+    Case sensitivity: file lookups use the literal paths above
+    (lowercase `pull_request_template.md`, uppercase
+    `PULL_REQUEST_TEMPLATE/`) — GitHub itself accepts both cases but
+    pila normalizes on the canonical casing rather than scanning every
+    case-variant.
+    """
+    for rel in _PR_TEMPLATE_SINGLE_LOCATIONS:
+        candidate = repo_root / rel
+        if candidate.is_file():
+            return (candidate, rel)
+    for rel_dir in _PR_TEMPLATE_MULTI_DIRS:
+        d = repo_root / rel_dir
+        if not d.is_dir():
+            continue
+        mds = sorted(p for p in d.iterdir()
+                     if p.is_file() and p.suffix == ".md")
+        if not mds:
+            continue
+        if override:
+            wanted = override if override.endswith(".md") else f"{override}.md"
+            for p in mds:
+                if p.name == wanted:
+                    return (p, f"{rel_dir}/{p.name}")
+            # Override named, no match — fall through to the default rather
+            # than die(), since a bad pr_template setting should not block
+            # finalize. The fail-open path in _compose_pr_via_llm logs a
+            # warning if pr_template was set but didn't resolve.
+        return (mds[0], f"{rel_dir}/{mds[0].name}")
+    return None
+
+
+# Byte budgets for the pr_writer payload. The launcher passes the whole
+# JSON-encoded payload as a single argv element to `claude -p`; Linux
+# ARG_MAX in the pila container (Debian 12) is ~128 KB. These caps keep
+# the largest fields well under that ceiling. The diff sample is line-
+# capped instead of byte-capped because individual diff lines can be
+# long but the worker reads them as hunks.
+PR_WRITER_COMMIT_LOG_MAX_BYTES = 80_000
+PR_WRITER_TEMPLATE_MAX_BYTES = 32_000
+PR_WRITER_DIFF_SAMPLE_MAX_LINES = 500
+
+
+def _cap_text(s: str, max_bytes: int, label: str) -> tuple[str, bool]:
+    """Return (capped_text, was_truncated). Cap `s` at `max_bytes` of
+    its UTF-8 encoding without splitting a multi-byte codepoint, then
+    append a single-line sentinel marker so the worker sees in-band
+    that the field was truncated. `label` names the field in the
+    sentinel so the worker can attribute the truncation correctly.
+    Empty / short strings pass through unchanged."""
+    if not s:
+        return (s, False)
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return (s, False)
+    # Trim to max_bytes and back off until the trailing bytes form a
+    # complete UTF-8 codepoint. errors="ignore" on the final decode
+    # makes this defensive against the rare case where the back-off
+    # logic still lands inside a continuation.
+    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    sentinel = (f"\n... [{label} truncated at ~{max_bytes // 1000} KB; "
+                "remainder omitted — rely on the commit log] ...")
+    return (truncated + sentinel, True)
+
+
+# Matches "pila:" at the very start of a string, case-insensitive, with
+# any whitespace that follows. Anchored so it can't fire mid-string
+# (does not false-positive on "pilates", "pila is great", etc.).
+_PILA_PREFIX_RE = re.compile(r"^pila:\s*", re.IGNORECASE)
+
+
+def _strip_pila_prefix(title: str) -> str:
+    """Strip a leading `pila:` from a worker-emitted PR title so the
+    launcher's unconditional `pila: ` prepend cannot produce
+    `pila: pila: ...`.
+
+    The pr_writer prompt tells the worker not to emit the prefix, but
+    DESIGN §12 *prompts are advisory, code enforces* — a guarantee
+    that matters and can be checked mechanically must live in code.
+    Without this guard, a single drift produces a user-visible defect
+    on every PR until the prompt is patched."""
+    return _PILA_PREFIX_RE.sub("", title)
+
+
+def _truncate_diff_sample(diff_text: str, max_lines: int) -> tuple[str, bool]:
+    """Return (truncated_text, was_truncated). Splits on newlines and
+    keeps the first `max_lines`, appending a sentinel line when truncated
+    so the worker can see in-band that the sample is incomplete.
+
+    Line-based (not byte-based) because individual diff lines can be
+    long and breaking one mid-line would render the surrounding hunk
+    unreadable. Byte budgets for other fields go through `_cap_text`."""
+    lines = diff_text.splitlines()
+    if len(lines) <= max_lines:
+        return (diff_text, False)
+    kept = lines[:max_lines]
+    kept.append(f"... [diff sample truncated at {max_lines} lines; "
+                "remaining hunks omitted — rely on the commit log] ...")
+    return ("\n".join(kept), True)
+
+
+async def _compose_pr_via_llm(st: "State",
+                              caps: dict,
+                              models: dict[str, str],
+                              efforts: dict[str, str | None],
+                              repo_root: Path,
+                              pr_template_override: str | None) -> None:
+    """Run the pr_writer worker and persist its title/body to run.json.
+
+    DESIGN §6 *Finalization*: the worker runs *inside* the orchestrator
+    container (where `claude -p` is available) and writes its output to
+    run.json — the existing container→host handoff channel. The host
+    launcher then reads `pr_title` and `pr_body` from run.json and
+    passes them to `gh pr create`.
+
+    **Fail-open contract**: any error (subprocess failure, schema
+    mismatch, timeout, git errors collecting context) is logged as a
+    warning and swallowed. The launcher's bash fallback composition
+    runs in that case, so a PR will still open — generating a richer
+    body must never block finalize success.
+    """
+    try:
+        # 1. Locate the template (may be None).
+        tpl = find_pr_template(repo_root, pr_template_override)
+        tpl_content = ""
+        tpl_rel: str | None = None
+        tpl_truncated = False
+        if tpl is not None:
+            tpl_path, tpl_rel = tpl
+            try:
+                raw = tpl_path.read_text()
+                tpl_content, tpl_truncated = _cap_text(
+                    raw, PR_WRITER_TEMPLATE_MAX_BYTES, "PR template")
+            except OSError as e:
+                log(f"pr_writer: failed to read template {tpl_rel}: {e} "
+                    "(falling back to no-template mode)")
+                tpl = None
+                tpl_rel = None
+        if pr_template_override and tpl_rel is None:
+            log(f"pr_writer: --pr-template={pr_template_override!r} did "
+                f"not match any template; using default discovery")
+
+        # 2. Collect git context. Commits are the spine; diff is sampled.
+        working_branch = st.data.get("working_branch") or "HEAD"
+        run_branch = compute_run_branch(st.run_id)
+        rev_range = f"{working_branch}..{run_branch}"
+
+        async def _git(args: list[str]) -> str:
+            # start_new_session=True per DESIGN §6 "Worker subtree
+            # termination" — every subprocess in this module isolates
+            # into its own POSIX session so cleanup can killpg without
+            # signalling the orchestrator's own group. Static-enforced
+            # by tests/test_signal_cleanup.py.
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", str(repo_root), *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            out, _err = await proc.communicate()
+            return out.decode("utf-8", errors="replace")
+
+        commit_log_raw = await _git([
+            "log", "--no-merges", "--format=%h %s%n%b%n---", rev_range])
+        commit_log, commit_log_truncated = _cap_text(
+            commit_log_raw, PR_WRITER_COMMIT_LOG_MAX_BYTES, "commit log")
+        diff_stat = await _git(["diff", "--stat", rev_range])
+        dirstat = await _git(["diff", "--dirstat=files,5", rev_range])
+        # Sample diff: cap at ~500 lines. A full diff of a 32-file run
+        # easily blows the prompt budget; the commit log is the canonical
+        # record. We pull the head of `git diff` (deterministic order:
+        # alphabetical by path) so the sample at least covers some
+        # concrete hunks instead of being a no-op stat.
+        full_diff = await _git(["diff", rev_range])
+        diff_sample, diff_truncated = _truncate_diff_sample(
+            full_diff, PR_WRITER_DIFF_SAMPLE_MAX_LINES)
+
+        # 3. Pull planner-written subtask titles from plan.json. The
+        # planner writes its full plan there (write_plan above), and the
+        # titles are the cleanest human-readable summary of each subtask's
+        # intent. Empty list if plan.json is missing or malformed.
+        subtask_titles: list[str] = []
+        try:
+            plan = json.loads(
+                (st.run_dir / "plan.json").read_text())
+            for sid, spec in (plan.get("subtasks") or {}).items():
+                title = (spec or {}).get("title")
+                if title:
+                    subtask_titles.append(title)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        categories = st.data.get("categories") or []
+        answers = st.data.get("answers") or {}
+
+        payload = {
+            "task": st.data.get("task", ""),
+            "categories": categories,
+            "source_of_truth": answers.get("source_of_truth"),
+            "working_branch": working_branch,
+            "run_branch": run_branch,
+            "wave_count": len(st.data.get("waves") or []),
+            "subtask_count": sum(
+                len(w) for w in (st.data.get("waves") or [])),
+            "worker_count": st.data.get("worker_count"),
+            "subtask_titles": subtask_titles,
+            "template": (
+                {"path": tpl_rel, "content": tpl_content,
+                 "truncated": tpl_truncated}
+                if tpl_rel else None
+            ),
+            "commit_log": commit_log,
+            "commit_log_truncated": commit_log_truncated,
+            "diff_stat": diff_stat,
+            "dirstat": dirstat,
+            "diff_sample": diff_sample,
+            "diff_sample_truncated": diff_truncated,
+        }
+
+        sys_prompt = load_prompt("pr_writer")
+        model = models.get("pr_writer", MODEL_DEFAULT_PER_WORKER.get(
+            "pr_writer", MODEL_DEFAULT))
+        effort = efforts.get("pr_writer")
+        # Pre-check the worker budget. If the run already saturated
+        # max_total_workers in execution, bump_workers() would raise
+        # WorkerError — which the fail-open except below would catch
+        # and log as "composition failed (WorkerError: ...)", which is
+        # misleading (the worker never ran; the budget said no). Skip
+        # cleanly and let the launcher's deterministic fallback run.
+        wc = st.data.get("worker_count", 0)
+        if wc >= caps["max_total_workers"]:
+            log(f"pr_writer: skipped (worker budget exhausted at "
+                f"{wc}/{caps['max_total_workers']}); deterministic "
+                "fallback will run")
+            return
+        st.bump_workers(caps)
+        result = await claude_p(
+            user_prompt=json.dumps(payload, separators=(",", ":")),
+            system_prompt=sys_prompt,
+            schema_key="pr_writer",
+            cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=20,
+            autonomous=False,
+            caps=caps,
+            st=st,
+            model=model,
+            effort=effort,
+            sid="pr-writer",
+        )
+
+        # Strip whitespace, then strip any leading `pila:` the worker
+        # may have emitted despite the prompt telling it not to —
+        # DESIGN §12 *prompts are advisory, code enforces*. The
+        # launcher unconditionally prepends `pila: `, so leaving a
+        # worker-emitted prefix in place would render `pila: pila: …`.
+        title = _strip_pila_prefix((result.get("title") or "").strip()).strip()
+        body = (result.get("body") or "").strip()
+        if not title or not body:
+            log("pr_writer: worker returned empty title or body; "
+                "launcher will use deterministic fallback")
+            return
+        used = result.get("used_template")
+        _write_run_json(
+            st.run_dir,
+            pr_title=title,
+            pr_body=body,
+            pr_template_used=used,
+        )
+        log(f"pr_writer: composed PR via {model}"
+            + (f" (filled template {used})" if used else ""))
+    except Exception as e:
+        # Fail-open: any failure means the launcher uses its bash
+        # fallback. Surface enough to debug but never raise.
+        log(f"pr_writer: composition failed ({type(e).__name__}: {e}); "
+            "launcher will use deterministic fallback")
+
+
 async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
-                         no_verify: bool) -> None:
+                         no_verify: bool,
+                         caps: dict | None = None,
+                         models: dict[str, str] | None = None,
+                         efforts: dict[str, str | None] | None = None,
+                         pr_template_override: str | None = None) -> None:
     """Phase 6: verify the run branch and record finalize state.
 
     The push + PR step has moved to the host launcher (DESIGN §6
@@ -8419,6 +8808,15 @@ async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
 
     `no_verify` is passed through into the run.json sidecar so the
     launcher knows whether to add `--no-verify` to its `git push`.
+
+    When `caps`, `models`, and `efforts` are provided and `no_push` is
+    False, the `pr_writer` worker runs after `finished_at` is recorded
+    to compose an LLM-written title + body that respects any
+    PR template in the target repo. Output lands in run.json's
+    `pr_title` / `pr_body` / `pr_template_used` fields; the launcher
+    reads these and falls back to the deterministic `compose_pr_body`
+    shape if they are missing. The args default to None so legacy
+    call sites (and tests) keep working with the old signature.
     """
     log("phase 6: finalizing")
     st.data["current_phase"] = "phase 6: finalize"
@@ -8442,6 +8840,16 @@ async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
         no_push=no_push,
         no_verify=no_verify,
     )
+
+    # LLM-composed PR title/body. Runs only when push will happen and
+    # the caller threaded models/efforts/caps through. Fail-open: any
+    # error is swallowed and the launcher uses its bash fallback.
+    if not no_push and caps is not None and models is not None and efforts is not None:
+        await _compose_pr_via_llm(
+            st, caps, models, efforts,
+            repo_root=Path(os.getcwd()),
+            pr_template_override=pr_template_override,
+        )
 
     if no_push:
         log(f"skipped push and PR (--no-push); the run branch "
@@ -8622,7 +9030,10 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
     await phase_execute(pila_dir, st, caps, models, efforts)
     await phase_finalize(pila_dir, st,
                         no_push=getattr(args, "no_push", False),
-                        no_verify=getattr(args, "no_verify", False))
+                        no_verify=getattr(args, "no_verify", False),
+                        caps=caps, models=models, efforts=efforts,
+                        pr_template_override=getattr(
+                            args, "pr_template", None))
 
 
 def main() -> None:
@@ -8672,6 +9083,15 @@ def main() -> None:
                          "(hooks run). CLI flag only (no env/TOML mirror — "
                          "matches CLAUDE.md's explicit-user-request "
                          "principle for hook-skipping).")
+    ap.add_argument("--pr-template", metavar="NAME",
+                    help="when the target repo has multiple PR templates "
+                         "in PULL_REQUEST_TEMPLATE/, pick this one by "
+                         "basename (with or without .md). No effect "
+                         "when the repo has a single top-level template "
+                         "or none at all. Default: alphabetically first "
+                         ".md. Also "
+                         f"{PR_TEMPLATE_ENV} env var or pr_template in "
+                         "pila.toml.")
     ap.add_argument("--dangerously-skip-permissions", action="store_true",
                     help="DANGEROUS: pass --dangerously-skip-permissions "
                          "to EVERY claude -p worker — including the "
@@ -8775,6 +9195,11 @@ def main() -> None:
                     help=f"model alias for the heal post-run worker "
                          f"(default {MODEL_DEFAULT_PER_WORKER['heal']}); "
                          f"also {MODEL_HEAL_ENV} or model_heal in pila.toml")
+    ap.add_argument("--pr-writer-model", choices=MODEL_VALUES, metavar="ALIAS",
+                    help=f"model alias for the pr_writer finalize worker "
+                         f"(default {MODEL_DEFAULT_PER_WORKER['pr_writer']}); "
+                         f"also {MODEL_PR_WRITER_ENV} or model_pr_writer "
+                         f"in pila.toml")
     ap.add_argument("--heal-max-rounds", type=int, metavar="N",
                     help=f"maximum heal-loop iterations per call_type "
                          f"(default {HEAL_MAX_ROUNDS_DEFAULT}); "
@@ -8949,6 +9374,13 @@ def main() -> None:
         log("dangerously-skip-permissions: ON "
             "(judgment workers run with prompts disabled — "
             "§12 enforcement waived)")
+
+    # Resolve --pr-template: free-form string (no enum). Re-attach to
+    # args so phase_finalize sees the resolved value via
+    # `args.pr_template`. None means "alphabetically first .md in
+    # PULL_REQUEST_TEMPLATE/" (the discovery helper's default).
+    args.pr_template = resolve_pr_template(
+        repo_root, getattr(args, "pr_template", None))
 
     # Resolve --inspect-dir: CLI flags (repeatable) → PILA_INSPECT_DIRS
     # env (colon-separated) → inspect_dirs in pila.toml (comma-separated)

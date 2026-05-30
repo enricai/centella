@@ -1262,24 +1262,42 @@ update_run_json "pushed_at=$PUSHED_AT" "push_error="
 echo "[pila] finalize: pushed $RUN_BRANCH" >&2
 
 # --- step 2: PR creation ------------------------------------------------
-# Compose the PR body deterministically from state.json — same shape as
-# the previous compose_pr_body in pila.py (DESIGN §6 *Finalization*).
+# Primary path: the pr_writer worker (DESIGN §6 *Finalization*) ran
+# before this script and wrote pr_title + pr_body to run.json. Use them
+# when present so the PR respects the target repo's PR template.
+#
+# Fallback path: when pr_writer errored, schema-failed, or was skipped,
+# pr_title / pr_body are absent (or empty) — compose a deterministic body
+# from state.json, mirroring `compose_pr_body` in orchestrator/pila.py.
 STATE_JSON="$LATEST_RUN_DIR/state.json"
+RUN_JSON="$LATEST_RUN_DIR/run.json"
 
-# Extract fields with safe defaults (n/a for missing/null).
-or_na() { [ -n "$1" ] && [ "$1" != "null" ] && printf '%s' "$1" || printf 'n/a'; }
+PR_TITLE_LLM="$(jq -r '.pr_title // ""' "$RUN_JSON")"
+PR_BODY_LLM="$(jq -r '.pr_body // ""' "$RUN_JSON")"
 
-TASK="$(jq -r '.task // ""' "$STATE_JSON")"
-FIRST_CAT="$(or_na "$(jq -r '.categories[0] // ""' "$STATE_JSON")")"
-SOURCE_OF_TRUTH="$(or_na "$(jq -r '.answers.source_of_truth // ""' "$STATE_JSON")")"
-STARTED_AT="$(or_na "$(jq -r '.started_at // ""' "$STATE_JSON")")"
-FINISHED_AT="$(or_na "$(jq -r '.finished_at // ""' "$STATE_JSON")")"
-WAVE_COUNT="$(jq -r '.waves | length' "$STATE_JSON")"
-SUBTASK_COUNT="$(jq -r '[.waves[] | length] | add // 0' "$STATE_JSON")"
-WORKER_COUNT="$(or_na "$(jq -r '.worker_count // ""' "$STATE_JSON")")"
-WORKING_BRANCH_DISPLAY="$(or_na "$WORKING_BRANCH")"
+if [ -n "$PR_TITLE_LLM" ] && [ -n "$PR_BODY_LLM" ]; then
+  # Launcher prepends "pila: " so pila-opened PRs stay easy to spot in
+  # lists. The worker MUST NOT include the prefix itself (its prompt
+  # says so); if it ever did, we'd render "pila: pila: <title>".
+  PR_TITLE="pila: $PR_TITLE_LLM"
+  PR_BODY="$PR_BODY_LLM"
+else
+  # Deterministic fallback. Extract fields with safe defaults
+  # (n/a for missing/null).
+  or_na() { [ -n "$1" ] && [ "$1" != "null" ] && printf '%s' "$1" || printf 'n/a'; }
 
-PR_BODY="$(cat <<EOF
+  TASK="$(jq -r '.task // ""' "$STATE_JSON")"
+  FIRST_CAT="$(or_na "$(jq -r '.categories[0] // ""' "$STATE_JSON")")"
+  SOURCE_OF_TRUTH="$(or_na "$(jq -r '.answers.source_of_truth // ""' "$STATE_JSON")")"
+  STARTED_AT="$(or_na "$(jq -r '.started_at // ""' "$STATE_JSON")")"
+  FINISHED_AT="$(or_na "$(jq -r '.finished_at // ""' "$STATE_JSON")")"
+  WAVE_COUNT="$(jq -r '.waves | length' "$STATE_JSON")"
+  SUBTASK_COUNT="$(jq -r '[.waves[] | length] | add // 0' "$STATE_JSON")"
+  WORKER_COUNT="$(or_na "$(jq -r '.worker_count // ""' "$STATE_JSON")")"
+  WORKING_BRANCH_DISPLAY="$(or_na "$WORKING_BRANCH")"
+
+  PR_TITLE="pila: $RUN_ID"
+  PR_BODY="$(cat <<EOF
 ## Task
 
 $TASK
@@ -1301,12 +1319,13 @@ $TASK
 See \`.pila/runs/$RUN_ID/state.json\` for full run state.
 EOF
 )"
+fi
 
 echo "[pila] finalize: opening PR against $WORKING_BRANCH" >&2
 if ! pr_output="$(echo "$PR_BODY" | gh pr create \
                   --base "$WORKING_BRANCH" \
                   --head "$RUN_BRANCH" \
-                  --title "pila: $RUN_ID" \
+                  --title "$PR_TITLE" \
                   --body-file - 2>&1)"; then
   # PR-creation failure is NON-fatal — the push succeeded.
   update_run_json "pr_url=" "pr_error=${pr_output:-gh pr create failed}"
