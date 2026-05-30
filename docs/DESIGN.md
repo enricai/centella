@@ -577,6 +577,49 @@ TTY adaptation that selects between the two modes; and
 "Concurrency model" for the unchanged in-container worker cleanup
 that runs as the happy path.
 
+**Worker subtree termination — Memory containment via cgroup v2.**
+The kernel reap above handles *process lifecycle*, not memory: when
+a worker's tool subtree (a `pnpm test` spawning vitest pools, a
+`tsc --noEmit` building a 1.5-2 GB V8 heap, an `npm run build`
+forking webpack workers) overshoots the container's available RAM,
+the kernel's OOM killer fires inside the container's single memcg.
+The victim it picks is whichever process in that memcg has the
+largest `oom_score`, which can land on `sshd` / `lima-guestagent` /
+the pila orchestrator itself — collapsing infrastructure that the
+launcher relies on for SSH-tunnel survival to the macOS host. The
+observed pattern on an undersized 11 GiB Colima VM with 4
+concurrent implementers was: vitest worker (1.85 GiB anon-rss) →
+OOM-killer fires → `agetty` → `journald` → `sshd` (Mac launcher
+sees `exit status 255`) → `lima-guestagent` → only then the
+offending Node process. Pila's own RSS sat at 36.8 MiB throughout,
+so the orchestrator wasn't leaking; the cascade was caused by all
+processes sharing one memcg.
+
+Each `claude -p` worker is therefore enrolled in its own child
+cgroup at `/sys/fs/cgroup/pila-w-<sid>/` with `memory.max` set to
+`caps["worker_memory_max_bytes"]` (default: VM RAM split across
+`max_parallel + 1` slots, clamped to ≤ 4 GiB) and `pids.max` set
+to `caps["worker_pids_max"]` (default 256). When the worker
+subtree blows past `memory.max`, the kernel OOM-kills *inside that
+cgroup*; sibling workers, the orchestrator, and host-side services
+in different cgroups are not eligible victims. `memory.swap.max=0`
+prevents the kernel from delaying an inevitable OOM by paging out
+worker memory to the Colima swap file.
+
+The mechanism is purely file-permission based on cgroup v2 — no
+`CAP_SYS_ADMIN`, no `--privileged`, no `systemd-run`. The launcher
+gives the container a writable `/sys/fs/cgroup` via
+`--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
+bind-propagation=rshared`; the orchestrator's `_cgroup_probe`
+verifies this at startup and falls back to uncapped behavior with
+one warn line if delegation isn't available (older launcher,
+kernel < 5.x, custom container shape). The teardown path uses
+`cgroup.kill` (kernel ≥ 5.14) as an atomic kill of any worker-
+subtree process that survived the existing `_terminate_proc_tree`
+proc-walk — a backstop, not the primary cleanup. See
+IMPLEMENTATION.md §"Caps" for the resolution surface and
+`_cgroup_*` in `orchestrator/pila.py` for the call sites.
+
 Earlier versions of pila gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
 accidental Ctrl-C catastrophic — and it conflated user intent ("stop

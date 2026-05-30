@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-worker cgroup v2 memory containment.** Each `claude -p`
+  worker is now enrolled in its own child cgroup at
+  `/sys/fs/cgroup/pila-w-<sid>/` with `memory.max`,
+  `memory.swap.max=0`, and `pids.max` set. When a worker's tool
+  subtree (vitest pools, `tsc --noEmit`, `npm run build`'s
+  webpack workers, etc.) overshoots its memory budget, the kernel
+  OOM-kills inside the worker's cgroup — sibling workers, the
+  orchestrator, and host-side services (`sshd`,
+  `lima-guestagent`) in different cgroups are not eligible
+  victims. Fixes the OOM-cascade failure mode observed in a
+  finalmemoriam run where four concurrent implementers ran 3
+  heavy Node toolchain processes simultaneously, blew through
+  the 11 GiB Colima VM, took out sshd, and surfaced as
+  `FATA[NNNN] exit status 255` on the Mac launcher with no
+  orchestrator-side diagnostic. Pila's own RSS sat at 36.8 MiB
+  through the whole event (no orchestrator leak); the cascade
+  was purely due to all processes sharing one container memcg.
+  Mechanism is purely cgroup v2 file-permission delegation — no
+  `--privileged`, no `--cap-add`, no `systemd-run`. The launcher
+  gains one mount flag
+  (`--mount type=bind,source=/sys/fs/cgroup,
+   target=/sys/fs/cgroup,bind-propagation=rshared`); the
+  orchestrator's `_cgroup_probe` verifies delegation at startup
+  and falls back to uncapped behavior with one warn-line if
+  unavailable (older launcher, kernel < 5.x). New CLI knob
+  `--worker-memory-max SIZE` (also `PILA_WORKER_MEMORY_MAX` env
+  and `worker_memory_max` in `pila.toml`); when unset, auto-
+  derives a per-worker cap from `/proc/meminfo` by splitting VM
+  RAM across `max_parallel + 1` slots, clamped to ≤ 4 GiB.
+  Suffixes K/M/G/T accepted. New telemetry field
+  `cgroup_applied` (bool) on every `calls.ndjson` record so a
+  post-mortem can confirm containment was active.
+
 ### Fixed
 
 - **Memory sampler stranded after the bootstrap-dir → final-run-id

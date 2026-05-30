@@ -1123,10 +1123,20 @@ else
   #
   # Note: NOT `exec` — we need control to return to the launcher after the
   # container exits so the host-side finalize block (below) can run.
+  # The --mount type=bind on /sys/fs/cgroup gives the orchestrator
+  # cgroup v2 write access inside the container — required for the
+  # per-worker memory.max / pids.max containment (DESIGN §6 "Worker
+  # subtree termination — Memory containment"). cgroup v2 delegation
+  # is file-permission based; no --privileged or --cap-add needed.
+  # If the host doesn't have cgroup v2 (kernel <5.x or unified hier
+  # disabled) the bind-mount no-ops cleanly and the orchestrator's
+  # _cgroup_probe returns False, falling back to the pre-fix
+  # uncapped behavior with one warn log line.
   nerdctl run \
     --rm $TTY_FLAGS \
     --name "pila-$(date +%s)-$$" \
     -e PILA_INSPECT_DIRS= \
+    --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
     -v "$USER_REPO:/work" \
     -v "$PILA_REPO:/work/.pila-image:ro" \
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \

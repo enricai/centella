@@ -112,6 +112,25 @@ DEFAULT_CAPS = {
     # itself. Surfacing the knob is for tuning persistence, not for
     # promoting a prompt-governed limit to a code guarantee.
     "confidence_rounds": 8,
+    # Per-worker cgroup v2 memory cap (bytes). Each `claude -p` worker is
+    # enrolled in its own child cgroup at /sys/fs/cgroup/pila-w-<sid>/ and
+    # the cgroup's memory.max is set to this value. When a worker's tool
+    # subtree (vitest, tsc, webpack workers, etc.) tries to allocate past
+    # the cap, the kernel OOM-kills inside the cgroup — sshd / pid 1 /
+    # other workers in the container are unaffected. This is the fix for
+    # the OOM cascade from the finalmemoriam run (kernel ring on the
+    # Colima VM showed agetty → journald → sshd → lima-guestagent killed
+    # because a vitest worker blew past 1.85 GB RSS inside the
+    # container's single memcg). Resolved at runtime by
+    # resolve_worker_memory_max — CLI > env > pila.toml > default. The
+    # default value of None means "auto-derive from /proc/meminfo at run
+    # start" (see _auto_worker_memory_max).
+    "worker_memory_max_bytes": None,
+    # Per-worker cgroup v2 PID cap. Catches runaway fork-bomb behavior
+    # from a worker's tool subtree. 256 is generous — webpack + vitest
+    # pools regularly hit 50+ PIDs per worker, but a runaway shell loop
+    # is in the thousands.
+    "worker_pids_max": 256,
 }
 
 # Every key the orchestrator writes to `st.data`. Canonical alongside the
@@ -254,6 +273,14 @@ CONFIDENCE_ROUNDS_FILE = SOURCE_OF_TRUTH_FILE
 # in pila.toml; then DEFAULT_CAPS fallback.
 MAX_WORKERS_ENV = "PILA_MAX_WORKERS"
 MAX_WORKERS_FILE = SOURCE_OF_TRUTH_FILE
+
+# Per-worker memory cap (cgroup v2 memory.max). Same resolution shape:
+# CLI --worker-memory-max wins; then PILA_WORKER_MEMORY_MAX env; then
+# worker_memory_max in pila.toml; then auto-derive from /proc/meminfo
+# at startup. Accepted suffixes: K, M, G, T (case-insensitive, IEC
+# binary — 1G == 1024**3 bytes). See _parse_memory_size.
+WORKER_MEMORY_MAX_ENV = "PILA_WORKER_MEMORY_MAX"
+WORKER_MEMORY_MAX_FILE = SOURCE_OF_TRUTH_FILE
 
 # --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
 # step at finalize. Resolution order: --no-push CLI flag → PILA_NO_PUSH
@@ -2043,6 +2070,89 @@ def resolve_max_workers(repo_root: Path,
             die(f"{cfg}: max_workers={file_val!r} is not a positive integer")
         return n
     return DEFAULT_CAPS["max_total_workers"]
+
+
+_MEMORY_SUFFIX_MULTIPLIER = {
+    "": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4,
+}
+
+
+def _parse_memory_size(value: str, context: str) -> int:
+    """Parse a memory size string like "4G", "512M", "1024" into bytes.
+
+    Accepts an optional case-insensitive IEC binary suffix (K/M/G/T).
+    No suffix means bytes. Rejects negative, zero, fractional, and
+    garbage values via die() with `context` in the error message so the
+    user knows which knob produced the bad value."""
+    v = value.strip()
+    if not v:
+        die(f"{context}: memory size cannot be empty")
+    suffix = v[-1:].upper()
+    if suffix in _MEMORY_SUFFIX_MULTIPLIER and suffix != "":
+        numeric = v[:-1]
+        mult = _MEMORY_SUFFIX_MULTIPLIER[suffix]
+    else:
+        numeric = v
+        mult = 1
+    try:
+        n = int(numeric)
+    except ValueError:
+        die(f"{context}: {value!r} is not a valid memory size "
+            f"(expected like '4G', '512M', '1024')")
+    if n <= 0:
+        die(f"{context}: {value!r} must be a positive memory size")
+    return n * mult
+
+
+def _auto_worker_memory_max(max_parallel: int) -> int:
+    """Auto-derive a per-worker memory cap from /proc/meminfo.
+
+    The goal: distribute the VM's RAM across `max_parallel + 1` slots
+    so one slot remains for the orchestrator + system processes
+    (sshd, lima-guestagent, etc.) outside any worker cgroup. Capped at
+    4 GiB per worker — beyond that, a single tool subtree shouldn't
+    legitimately need more, and an uncapped 8+ GiB cgroup defeats
+    the containment purpose.
+
+    Falls back to 2 GiB if /proc/meminfo is unreadable (non-Linux,
+    sandboxed test, etc.). The cgroup write itself will detect a
+    nonsensical limit and the probe will skip wrapping."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    total = kb * 1024
+                    break
+            else:
+                return 2 * 1024**3
+    except (FileNotFoundError, PermissionError, ValueError):
+        return 2 * 1024**3
+    per_worker = total // (max_parallel + 1)
+    return min(per_worker, 4 * 1024**3)
+
+
+def resolve_worker_memory_max(repo_root: Path,
+                              max_parallel: int,
+                              cli_value: str | None = None) -> int:
+    """Resolve the per-worker cgroup memory cap (bytes). Order:
+    --worker-memory-max CLI flag → PILA_WORKER_MEMORY_MAX env →
+    pila.toml `worker_memory_max` → auto-derive from /proc/meminfo.
+
+    All sources accept the same format ("4G", "512M", "1024") and are
+    validated by _parse_memory_size, which die()s on bad input — bad
+    config is caught at startup, not during a worker spawn."""
+    if cli_value is not None:
+        return _parse_memory_size(cli_value, "--worker-memory-max")
+    env = os.environ.get(WORKER_MEMORY_MAX_ENV, "").strip()
+    if env:
+        return _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
+    cfg = repo_root / WORKER_MEMORY_MAX_FILE
+    file_val = _read_toml_key(cfg, "worker_memory_max")
+    if file_val is not None:
+        return _parse_memory_size(file_val,
+                                  f"{cfg}: worker_memory_max")
+    return _auto_worker_memory_max(max_parallel)
 
 
 def resolve_inspect_dirs(repo_root: Path,
@@ -4089,10 +4199,127 @@ def _get_progress(st: "State") -> tuple[int, int] | None:
     return done, total
 
 
+# --- cgroup v2 containment for worker subtrees ---------------------------
+# Each `claude -p` worker (and every descendant it forks: bash children,
+# vitest pools, webpack workers, tsc, etc.) is enrolled in its own child
+# cgroup at /sys/fs/cgroup/pila-w-<sid>/. The cgroup's memory.max and
+# pids.max bound how much RAM / how many PIDs the worker subtree may
+# consume. When the worker subtree exceeds memory.max, the kernel OOM-
+# kills inside that cgroup — sshd / pid 1 / sibling workers are not
+# eligible victims. This is the fix for the cascade documented in
+# DESIGN §6 Worker subtree termination — Memory containment.
+#
+# Delegation is purely file-permission based on cgroup v2; no
+# CAP_SYS_ADMIN required. The launcher mounts /sys/fs/cgroup writable
+# into the container (see `pila` launcher: --mount type=bind,source=
+# /sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared). If
+# the mount is not writable (older launcher, host kernel <5.x, custom
+# container shape), the probe degrades the path to no-op with a
+# warn-once log line — pila must never die because the cap can't be
+# applied.
+
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_CGROUP_PROBE_RESULT: bool | None = None
+
+
+def _cgroup_probe() -> bool:
+    """Once-per-run probe: can we create cgroups under /sys/fs/cgroup/?
+
+    Memoized in `_CGROUP_PROBE_RESULT`. Returns True on success, False
+    on any failure (RO mount, missing dir, missing controllers, etc.).
+    A failure logs one warn-once line so the user sees that the
+    containment is degraded; subsequent worker spawns silently skip the
+    cgroup work.
+
+    The probe creates a child dir and immediately rmdir's it. On real
+    cgroupfs, rmdir of a cgroup dir succeeds even though it appears
+    "non-empty" — the kernel removes the cgroup atomically. On a
+    regular filesystem (test environment), the child dir IS empty
+    after mkdir so rmdir also succeeds. We deliberately do NOT touch
+    memory.max during the probe: writing a kernel-controller file
+    would leave files in the dir on a non-cgroupfs path, breaking
+    rmdir cleanup."""
+    global _CGROUP_PROBE_RESULT
+    if _CGROUP_PROBE_RESULT is not None:
+        return _CGROUP_PROBE_RESULT
+    probe_dir = _CGROUP_ROOT / "pila-probe"
+    try:
+        probe_dir.mkdir(exist_ok=True)
+        probe_dir.rmdir()
+        _CGROUP_PROBE_RESULT = True
+    except OSError as e:
+        log(f"  cgroup probe failed ({e.strerror or e}); worker memory "
+            f"containment is OFF for this run. The launcher may need "
+            f"the --mount type=bind,source=/sys/fs/cgroup,... flag.")
+        with contextlib.suppress(OSError):
+            probe_dir.rmdir()
+        _CGROUP_PROBE_RESULT = False
+    return _CGROUP_PROBE_RESULT
+
+
+def _cgroup_create(sid: str, memory_max_bytes: int,
+                   pids_max: int) -> Path | None:
+    """Create a child cgroup for a worker and set its caps. Returns the
+    cgroup path on success, None on any failure. Idempotent on the
+    mkdir — re-spawning a worker with the same sid (handoff,
+    continuation) reuses the existing cgroup. The caps are re-written
+    so a config change between spawns takes effect."""
+    if not _cgroup_probe():
+        return None
+    path = _CGROUP_ROOT / f"pila-w-{sid}"
+    try:
+        path.mkdir(exist_ok=True)
+        (path / "memory.max").write_text(str(memory_max_bytes))
+        (path / "pids.max").write_text(str(pids_max))
+        # memory.swap.max = 0 so the kernel doesn't swap-out the
+        # worker pages to delay an inevitable OOM. The Colima VM has
+        # 4 GB swap; letting workers eat it just means slow death
+        # instead of fast death.
+        with contextlib.suppress(OSError):
+            (path / "memory.swap.max").write_text("0")
+    except OSError as e:
+        log(f"  [{sid}] cgroup create failed ({e.strerror or e}); "
+            f"worker runs uncapped")
+        return None
+    return path
+
+
+def _cgroup_enroll(cgroup_path: Path, pid: int) -> bool:
+    """Move `pid` into the cgroup. Called immediately after the worker
+    subprocess spawns. Returns True on success. Failure logs but does
+    not abort the worker — the worker will simply run in the parent
+    cgroup (uncapped) which is the pre-fix behavior."""
+    try:
+        (cgroup_path / "cgroup.procs").write_text(str(pid))
+        return True
+    except OSError as e:
+        log(f"  cgroup enroll failed for pid={pid}: "
+            f"{e.strerror or e}")
+        return False
+
+
+def _cgroup_destroy(cgroup_path: Path | None) -> None:
+    """Tear down the worker's cgroup. Best-effort:
+    - cgroup.kill (kernel ≥5.14) atomically kills all members of the
+      cgroup. Catches any lingering grandchild process the
+      _DescendantTracker / proc-walk may have missed.
+    - rmdir removes the empty cgroup.
+    Both are swallowed on ENOENT (already cleaned). Called from
+    `_invoke`'s cleanup path on every exit (success, timeout, abort)."""
+    if cgroup_path is None:
+        return
+    with contextlib.suppress(OSError):
+        (cgroup_path / "cgroup.kill").write_text("1")
+    with contextlib.suppress(OSError):
+        cgroup_path.rmdir()
+
+
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   sid: str, pila_dir: Path, verbosity: str,
                   progress: tuple[int, int] | None = None,
-                  idle_warn_sec: float | None = None) -> dict:
+                  idle_warn_sec: float | None = None,
+                  worker_memory_max_bytes: int | None = None,
+                  worker_pids_max: int | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     The CLI is invoked with `--output-format stream-json --verbose`; each
@@ -4165,6 +4392,20 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # operational chatter and stays gated.
     if verbosity != "quiet":
         log(f"  [{sid}] spawned (pid={proc.pid})")
+    # cgroup v2 containment: enroll the worker (and every descendant it
+    # forks — `set_new_session=True` above means the kernel propagates
+    # cgroup membership down the process tree by default on v2). On
+    # systems without writable cgroupfs the helpers return None / False
+    # silently and the worker runs uncapped. Failure modes from the
+    # cgroup path NEVER abort the worker — telemetry that crashes its
+    # host is worse than no telemetry (same principle as _memory_sampler).
+    cgroup_path: Path | None = None
+    if (worker_memory_max_bytes is not None
+            and worker_pids_max is not None):
+        cgroup_path = _cgroup_create(sid, worker_memory_max_bytes,
+                                     worker_pids_max)
+        if cgroup_path is not None:
+            _cgroup_enroll(cgroup_path, proc.pid)
     # Track every descendant PID that ever appears under this worker. Claude
     # Code's Bash tool uses `run_in_background: true` to fire-and-forget
     # long-running commands (test runners, builds, dev servers); those
@@ -4360,6 +4601,14 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
+        # cgroup teardown. cgroup.kill (kernel ≥5.14) atomically reaps
+        # any worker-tree process that survived _terminate_proc_tree /
+        # descendant_tracker.stop_and_reap above — a backstop for the
+        # backgrounded grandchild class. Then rmdir the cgroup so we
+        # don't accumulate /sys/fs/cgroup/pila-w-* entries across a
+        # long-running orchestrator. Best-effort: ENOENT etc. are
+        # swallowed inside _cgroup_destroy.
+        _cgroup_destroy(cgroup_path)
     # Success path: reap any backgrounded subprocesses the worker left
     # behind. `claude -p` workers use Claude Code's Bash tool with
     # `run_in_background: true` for long-running tasks (test runners,
@@ -4596,7 +4845,12 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                  progress=_get_progress(st),
                                  idle_warn_sec=caps.get(
                                      "worker_idle_warn_sec",
-                                     DEFAULT_CAPS["worker_idle_warn_sec"]))
+                                     DEFAULT_CAPS["worker_idle_warn_sec"]),
+                                 worker_memory_max_bytes=caps.get(
+                                     "worker_memory_max_bytes"),
+                                 worker_pids_max=caps.get(
+                                     "worker_pids_max",
+                                     DEFAULT_CAPS["worker_pids_max"]))
         _latency_ms = int((time.monotonic() - _t0) * 1000)
 
         # record run-weight telemetry
@@ -4610,6 +4864,13 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             _usage = envelope.get("usage") or {}
             _parsed_ok = envelope.get("structured_output") is not None
             _success = not envelope.get("is_error") and _parsed_ok
+            # cgroup_applied: whether the per-worker cgroup containment
+            # was active for this spawn. Useful when post-mortem
+            # inspecting a calls.ndjson — a run with cgroup_applied
+            # consistently False means the launcher's writable
+            # /sys/fs/cgroup mount didn't propagate, and the OOM-
+            # cascade safety net was off.
+            _cgroup_applied = _CGROUP_PROBE_RESULT is True
             _capture_call(st.run_dir, {
                 "call_id": str(uuid.uuid4()),
                 "run_id": st.run_id,
@@ -4623,6 +4884,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 "output_tokens": int(_usage.get("output_tokens") or 0),
                 "latency_ms": _latency_ms,
                 "success": _success,
+                "cgroup_applied": _cgroup_applied,
                 "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
             })
 
@@ -8006,6 +8268,15 @@ def main() -> None:
                          f"(default {DEFAULT_CAPS['confidence_rounds']}); "
                          f"also {CONFIDENCE_ROUNDS_ENV} and "
                          f"confidence_rounds in pila.toml")
+    ap.add_argument("--worker-memory-max", metavar="SIZE",
+                    help="per-worker cgroup memory cap (e.g. '4G', "
+                         "'512M', '1024'). Bounds RAM available to each "
+                         "claude -p worker subtree; an OOM stays inside "
+                         "the worker cgroup rather than cascading to "
+                         "sshd / orchestrator. Auto-derived from "
+                         "/proc/meminfo when unset. Also "
+                         f"{WORKER_MEMORY_MAX_ENV} env var or "
+                         "worker_memory_max in pila.toml")
     ap.add_argument("--skip-smoke", action="store_true",
                     help="skip the live claude -p smoke test during preflight. "
                          "Default: off (smoke test runs)")
@@ -8151,6 +8422,12 @@ def main() -> None:
     # a bad --confidence-rounds via _positive_int.
     caps["confidence_rounds"] = resolve_confidence_rounds(
         Path(os.getcwd()), args.confidence_rounds)
+    # Resolve per-worker cgroup memory cap. Auto-derives from
+    # /proc/meminfo when unset; resolver die()s on a bad size string.
+    # Reads `caps["max_parallel"]` already resolved above so the auto-
+    # derived value is "VM ram split N+1 ways, capped at 4 GiB".
+    caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
+        Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max)
 
     # Resolve verbosity. Explicit --verbosity wins; else -v/-q
     # shortcuts (anchored to `normal`); else env / TOML / default.

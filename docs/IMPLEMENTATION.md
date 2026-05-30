@@ -1468,6 +1468,8 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed; `worker_timeout_sec` remains the only kill. Surfaces silent-hang failures (a worker that never emits its first `system/init` event) so the user is not left with zero feedback between phase start and the 90-min hard kill. |
+| per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived from `/proc/meminfo` (VM ram split across `max_parallel + 1` slots, clamped to ≤ 4 GiB), or `--worker-memory-max SIZE` / `PILA_WORKER_MEMORY_MAX` / `worker_memory_max` in `pila.toml`. Suffixes K/M/G/T accepted | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services (sshd, lima-guestagent) are not eligible victims. Requires the launcher's writable `/sys/fs/cgroup` bind-mount (see `pila` launcher); on incompatible hosts the probe at startup logs one warn line and the run continues uncapped. See DESIGN §6 *Memory containment*. |
+| per-worker cgroup PIDs cap (`worker_pids_max`) | 256 | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees. |
 
 `--max-turns` by worker: classifier 60, planner 100, integrator 60,
 implementer 120, conformer 60, judge 40, heal patch_generator 40. For
