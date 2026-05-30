@@ -1,9 +1,15 @@
 # pila container image — see docs/IMPLEMENTATION.md §0.5 "Container shape".
 #
 # Built locally on first `pila` run; tagged `pila:<VERSION>` so a pila upgrade
-# rebuilds once and reuses layers thereafter. The orchestrator source itself
-# is bind-mounted from the host at runtime (not baked in), so editing
-# orchestrator/pila.py does NOT require an image rebuild.
+# rebuilds once and reuses layers thereafter.
+#
+# LOCAL MODE: the launcher bind-mounts $PILA_HOME → /work/.pila-image:ro at
+# runtime, shadowing the baked-in COPY layers. Editing orchestrator/pila.py
+# on the host takes effect on the next run without an image rebuild.
+#
+# REGISTRY / FLY MODE: the COPY instructions below bake orchestrator/,
+# scripts/, and prompts/ into /work/.pila-image/ so the image is self-contained
+# without a bind-mount. An image rebuild IS required after source changes.
 
 FROM debian:12-slim
 
@@ -139,4 +145,14 @@ RUN mkdir -p /home/pila/.local/share/mise \
 
 USER pila
 WORKDIR /work
+
+# Bake the orchestrator source into the image at the same path the local
+# bind-mount uses (/work/.pila-image). This is a no-op for local mode
+# (the launcher's -v $PILA_HOME:/work/.pila-image:ro shadows this layer),
+# but required for registry / fly.io mode where no bind-mount exists.
+# .dockerignore allows exactly these three directories into the build context.
+COPY --chown=pila:pila orchestrator/ /work/.pila-image/orchestrator/
+COPY --chown=pila:pila scripts/      /work/.pila-image/scripts/
+COPY --chown=pila:pila prompts/      /work/.pila-image/prompts/
+
 ENTRYPOINT ["/work/.pila-image/scripts/container-entry.sh"]

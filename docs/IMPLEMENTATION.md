@@ -35,10 +35,15 @@ inside the container (DESIGN §6 / §0.5 below).
 
 Pila requires Python 3.10+. The container image installs Debian 12's
 `python3` (currently 3.11), which satisfies the requirement. The host
-needs no Python at all. The orchestrator's source is bind-mounted from
-`$PILA_HOME` into `/work/.pila-image/` at runtime, *not* baked into the
-image — so iterating on `orchestrator/pila.py` does not require an image
-rebuild.
+needs no Python at all.
+
+The orchestrator source (`orchestrator/`, `scripts/`, `prompts/`) is baked
+into the image via `COPY` instructions at `/work/.pila-image/`. In local mode
+the launcher overrides this with a read-only bind-mount (`-v
+$PILA_HOME:/work/.pila-image:ro`), so iterating on `orchestrator/pila.py`
+does not require an image rebuild in that mode. In registry / fly.io mode
+there is no bind-mount, and the baked-in copy is used directly; source
+changes require an image rebuild and republish.
 
 The orchestrator itself remains stdlib-only — no `pip install`, no
 `pyproject.toml`, no PyPI release. `pytest` is still the only dev
@@ -234,11 +239,14 @@ cd /work
 exec python3 /work/.pila-image/orchestrator/pila.py "$@"
 ```
 
-The orchestrator's source lives at `/work/.pila-image/` (read-only
-bind mount from `$PILA_HOME` on the host), *not* baked into the
-image. Iterating on `orchestrator/pila.py` therefore does not need
-an image rebuild — edit the file on the host, next `pila` invocation
-picks it up.
+The orchestrator's source lives at `/work/.pila-image/`. The Dockerfile
+bakes `orchestrator/`, `scripts/`, and `prompts/` there via `COPY`
+instructions. In local mode the launcher overlays that baked copy with a
+read-only bind mount from `$PILA_HOME` on the host, so iterating on
+`orchestrator/pila.py` does not need an image rebuild — edit the file
+on the host, next `pila` invocation picks it up. In registry / fly.io
+mode the baked copy is authoritative (no bind mount exists); a source
+change requires an image rebuild.
 
 ### Bind-mount table
 
@@ -247,7 +255,7 @@ The launcher passes the following mounts to `nerdctl run`:
 | Host path | Container path | Mode | Purpose |
 |---|---|---|---|
 | `$(pwd -P)` (user repo) | `/work` | rw | The repo pila operates on. Worktrees and `.pila/` state live here. Writes flow back to the host so `--resume` works across container runs. |
-| `$PILA_HOME` (pila install dir) | `/work/.pila-image` | ro | Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. |
+| `$PILA_HOME` (pila install dir) | `/work/.pila-image` | ro | *Local mode only.* Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. Shadows the baked COPY layer so edits to `orchestrator/pila.py` take effect without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
 | `$STAGE/.claude.json` (per-run host scratch) | `/home/pila/.claude.json` | rw | Per-container copy of `~/.claude.json` with the `projects[]` block stripped. The host file is never directly mounted into a container: the shared mount is a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226 — all open) that hangs workers in a recovery loop with no backoff. Each container writes only its private copy. |
 | `$STAGE/.claude` (per-run host scratch) | `/home/pila/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/`, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. |
 | Keychain → `$STAGE/.claude/.credentials.json` (macOS only) | `/home/pila/.claude/.credentials.json` | rw | On macOS the launcher extracts the OAuth token JSON from Keychain (service `Claude Code-credentials`) and writes it to the staged `.claude/.credentials.json`. The Linux CLI reads exactly that path, so both platforms use the same file-based auth flow inside the container. Extraction uses `security find-generic-password -w`; succeeds silently in the user's login session. |
