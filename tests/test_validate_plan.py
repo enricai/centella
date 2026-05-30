@@ -85,7 +85,10 @@ def test_dangling_depends_on_dies(pila, capsys):
 
 def test_unresolvable_requires_dies(pila, capsys):
     plan = {
-        "feat-001": _good_subtask("feat-001", requires=["nonexistent-cap"]),
+        "feat-001": _good_subtask(
+            "feat-001",
+            requires=[{"tag": "nonexistent-cap", "extent": "in_plan"}],
+        ),
     }
     with pytest.raises(SystemExit):
         pila.validate_plan(plan)
@@ -98,7 +101,10 @@ def test_resolvable_requires_passes(pila):
     """When provides on one subtask matches requires on another, it passes."""
     plan = {
         "feat-001": _good_subtask("feat-001", provides=["feature-x-live"]),
-        "test-001": _good_subtask("test-001", requires=["feature-x-live"]),
+        "test-001": _good_subtask(
+            "test-001",
+            requires=[{"tag": "feature-x-live", "extent": "in_plan"}],
+        ),
     }
     pila.validate_plan(plan)
 
@@ -128,3 +134,100 @@ def test_all_documented_prefixes_accepted(pila, prefix):
     sid = f"{prefix}001"
     plan = {sid: _good_subtask(sid)}
     pila.validate_plan(plan)
+
+
+# --- requires.extent invariants (DESIGN §5 `requires.extent`) ----------
+
+def test_requires_bare_string_rejected(pila, capsys):
+    """`requires` entries must be objects `{tag, extent, reason?}`. Bare
+    strings were the pre-extent shape; reject them defensively even
+    though the JSON schema catches them earlier — `validate_plan` runs
+    after schedule(), which can in principle pass through mutated data."""
+    plan = {"feat-001": _good_subtask("feat-001", requires=["bare-string"])}
+    with pytest.raises(SystemExit):
+        pila.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert "requires entry must be an object" in err
+
+
+def test_requires_external_without_reason_rejected(pila, capsys):
+    """`extent: external` is a planner declaration that the prerequisite
+    lives outside the build graph; the `reason` field is what makes that
+    declaration accountable. Reject an external entry that omits it (or
+    leaves it empty / whitespace), mirroring the discipline the
+    reconciler applies to its `unresolvable` verdict."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            requires=[{"tag": "external-cap", "extent": "external"}],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        pila.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert "extent=external" in err
+    assert "reason" in err
+
+
+def test_requires_external_with_whitespace_only_reason_rejected(pila, capsys):
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            requires=[{"tag": "external-cap", "extent": "external",
+                       "reason": "   \n  "}],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        pila.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert "extent=external" in err
+
+
+def test_requires_unknown_extent_rejected(pila, capsys):
+    """`extent` is an enum; defensive Python check in addition to the
+    JSON schema enum (schema runs at worker output time; this catches
+    a downstream mutation that smuggled in a bad value)."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            requires=[{"tag": "x", "extent": "maybe"}],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        pila.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert "unknown extent" in err
+
+
+def test_requires_external_does_not_need_a_provider(pila):
+    """An `extent: external` entry is explicitly out-of-graph — no
+    in-plan provider is required (or expected). validate_plan must NOT
+    flag it as unresolvable."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            requires=[{
+                "tag": "dynamo-table-in-region",
+                "extent": "external",
+                "reason": "provisioned by the api-services repo's CDK stack",
+            }],
+        ),
+    }
+    pila.validate_plan(plan)  # no SystemExit
+
+
+def test_requires_in_plan_without_provider_still_dies(pila, capsys):
+    """The pre-existing missing-provider check still applies to
+    `extent: in_plan` entries — extent only changes behavior for
+    external, not in_plan."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            requires=[{"tag": "missing-cap", "extent": "in_plan"}],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        pila.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert "requires 'missing-cap'" in err
+    assert "nothing provides it" in err

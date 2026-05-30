@@ -62,6 +62,45 @@ The orchestrator gives you, in your prompt:
      edges by matching `requires` against every domain's `provides`. Use
      specific tags, e.g. `auth-service-extracted`, `export-endpoint-live`.
 
+   **`requires` is an array of objects, not strings.** Each entry is
+   `{tag, extent, reason}`:
+
+   - `extent: "in_plan"` — the default. The capability is produced by some
+     code subtask in this plan (yours or another domain's). The
+     orchestrator wires a graph edge by matching against `provides`. Omit
+     `reason` or leave it empty.
+   - `extent: "external"` — your research surfaced a real prerequisite that
+     is **not** produced by any code subtask in this plan. It lives outside
+     the build graph: another repo's deploy, an ops runbook, a manual
+     step in a different team's queue, infrastructure already provisioned
+     elsewhere. `reason` is **required and must name the owner** ("Dynamo
+     table provisioned by the API repo's CDK stack", "ops runbook
+     `runbooks/cutover.md` step 4", "manual: SRE must enable the feature
+     flag in PagerDuty before deploy"). The orchestrator does not try to
+     wire a graph edge — it surfaces these in `plan.json`'s
+     `preconditions` section as deploy notes for the human running the
+     change.
+
+   `extent: "external"` is not a dumping ground for uncomfortable
+   requirements. Before classifying an entry as `external`, ask: *could a
+   small connector subtask in some domain's plan produce this?* If yes, it
+   is `in_plan` and you should let the reconciler wire it. If the
+   capability is fundamentally a runtime or ops state that no code change
+   can produce, it is `external`. The discipline mirrors the reconciler's
+   discipline for `unresolvable`: name the owner concretely, or do not use
+   the channel.
+
+   **Examples:**
+
+   ```json
+   "requires": [
+     {"tag": "auth-service-extracted", "extent": "in_plan"},
+     {"tag": "dynamo-contact-table-present-in-region",
+      "extent": "external",
+      "reason": "Dynamo table + GSI provisioned by the api-services repo's CDK stack; backfill cannot run before the cutover deploy lands there."}
+   ]
+   ```
+
 4. **Seed success criteria.** For each subtask, write a concrete, checkable
    `success_criteria_seed` — describe an automated test wherever possible.
 
@@ -139,7 +178,11 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "scope_note": "Why this is the smallest independently verifiable unit.",
       "files_likely_touched": ["src/path/file.ext"],
       "depends_on": ["bugfix-000"],
-      "requires": ["capability-tag-needed"],
+      "requires": [
+        {"tag": "capability-tag-needed", "extent": "in_plan"},
+        {"tag": "external-prereq-tag", "extent": "external",
+         "reason": "Named owner of the out-of-graph prerequisite, e.g. 'provisioned by infra repo X'."}
+      ],
       "provides": ["capability-tag-produced"],
       "success_criteria_seed": "The concrete checkable condition; an automated test where possible.",
       "size": "small | medium",

@@ -42,8 +42,18 @@ The orchestrator gives you, in your prompt, a JSON payload:
 ```
 
 `unresolved_requires` is pre-computed: every `(sid, tag)` pair where the tag
-appears in some subtask's `requires` but no subtask's `provides`. Your job is
-to decide, for each pair, what to do.
+appears in some subtask's `requires` (with `extent: in_plan`) but no
+subtask's `provides`. Your job is to decide, for each pair, what to do.
+
+**You only see `in_plan` requires.** The orchestrator filters
+planner-declared `extent: external` entries out before computing this
+list — those are explicitly out-of-graph prerequisites (other repo, ops
+runbook, manual step) that surface in `plan.json` as `preconditions`
+rather than as edges in the build graph. If a planner classified
+something as `external`, it is not in your input and you do not need to
+reason about it. Likewise, the `requires` field shown to you on each
+subtask in `subtasks[]` contains only the `in_plan` tags — externals are
+elided so you can match cleanly against `provides`.
 
 ## Output
 
@@ -67,7 +77,9 @@ A JSON object with four arrays. Each array may be empty:
       "intent": "...",
       "success_criteria_seed": "<concrete, checkable criterion>",
       "provides": ["<the unresolved tag>"],
-      "requires": [],
+      "requires": [
+        {"tag": "<some-other-cap>", "extent": "in_plan"}
+      ],
       "depends_on": [],
       "size": "small",
       "_added_by_reconciler": true
@@ -175,5 +187,8 @@ Output:
 - Never emit a new subtask whose own `requires` aren't satisfied by the
   reconciled plan. If the connector you'd add has unmet `requires`, fall
   through to `unresolvable` instead — leave deeper redesign to the user.
+  (Connector subtasks use the same `requires: [{tag, extent, reason?}]`
+  object form as planner subtasks. Use `extent: "in_plan"` for tags the
+  reconciled plan must satisfy.)
 - Stay read-only. You may consult the codebase via Read/Grep/Glob to confirm
   what a capability actually means, but you do not modify code.

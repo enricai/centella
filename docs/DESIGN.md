@@ -203,6 +203,51 @@ It is reconciled by the orchestrator with three mechanisms:
   computes the unresolved set mechanically and applies the worker's output
   mechanically.
 
+### `requires.extent` — in-graph vs. external prerequisites
+
+Not every prerequisite a planner identifies is satisfiable by another code
+subtask in the plan. When a planner researches its domain (especially under
+`source_of_truth = both`), it sometimes surfaces a genuine prerequisite that
+lives *outside* the build graph: a Dynamo table provisioned by another repo,
+an ops runbook the deploy depends on, a manual step in a different team's
+queue. Treating those as unresolved cross-domain edges forces the reconciler
+either to invent a connector subtask that itself has out-of-scope `requires`,
+or to abort. Neither preserves the insight.
+
+To carry that distinction, each `requires` entry is an object — `{tag,
+extent, reason}` — rather than a bare string. The planner classifies each
+entry along one axis:
+
+- `extent: in_plan` — satisfied by another subtask in this plan; the
+  orchestrator wires a graph edge by matching against `provides`. The
+  reconciler resolves these (rename / added_provides / added_subtasks) and
+  aborts on a true unresolvable.
+- `extent: external` — a real prerequisite the planner is declaring lives
+  outside the build graph. The `reason` field names the owner (other repo,
+  ops runbook, manual step) and why no in-repo subtask could plausibly
+  produce it. The orchestrator filters these out of the matching pass
+  entirely — they never enter the reconciler's queue — and instead collects
+  them into a `preconditions` section of the assembled plan. The human sees
+  the insight as a deploy note rather than a hard edge.
+
+The planner is the right classifier because it just did the research that
+surfaced the prerequisite — it can answer "is this satisfiable by a code
+change I'm describing?" The reconciler cannot, because asking it to predict
+whether some *other* domain's planner produces a capability is exactly the
+question planners cannot answer about each other.
+
+**Collision rule.** If any planner declares `requires: {tag: X, extent:
+external}` and another planner declares `provides: X`, the `provides` wins
+and the entry is silently promoted to `in_plan` before the matching pass.
+This prevents a planner from unilaterally bypassing a real producer that
+happens to exist in another domain's plan. The promotion is mechanical and
+needs no reconciler involvement: a real producer for the capability already
+exists in the plan, so the edge can be wired without judgment.
+
+`unresolvable` is now reserved for genuinely-broken in-plan tags — typos,
+hallucinations, or in-plan capabilities the reconciler can neither rename,
+attribute, nor connect. An external prerequisite never reaches that path.
+
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
@@ -1305,6 +1350,15 @@ already names its own source of truth, or a non-feature task where the
 question does not apply, runs without it. Whichever path resolved the
 preference, its value becomes a setting carried to every planner and
 implementer, so the whole run draws from one consistent source of truth.
+
+Under `both`, planners may legitimately surface prerequisites from research
+that are real but not produced by any code subtask in the plan — the target
+Dynamo table provisioned by another repo, an ops runbook, a manual deploy
+step. The channel for those is `requires.extent: external` (see §5): the
+planner declares the prerequisite and names its external owner, and the
+reconciler does not try to wire it as a graph edge. Without that channel,
+`both` tends to produce phantom `requires` that abort the run — narrowing
+to `source_of_truth = codebase` was historically the only escape hatch.
 
 When Pila runs under `--clarify` in a context where it cannot block for
 an answer, the clarification step is non-blocking: it records the questions,

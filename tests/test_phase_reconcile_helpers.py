@@ -21,6 +21,16 @@ def _plan(domain: str, *subtasks: dict) -> dict:
     return {"domain": domain, "status": "ready", "subtasks": list(subtasks)}
 
 
+def _req(tag: str, extent: str = "in_plan", reason: str = "") -> dict:
+    """Build a `requires` entry in the object form (DESIGN §5
+    `requires.extent`). Defaults to `in_plan` since that's the common
+    case in pre-extent tests and matches what bare strings represented."""
+    entry = {"tag": tag, "extent": extent}
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
 def test_unresolved_empty_when_plan_has_no_requires(pila):
     plans = [_plan("feature-implementation",
                    {"id": "feat-001", "title": "x", "provides": ["a"]})]
@@ -32,7 +42,7 @@ def test_unresolved_empty_when_every_requires_has_a_provider(pila):
         _plan("feature-implementation",
               {"id": "feat-001", "title": "x", "provides": ["a"]}),
         _plan("testing",
-              {"id": "test-001", "title": "y", "requires": ["a"]}),
+              {"id": "test-001", "title": "y", "requires": [_req("a")]}),
     ]
     assert pila._compute_unresolved_requires(plans) == []
 
@@ -42,9 +52,11 @@ def test_unresolved_lists_missing_tags(pila):
         _plan("feature-implementation",
               {"id": "feat-001", "title": "x", "provides": ["a"]}),
         _plan("testing",
-              {"id": "test-001", "title": "y", "requires": ["a", "missing-1"]}),
+              {"id": "test-001", "title": "y",
+               "requires": [_req("a"), _req("missing-1")]}),
         _plan("testing",
-              {"id": "test-002", "title": "z", "requires": ["missing-2"]}),
+              {"id": "test-002", "title": "z",
+               "requires": [_req("missing-2")]}),
     ]
     out = pila._compute_unresolved_requires(plans)
     # Order is by iteration order over plans → subtasks → requires;
@@ -68,7 +80,7 @@ def test_unresolved_handles_subtask_with_no_provides_field(pila):
         _plan("feature-implementation",
               {"id": "feat-001", "title": "x"}),
         _plan("testing",
-              {"id": "test-001", "title": "y", "requires": ["a"]}),
+              {"id": "test-001", "title": "y", "requires": [_req("a")]}),
     ]
     out = pila._compute_unresolved_requires(plans)
     assert out == [{"sid": "test-001", "tag": "a", "domain": "testing"}]
@@ -81,7 +93,7 @@ def test_unresolved_duplicate_requires_emits_once_per_subtask(pila):
     plans = [
         _plan("testing",
               {"id": "test-001", "title": "y",
-               "requires": ["missing-1", "missing-1"]}),
+               "requires": [_req("missing-1"), _req("missing-1")]}),
     ]
     out = pila._compute_unresolved_requires(plans)
     # Two entries — same sid + tag, both surfaced. The reconciler
@@ -95,12 +107,13 @@ def test_unresolved_duplicate_requires_emits_once_per_subtask(pila):
 def test_apply_empty_output_is_noop(pila):
     """An all-empty output leaves plans unchanged."""
     plans = [_plan("feature-implementation",
-                   {"id": "feat-001", "title": "x", "requires": ["foo"]})]
+                   {"id": "feat-001", "title": "x",
+                    "requires": [_req("foo")]})]
     out = {"renames": [], "added_provides": [],
            "added_subtasks": [], "unresolvable": []}
     pila._apply_reconciler_output(plans, out)
     # No mutations.
-    assert plans[0]["subtasks"][0]["requires"] == ["foo"]
+    assert plans[0]["subtasks"][0]["requires"] == [_req("foo")]
     assert len(plans) == 1
 
 
@@ -110,14 +123,20 @@ def test_apply_rename_rewrites_requires_on_named_subtask(pila):
               {"id": "feat-001", "title": "x", "provides": ["canonical"]}),
         _plan("testing",
               {"id": "test-001", "title": "y",
-               "requires": ["old-name", "other-req"]}),
+               "requires": [_req("old-name"), _req("other-req")]}),
     ]
     out = {"renames": [{"sid": "test-001", "from": "old-name",
                         "to": "canonical"}],
            "added_provides": [], "added_subtasks": [], "unresolvable": []}
     pila._apply_reconciler_output(plans, out)
-    # The `from` tag is gone; `to` replaces it; other reqs untouched.
-    assert plans[1]["subtasks"][0]["requires"] == ["canonical", "other-req"]
+    # The `from` tag is rewritten in-place; `extent` and other reqs
+    # untouched. The rename mutates the entry's `tag` field rather than
+    # building a new list, so order is preserved (DESIGN §5).
+    requires = plans[1]["subtasks"][0]["requires"]
+    tags = [e["tag"] for e in requires]
+    assert tags == ["canonical", "other-req"]
+    # extent preserved across the rename.
+    assert all(e["extent"] == "in_plan" for e in requires)
 
 
 def test_apply_rename_with_nonexistent_sid_is_silently_skipped(pila):
@@ -125,13 +144,45 @@ def test_apply_rename_with_nonexistent_sid_is_silently_skipped(pila):
     doesn't exist, drop it rather than crash. (The reconciler is told
     only existing sids; this is belt-and-suspenders.)"""
     plans = [_plan("testing",
-                   {"id": "test-001", "title": "y", "requires": ["foo"]})]
+                   {"id": "test-001", "title": "y",
+                    "requires": [_req("foo")]})]
     out = {"renames": [{"sid": "nonexistent-001", "from": "foo",
                         "to": "bar"}],
            "added_provides": [], "added_subtasks": [], "unresolvable": []}
     pila._apply_reconciler_output(plans, out)
     # test-001 was not the target; its requires is unchanged.
-    assert plans[0]["subtasks"][0]["requires"] == ["foo"]
+    assert plans[0]["subtasks"][0]["requires"] == [_req("foo")]
+
+
+def test_apply_rename_does_not_mutate_external_with_same_tag(pila):
+    """Pathological-but-legal: a subtask carries two `requires` entries
+    with the same `tag` — one `extent: in_plan` (which the reconciler
+    saw and renamed), one `extent: external` (which the reconciler
+    never sees because the orchestrator filters externals out of its
+    input). The rename must touch *only* the in_plan entry; mutating
+    the external entry's tag would corrupt the planner's out-of-graph
+    declaration (the `reason` would no longer describe the new tag).
+    Pins the DESIGN §5 invariant that the reconciler's verdicts only
+    apply to in_plan tags."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["canonical"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("old-name", "in_plan"),
+                            _req("old-name", "external",
+                                 "owned by api-services CDK stack")]}),
+    ]
+    out = {"renames": [{"sid": "test-001", "from": "old-name",
+                        "to": "canonical"}],
+           "added_provides": [], "added_subtasks": [], "unresolvable": []}
+    pila._apply_reconciler_output(plans, out)
+    requires = plans[1]["subtasks"][0]["requires"]
+    # The in_plan entry is renamed; the external entry is untouched.
+    assert requires[0] == {"tag": "canonical", "extent": "in_plan"}
+    assert requires[1]["tag"] == "old-name"
+    assert requires[1]["extent"] == "external"
+    assert requires[1]["reason"] == "owned by api-services CDK stack"
 
 
 def test_apply_added_provides_appends_to_subtask(pila):
@@ -320,7 +371,7 @@ def test_apply_combined_renames_provides_and_subtasks(pila):
               {"id": "feat-001", "title": "shim", "provides": ["shim-cap"]}),
         _plan("testing",
               {"id": "test-001", "title": "test",
-               "requires": ["wrong-name", "new-cap"]}),
+               "requires": [_req("wrong-name"), _req("new-cap")]}),
     ]
     out = {
         "renames": [{"sid": "test-001", "from": "wrong-name",
@@ -336,9 +387,10 @@ def test_apply_combined_renames_provides_and_subtasks(pila):
         "unresolvable": [],
     }
     pila._apply_reconciler_output(plans, out)
-    # rename applied
-    assert "wrong-name" not in plans[1]["subtasks"][0]["requires"]
-    assert "shim-cap" in plans[1]["subtasks"][0]["requires"]
+    # rename applied — check via tag set since entries are objects now.
+    tags = [e["tag"] for e in plans[1]["subtasks"][0]["requires"]]
+    assert "wrong-name" not in tags
+    assert "shim-cap" in tags
     # added_provides applied
     assert "extra-cap" in plans[0]["subtasks"][0]["provides"]
     # added_subtasks landed
@@ -352,11 +404,298 @@ def test_apply_does_not_consume_unresolvable_array(pila):
     helper doesn't accidentally swallow unresolvable as a non-failure
     mutation."""
     plans = [_plan("testing",
-                   {"id": "test-001", "title": "y", "requires": ["x"]})]
+                   {"id": "test-001", "title": "y",
+                    "requires": [_req("x")]})]
     out = {"renames": [], "added_provides": [], "added_subtasks": [],
            "unresolvable": [{"sid": "test-001", "tag": "x",
                              "reason": "fake reason"}]}
     pila._apply_reconciler_output(plans, out)
     # Plans unchanged — unresolvable is not the helper's concern.
-    assert plans[0]["subtasks"][0]["requires"] == ["x"]
+    assert plans[0]["subtasks"][0]["requires"] == [_req("x")]
     assert len(plans) == 1
+
+
+# --- _promote_external_collisions (DESIGN §5 collision rule) -----------
+
+def test_promote_external_with_no_provider_left_alone(pila):
+    """The whole point of `extent: external` is "no in-plan producer";
+    the promotion pass must leave such entries as-is."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["something-else"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("external-cap", "external",
+                                 "owned by other repo")]}),
+    ]
+    promoted = pila._promote_external_collisions(plans)
+    assert promoted == 0
+    assert plans[1]["subtasks"][0]["requires"][0]["extent"] == "external"
+
+
+def test_promote_external_with_provider_demoted_to_in_plan(pila):
+    """If any plan provides the tag, the external declaration must be
+    silently promoted to in_plan — the in-plan producer wins so a
+    planner cannot unilaterally bypass a real producer that happens to
+    exist in another domain (DESIGN §5 collision rule)."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "provides": ["redis-available"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("redis-available", "external",
+                                 "the planner thought infra owned this")]}),
+    ]
+    promoted = pila._promote_external_collisions(plans)
+    assert promoted == 1
+    entry = plans[1]["subtasks"][0]["requires"][0]
+    assert entry["extent"] == "in_plan"
+    # `reason` is preserved for telemetry — promotion does not strip it.
+    assert entry["reason"] == "the planner thought infra owned this"
+
+
+def test_promote_external_counts_each_promotion_separately(pila):
+    """Multiple external entries that collide are each counted."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "provides": ["cap-a", "cap-b"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("cap-a", "external", "r1"),
+                            _req("cap-b", "external", "r2"),
+                            _req("cap-c", "external", "r3")]}),
+    ]
+    promoted = pila._promote_external_collisions(plans)
+    # cap-a and cap-b collide; cap-c does not.
+    assert promoted == 2
+    extents = [e["extent"] for e in plans[1]["subtasks"][0]["requires"]]
+    assert extents == ["in_plan", "in_plan", "external"]
+
+
+def test_promote_external_ignores_in_plan_entries(pila):
+    """`_promote_external_collisions` only touches external entries;
+    in_plan entries that look "wrong" are someone else's problem
+    (validate_plan or the reconciler)."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["cap-a"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("cap-a", "in_plan")]}),
+    ]
+    promoted = pila._promote_external_collisions(plans)
+    assert promoted == 0
+
+
+# --- _collect_external_preconditions -----------------------------------
+
+def test_collect_externals_emits_one_entry_per_tag(pila):
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "requires": [_req("ext-1", "external", "reason-a")]}),
+    ]
+    out = pila._collect_external_preconditions(plans)
+    assert len(out) == 1
+    assert out[0]["tag"] == "ext-1"
+    assert out[0]["originating_subtasks"] == ["feat-001"]
+    assert out[0]["reasons"] == [{"sid": "feat-001", "reason": "reason-a"}]
+
+
+def test_collect_externals_dedupes_by_tag(pila):
+    """Two subtasks declaring the same external tag merge into one
+    preconditions entry; each subtask's reason is preserved in the
+    `reasons` array so attribution survives the dedup."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "requires": [_req("dynamo-table", "external", "feat says")]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("dynamo-table", "external", "test says")]}),
+    ]
+    out = pila._collect_external_preconditions(plans)
+    assert len(out) == 1
+    assert out[0]["tag"] == "dynamo-table"
+    assert out[0]["originating_subtasks"] == ["feat-001", "test-001"]
+    reasons = {r["sid"]: r["reason"] for r in out[0]["reasons"]}
+    assert reasons == {"feat-001": "feat says", "test-001": "test says"}
+
+
+def test_collect_externals_skips_in_plan_entries(pila):
+    """Only `extent: external` entries land in preconditions; in_plan
+    entries are graph edges and stay in the reconciler's domain."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["cap-a"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("cap-a", "in_plan"),
+                            _req("ext-cap", "external", "reason")]}),
+    ]
+    out = pila._collect_external_preconditions(plans)
+    assert len(out) == 1
+    assert out[0]["tag"] == "ext-cap"
+
+
+def test_collect_externals_is_deterministically_ordered(pila):
+    """Output is sorted by tag so test assertions and the on-disk
+    plan.json don't churn run-to-run for the same input."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "requires": [_req("zeta", "external", "z"),
+                            _req("alpha", "external", "a"),
+                            _req("mu", "external", "m")]}),
+    ]
+    out = pila._collect_external_preconditions(plans)
+    tags = [e["tag"] for e in out]
+    assert tags == ["alpha", "mu", "zeta"]
+
+
+def test_collect_externals_empty_for_plan_with_no_externals(pila):
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x",
+                    "requires": [_req("cap-a", "in_plan")]})]
+    assert pila._collect_external_preconditions(plans) == []
+
+
+# --- _compute_unresolved_requires + extent filtering -------------------
+
+def test_compute_unresolved_ignores_external_entries(pila):
+    """`extent: external` entries are out-of-graph by planner
+    declaration; they must NOT appear in the unresolved set even when
+    no subtask provides them (that's the whole point of the channel)."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "requires": [_req("ext-cap", "external", "external owner")]}),
+    ]
+    assert pila._compute_unresolved_requires(plans) == []
+
+
+# --- reconciler-added externals round-trip (DESIGN §5, P2.3 fix) -------
+
+def test_collect_externals_includes_reconciler_added_subtasks(pila):
+    """Pin the P2.3 invariant: after `_apply_reconciler_output` appends a
+    connector subtask that itself declares `extent: external`, a
+    subsequent `_collect_external_preconditions` pass must include that
+    new external entry in the deduped preconditions list. Without the
+    re-run wired in `phase_reconcile`, the reconciler-added external
+    would be silently dropped (collected only against the original
+    planner output, not the post-reconciler plan tree)."""
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x"})]
+    new_subtask = {
+        "id": "feat-008",
+        "title": "Connector for cross-system handoff",
+        "success_criteria_seed": "criterion",
+        "provides": ["new-cap"],
+        "requires": [_req("manual-pagerduty-flag-on", "external",
+                          "SRE must enable the feature flag in PagerDuty "
+                          "before deploy")],
+        "_added_by_reconciler": True,
+    }
+    out = {"renames": [], "added_provides": [],
+           "added_subtasks": [new_subtask], "unresolvable": []}
+    pila._apply_reconciler_output(plans, out)
+    preconditions = pila._collect_external_preconditions(plans)
+    assert len(preconditions) == 1
+    assert preconditions[0]["tag"] == "manual-pagerduty-flag-on"
+    assert preconditions[0]["originating_subtasks"] == ["feat-008"]
+    assert preconditions[0]["reasons"][0]["sid"] == "feat-008"
+
+
+def test_promote_externals_after_reconciler_handles_in_plan_producer(pila):
+    """Sibling to the above: if a reconciler-added subtask declares an
+    external `requires` whose tag is `provides`d by some plan (either
+    an original planner or another reconciler-added subtask), the
+    second-pass `_promote_external_collisions` must promote it to
+    in_plan so the graph edge gets wired. Same DESIGN §5 collision rule
+    that applies to planner-declared externals."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "provides": ["cap-a"]}),
+    ]
+    new_subtask = {
+        "id": "feat-008",
+        "title": "Connector",
+        "success_criteria_seed": "criterion",
+        "provides": ["new-cap"],
+        "requires": [_req("cap-a", "external",
+                          "reconciler thought infra owned this")],
+        "_added_by_reconciler": True,
+    }
+    out = {"renames": [], "added_provides": [],
+           "added_subtasks": [new_subtask], "unresolvable": []}
+    pila._apply_reconciler_output(plans, out)
+    promoted = pila._promote_external_collisions(plans)
+    assert promoted == 1
+    # The promoted entry is now in_plan; the reason is preserved for
+    # telemetry but no longer load-bearing.
+    promoted_entry = plans[-1]["subtasks"][0]["requires"][0]
+    assert promoted_entry["extent"] == "in_plan"
+    assert promoted_entry["tag"] == "cap-a"
+
+
+def test_added_provides_absorbs_planner_external_on_second_pass(pila):
+    """Demotion direction: a planner declared `cap-X` as `extent:
+    external` (so the first-pass collection captured it as a
+    precondition). The reconciler then emits `added_provides` claiming
+    some existing subtask actually produces `cap-X`. After
+    `_apply_reconciler_output`, the second-pass
+    `_promote_external_collisions` must demote the external entry to
+    in_plan because a provider now exists in some plan's `provides`,
+    and the second-pass `_collect_external_preconditions` must therefore
+    return a *shorter* list than the first pass.
+
+    Pins the correctness of the bracket pattern in the count-shrinks
+    direction (the case that motivated the P3.2 neutral-wording log
+    fix at pila.py:7140-7143). Without this, a future refactor could
+    accidentally regress to a one-way `if promoted_after:` guard that
+    silently hides the demotion."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "shim",
+               # Does not yet declare `provides: cap-X` — that comes
+               # via the reconciler's added_provides below.
+               "provides": []}),
+        _plan("testing",
+              {"id": "test-001", "title": "tests",
+               "requires": [_req("cap-X", "external",
+                                 "planner thought infra owned this")]}),
+    ]
+    # First-pass collection: 1 external precondition.
+    preconditions_before = pila._collect_external_preconditions(plans)
+    assert len(preconditions_before) == 1
+    assert preconditions_before[0]["tag"] == "cap-X"
+
+    # Reconciler discovers that feat-001 actually produces cap-X.
+    out = {
+        "renames": [],
+        "added_provides": [{"sid": "feat-001", "tag": "cap-X"}],
+        "added_subtasks": [],
+        "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, out)
+
+    # Second-pass promotion finds cap-X in feat-001's `provides` and
+    # demotes the testing subtask's external entry to in_plan.
+    promoted = pila._promote_external_collisions(plans)
+    assert promoted == 1
+
+    # Second-pass collection now returns 0 externals — the count
+    # SHRANK from 1 to 0. This is the demotion direction the P3.2
+    # log fix neutrally describes ("count changed from N to M").
+    preconditions_after = pila._collect_external_preconditions(plans)
+    assert len(preconditions_after) == 0
+    assert len(preconditions_after) < len(preconditions_before)
+
+    # The previously-external entry is now in_plan; reason preserved
+    # for telemetry but no longer load-bearing.
+    entry = plans[1]["subtasks"][0]["requires"][0]
+    assert entry["extent"] == "in_plan"
+    assert entry["tag"] == "cap-X"

@@ -163,6 +163,12 @@ STATE_FIELDS = (
     "integrator_failure", "integrator_warnings", "scope_warnings",
     "conformance",
     "provision",
+    # external_preconditions: planner-declared `extent: external` requires
+    # entries collected during phase_reconcile (DESIGN §5
+    # `requires.extent`). Persisted so write_plan() can surface them in
+    # plan.json's `preconditions` section. Empty list when no planner
+    # declared any external requirement — the common case.
+    "external_preconditions",
     # current_phase carries the orchestrator's active phase string so the
     # `_memory_sampler` (telemetry sidecar at memory.ndjson) can correlate
     # RSS growth with the code path that produced it. Updated at each
@@ -454,6 +460,24 @@ _CONFORMER_BLT_PROP = {
     },
 }
 
+# Shared shape for a single `requires` entry on a planner or reconciler
+# subtask. The structural part is in the JSON schema — `tag` + `extent`
+# must be present and `extent` is restricted to two values. The
+# *conditional* invariant ("`reason` is required and non-empty when
+# `extent == 'external'`") is not expressible in vanilla JSON Schema
+# without `if/then`, so it is enforced in `validate_plan` instead, per
+# CLAUDE.md "prompts are advisory, code enforces." See DESIGN §5
+# `requires.extent` for the architectural contract.
+_REQUIRES_ITEM = {
+    "type": "object",
+    "required": ["tag", "extent"],
+    "properties": {
+        "tag": {"type": "string"},
+        "extent": {"type": "string", "enum": ["in_plan", "external"]},
+        "reason": {"type": "string"},
+    },
+}
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
@@ -538,7 +562,7 @@ SCHEMAS: dict[str, dict] = {
                         "files_likely_touched": {
                             "type": "array", "items": {"type": "string"}},
                         "depends_on": {"type": "array", "items": {"type": "string"}},
-                        "requires": {"type": "array", "items": {"type": "string"}},
+                        "requires": {"type": "array", "items": _REQUIRES_ITEM},
                         "provides": {"type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
                         "size": {"type": "string"},
@@ -609,7 +633,7 @@ SCHEMAS: dict[str, dict] = {
                         "files_likely_touched": {
                             "type": "array", "items": {"type": "string"}},
                         "depends_on": {"type": "array", "items": {"type": "string"}},
-                        "requires": {"type": "array", "items": {"type": "string"}},
+                        "requires": {"type": "array", "items": _REQUIRES_ITEM},
                         "provides": {"type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
                         "size": {"type": "string"},
@@ -2855,8 +2879,20 @@ async def preflight(pila_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
 _ID_PREFIXES = frozenset(f"{v}-" for v in CATEGORY_ABBREV.values())
 
 
+_VALID_EXTENTS = frozenset({"in_plan", "external"})
+
+
 def validate_plan(subtasks: dict) -> None:
-    """Structural validation of the merged plan — pure Python set operations."""
+    """Structural validation of the merged plan — pure Python set operations.
+
+    `requires` entries are objects `{tag, extent, reason?}` per DESIGN §5
+    `requires.extent`. The JSON schema (`_REQUIRES_ITEM`) enforces the
+    shape; this function enforces the conditional invariants that
+    vanilla JSON Schema cannot express, and verifies the in-plan
+    producer-side of cross-domain dependencies. `extent: external`
+    entries are deliberately *not* checked for a provider — they are
+    declared out-of-graph by the planner and surface in `plan.json`'s
+    `preconditions` section."""
     errors: list[str] = []
 
     # all provides tags across every subtask — used for requires resolution
@@ -2879,9 +2915,34 @@ def validate_plan(subtasks: dict) -> None:
             if dep not in all_ids:
                 errors.append(f"{sid}: depends_on '{dep}' which does not exist "
                               "— scheduler will silently drop this edge")
-        for cap in s.get("requires", []):
-            if cap not in all_provides:
-                errors.append(f"{sid}: requires '{cap}' but nothing provides it — "
+        for entry in s.get("requires", []):
+            # Defensive: the JSON schema rejects bare strings before this
+            # function runs, but the planner output gets mutated downstream
+            # (rename / promotion) so re-check shape here.
+            if not isinstance(entry, dict):
+                errors.append(f"{sid}: requires entry must be an object "
+                              f"{{tag, extent, reason?}}, got {entry!r}")
+                continue
+            tag = entry.get("tag", "")
+            extent = entry.get("extent", "")
+            reason = (entry.get("reason") or "").strip()
+            if not tag or not isinstance(tag, str):
+                errors.append(f"{sid}: requires entry has empty or non-string "
+                              f"tag: {entry!r}")
+                continue
+            if extent not in _VALID_EXTENTS:
+                errors.append(f"{sid}: requires '{tag}' has unknown extent "
+                              f"{extent!r} — must be one of "
+                              f"{sorted(_VALID_EXTENTS)}")
+                continue
+            if extent == "external" and not reason:
+                errors.append(f"{sid}: requires '{tag}' with extent=external "
+                              "must include a non-empty `reason` naming the "
+                              "owner (other repo, ops runbook, manual step) "
+                              "and why no in-repo subtask could produce it")
+                continue
+            if extent == "in_plan" and tag not in all_provides:
+                errors.append(f"{sid}: requires '{tag}' but nothing provides it — "
                               "dependency is unresolvable and will be silently dropped")
 
     if errors:
@@ -6703,6 +6764,66 @@ async def phase_plan(task: str, st: State, caps: dict,
     return list(plans)
 
 
+def _promote_external_collisions(plans: list[dict]) -> int:
+    """In-place: for every `requires` entry with `extent: external` whose
+    tag is in some plan's `provides`, rewrite the entry to `extent:
+    in_plan`. The in-plan producer wins so a planner cannot unilaterally
+    bypass a real producer in another domain — DESIGN §5 `requires.extent`
+    collision rule.
+
+    Returns the count of promoted entries (for logging). Mutates the
+    plans list in place; `reason` is preserved on the promoted entry
+    for telemetry but is no longer load-bearing once `extent` is
+    `in_plan`."""
+    all_provides: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            all_provides.update(s.get("provides", []))
+    promoted = 0
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            for entry in s.get("requires", []):
+                if (isinstance(entry, dict)
+                        and entry.get("extent") == "external"
+                        and entry.get("tag") in all_provides):
+                    entry["extent"] = "in_plan"
+                    promoted += 1
+    return promoted
+
+
+def _collect_external_preconditions(plans: list[dict]) -> list[dict]:
+    """Walk plans and return the deduped list of planner-declared
+    `extent: external` requires entries — the `preconditions` surface
+    persisted in `plan.json` (DESIGN §5 `requires.extent`).
+
+    Run AFTER `_promote_external_collisions` so any entry that had an
+    in-plan producer has already been demoted out of the external set.
+    Each output entry is `{tag, reasons: [{sid, reason}, …],
+    originating_subtasks: [sid, …]}`, deduped by tag and stable-sorted
+    for deterministic output."""
+    by_tag: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            sid = s.get("id", "")
+            for entry in s.get("requires", []):
+                if (not isinstance(entry, dict)
+                        or entry.get("extent") != "external"):
+                    continue
+                tag = entry.get("tag", "")
+                reason = (entry.get("reason") or "").strip()
+                if not tag:
+                    continue
+                bucket = by_tag.setdefault(tag, {
+                    "tag": tag,
+                    "reasons": [],
+                    "originating_subtasks": [],
+                })
+                if sid not in bucket["originating_subtasks"]:
+                    bucket["originating_subtasks"].append(sid)
+                bucket["reasons"].append({"sid": sid, "reason": reason})
+    return [by_tag[t] for t in sorted(by_tag)]
+
+
 def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     """Pure-Python lookup: every (sid, tag, domain) where a subtask
     `requires` a capability tag that no subtask in the merged plan
@@ -6710,6 +6831,13 @@ def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     data rather than raising. Used by phase_reconcile to assemble the
     reconciler worker's input and (after the worker applies its
     resolutions) to verify the output actually closed every gap.
+
+    Only `extent: in_plan` entries are checked — `extent: external` is
+    a planner-declared out-of-graph prerequisite (DESIGN §5
+    `requires.extent`) and is collected separately by
+    `_collect_external_preconditions`. Caller is expected to have run
+    `_promote_external_collisions` first so any external entry with an
+    in-plan producer has already been demoted.
 
     `domain` names the producing planner-domain of `sid` — surfaced in
     the abort message so the user can see which planner held the
@@ -6724,10 +6852,15 @@ def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     unresolved: list[dict] = []
     for plan in plans:
         for s in plan.get("subtasks", []):
-            for cap in s.get("requires", []):
-                if cap not in all_provides:
+            for entry in s.get("requires", []):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("extent") != "in_plan":
+                    continue
+                tag = entry.get("tag", "")
+                if tag and tag not in all_provides:
                     unresolved.append({
-                        "sid": s["id"], "tag": cap,
+                        "sid": s["id"], "tag": tag,
                         "domain": sid_domain[s["id"]],
                     })
     return unresolved
@@ -6762,8 +6895,19 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
         s = by_id.get(r["sid"])
         if s is None:
             continue  # reconciler named a sid that doesn't exist; ignore
-        reqs = s.get("requires", []) or []
-        s["requires"] = [r["to"] if t == r["from"] else t for t in reqs]
+        # `requires` entries are objects `{tag, extent, reason?}`
+        # (DESIGN §5 `requires.extent`); rewrite the `tag` field on the
+        # entry whose tag matches `from`, preserve extent/reason. The
+        # `extent: in_plan` guard makes the architectural invariant
+        # load-bearing: the reconciler only ever reasons about in_plan
+        # tags (externals are filtered out before its input is built),
+        # so a rename must not mutate an external entry even if its tag
+        # happens to collide.
+        for entry in s.get("requires", []) or []:
+            if (isinstance(entry, dict)
+                    and entry.get("extent") == "in_plan"
+                    and entry.get("tag") == r["from"]):
+                entry["tag"] = r["to"]
 
     for ap in output.get("added_provides", []):
         s = by_id.get(ap["sid"])
@@ -6862,6 +7006,25 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "the DAG. Refine the task or re-run."
         )
 
+    # Apply the DESIGN §5 `requires.extent` mechanical passes BEFORE
+    # computing the unresolved set:
+    #   1. Promote `external` entries whose tag is in some plan's
+    #      `provides` to `in_plan` — the real producer wins.
+    #   2. Collect remaining `external` entries into the preconditions
+    #      list, persisted via st so write_plan can surface it in
+    #      plan.json. Externals never enter the reconciler's queue.
+    promoted = _promote_external_collisions(plans)
+    if promoted:
+        log(f"phase 2½: promoted {promoted} external requires entry/entries "
+            "to in_plan (an in-plan provider exists)")
+    preconditions = _collect_external_preconditions(plans)
+    st.data["external_preconditions"] = preconditions
+    st.save()
+    if preconditions:
+        log(f"phase 2½: collected {len(preconditions)} external precondition(s) "
+            "(planner-declared out-of-graph requirements — will surface in "
+            "plan.json's `preconditions` section)")
+
     unresolved = _compute_unresolved_requires(plans)
     if not unresolved:
         # Common-case short-circuit: every `requires` already has a
@@ -6877,6 +7040,14 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     # categories that contributed subtasks, every subtask's id/title/
     # intent/provides/requires (omit other fields to keep context small),
     # and the precomputed unresolved set.
+    #
+    # `requires` is flattened to bare tag strings here, dropping any
+    # `extent: external` entries entirely. The reconciler reasons
+    # purely about graph edges (DESIGN §5); externals are out-of-graph
+    # by planner declaration and surface via `preconditions` in
+    # plan.json, not through the reconciler. Keeping the view simple
+    # also matches the worked example in prompts/reconciler.md (bare
+    # strings).
     categories: list[str] = []
     subtask_views: list[dict] = []
     for plan in plans:
@@ -6884,12 +7055,17 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         if domain and domain not in categories and domain != "_reconciler":
             categories.append(domain)
         for s in plan.get("subtasks", []):
+            in_plan_tags = [
+                e.get("tag", "") for e in (s.get("requires") or [])
+                if isinstance(e, dict) and e.get("extent") == "in_plan"
+                and e.get("tag")
+            ]
             subtask_views.append({
                 "id": s.get("id", ""),
                 "title": s.get("title", ""),
                 "intent": s.get("intent", ""),
                 "provides": list(s.get("provides", []) or []),
-                "requires": list(s.get("requires", []) or []),
+                "requires": in_plan_tags,
             })
     payload = {
         "task": task,
@@ -6945,6 +7121,38 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         )
 
     _apply_reconciler_output(plans, output)
+
+    # Re-run the DESIGN §5 `requires.extent` mechanical passes against the
+    # post-reconciler plan tree so any `extent: external` entries on
+    # reconciler-added connector subtasks flow through the same machinery
+    # as planner-declared externals. Without this, an added_subtask
+    # carrying an external prerequisite would be silently dropped: not
+    # collected as a precondition, not surfaced in plan.json, not
+    # promoted even if an in-plan producer exists in another plan. The
+    # collector returns the full deduped set, so replacing (not
+    # appending to) st.data["external_preconditions"] keeps the
+    # re-run idempotent.
+    #
+    # The count can move in either direction:
+    #   - GROWS when a reconciler added_subtask declares a new external
+    #     requirement (the common forward case).
+    #   - SHRINKS when a reconciler `added_provides` (or an added_subtask
+    #     that provides a tag) absorbs a planner-declared external —
+    #     the second-pass `_promote_external_collisions` demotes the
+    #     external entry to in_plan because a provider now exists. This
+    #     is correct behavior: the reconciler discovered that the
+    #     external prerequisite is actually in-plan after all.
+    promoted_after = _promote_external_collisions(plans)
+    if promoted_after:
+        log(f"phase 2½: promoted {promoted_after} external requires "
+            "entry/entries from reconciler added_subtasks to in_plan")
+    preconditions_after = _collect_external_preconditions(plans)
+    if len(preconditions_after) != len(preconditions):
+        log(f"phase 2½: preconditions count changed from "
+            f"{len(preconditions)} to {len(preconditions_after)} "
+            "after reconciler output")
+    st.data["external_preconditions"] = preconditions_after
+    st.save()
 
     # Second-pass check: an `added_subtask` may itself have an unresolved
     # `requires`. If so, the reconciler's output didn't actually close
@@ -7010,13 +7218,20 @@ def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
         for cap in s.get("provides", []):
             providers.setdefault(cap, []).append(sid)
 
-    # build edges: predecessors of each subtask
+    # build edges: predecessors of each subtask. `requires` entries are
+    # objects `{tag, extent, reason?}` (DESIGN §5 `requires.extent`);
+    # only `extent: in_plan` entries become graph edges — `external`
+    # entries are out-of-graph by planner declaration and are surfaced
+    # as preconditions in plan.json instead.
     preds: dict[str, set[str]] = {sid: set() for sid in subtasks}
     for sid, s in subtasks.items():
         for dep in s.get("depends_on", []):
             if dep in subtasks:
                 preds[sid].add(dep)
-        for cap in s.get("requires", []):
+        for entry in s.get("requires", []):
+            if not isinstance(entry, dict) or entry.get("extent") != "in_plan":
+                continue
+            cap = entry.get("tag", "")
             for provider in providers.get(cap, []):
                 if provider != sid:
                     preds[sid].add(provider)
@@ -7043,8 +7258,16 @@ def write_plan(pila_dir: Path, task: str, st: State,
     """Persist the merged plan and per-subtask spec files the implementers read."""
     answers = st.data.get("answers", {})
     sot = answers.get("source_of_truth", "codebase")
+    # External preconditions are the planner-declared out-of-graph
+    # requires entries collected during phase_reconcile (DESIGN §5
+    # `requires.extent`). Surfacing them in plan.json gives the
+    # launcher / integrator / human a deploy-notes section without
+    # treating them as build-graph edges. Empty list when no planner
+    # declared any `extent: external` entry — common case.
+    preconditions = st.data.get("external_preconditions", []) or []
     (pila_dir / "plan.json").write_text(json.dumps(
-        {"task": task, "waves": waves, "subtasks": subtasks}, indent=2))
+        {"task": task, "waves": waves, "subtasks": subtasks,
+         "preconditions": preconditions}, indent=2))
     sub_dir = pila_dir / "subtasks"
     for sid, s in subtasks.items():
         spec = dict(s)

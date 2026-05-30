@@ -51,11 +51,12 @@ def test_short_circuit_no_unresolved_returns_plans_unchanged(pila, tmp_path):
     """The common case: planners agreed on capability vocabulary, every
     `requires` has a matching `provides`. phase_reconcile must return
     the plans list without spawning a worker."""
+    req_a = {"tag": "a", "extent": "in_plan"}
     plans = [
         _plan("feature-implementation",
               {"id": "feat-001", "title": "x", "provides": ["a"]}),
         _plan("testing",
-              {"id": "test-001", "title": "y", "requires": ["a"]}),
+              {"id": "test-001", "title": "y", "requires": [req_a]}),
     ]
     st = _minimal_state(pila, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
@@ -68,7 +69,7 @@ def test_short_circuit_no_unresolved_returns_plans_unchanged(pila, tmp_path):
                                                   caps, models))
     # Same list, unchanged.
     assert result is plans
-    assert plans[1]["subtasks"][0]["requires"] == ["a"]
+    assert plans[1]["subtasks"][0]["requires"] == [req_a]
     # No worker spawned → worker_count unchanged.
     assert st.data.get("worker_count", 0) == 0
 
@@ -258,6 +259,29 @@ def test_phase_reconcile_second_pass_check_present(pila):
     )
 
 
+def test_phase_reconcile_precondition_passes_run_twice(pila):
+    """DESIGN §5 `requires.extent`: the precondition-collection +
+    collision-promotion passes must run BOTH before the reconciler call
+    AND again after `_apply_reconciler_output`. Without the second run,
+    `extent: external` entries on reconciler-added connector subtasks
+    are silently dropped (the P2.3 finding). Pin both invocations as a
+    source-text invariant so a future refactor cannot regress to the
+    single-pass behavior."""
+    src = inspect.getsource(pila.phase_reconcile)
+    promote_count = src.count("_promote_external_collisions(plans)")
+    collect_count = src.count("_collect_external_preconditions(plans)")
+    assert promote_count >= 2, (
+        f"phase_reconcile should call _promote_external_collisions twice "
+        f"(initial pre-pass + re-run after _apply_reconciler_output), "
+        f"found {promote_count}"
+    )
+    assert collect_count >= 2, (
+        f"phase_reconcile should call _collect_external_preconditions twice "
+        f"(initial pre-pass + re-run after _apply_reconciler_output), "
+        f"found {collect_count}"
+    )
+
+
 def test_phase_reconcile_bumps_workers(pila):
     """Worker invocation must go through st.bump_workers to count
     against max_total_workers. Pin so the reconciler counts toward the
@@ -273,3 +297,82 @@ def test_phase_reconcile_uses_sid_reconciler(pila):
     'reconciler'. Pin so the log file lookup is stable."""
     src = inspect.getsource(pila.phase_reconcile)
     assert 'sid="reconciler"' in src
+
+
+# --- DESIGN §5 `requires.extent` integration ---------------------------
+
+def _req(tag: str, extent: str = "in_plan", reason: str = "") -> dict:
+    entry = {"tag": tag, "extent": extent}
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+def test_phase_reconcile_external_only_short_circuits(pila, tmp_path):
+    """A plan whose only "unresolved" requires are `extent: external` must
+    NOT invoke the reconciler — externals are out-of-graph by planner
+    declaration. The function still completes the helper passes
+    (promotion + collection), persists `external_preconditions` to
+    state, and returns the plans unchanged."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x",
+               "requires": [_req("dynamo-table", "external",
+                                 "owned by api-services CDK stack")]}),
+    ]
+    st = _minimal_state(pila, tmp_path)
+    caps = {"max_total_workers": 40, "max_parallel": 4,
+            "confidence_rounds": 8}
+    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+    assert result is plans
+    # No worker spawned.
+    assert st.data.get("worker_count", 0) == 0
+    # External preconditions persisted for write_plan to pick up.
+    pre = st.data.get("external_preconditions", [])
+    assert len(pre) == 1
+    assert pre[0]["tag"] == "dynamo-table"
+    assert pre[0]["originating_subtasks"] == ["feat-001"]
+
+
+def test_phase_reconcile_promotes_collision_before_unresolved_check(pila, tmp_path):
+    """An `extent: external` entry whose tag is `provides`d by some
+    plan must be promoted to in_plan *before* `_compute_unresolved_requires`
+    runs. The combined effect: the entry becomes a normal graph edge,
+    nothing is unresolved, and the reconciler is not invoked."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["redis-available"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": [_req("redis-available", "external",
+                                 "planner thought infra owned this")]}),
+    ]
+    st = _minimal_state(pila, tmp_path)
+    caps = {"max_total_workers": 40, "max_parallel": 4,
+            "confidence_rounds": 8}
+    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+    assert result is plans
+    # Promoted: the entry's extent is now in_plan, with reason preserved.
+    entry = plans[1]["subtasks"][0]["requires"][0]
+    assert entry["extent"] == "in_plan"
+    # No worker spawned (the promoted entry has a provider).
+    assert st.data.get("worker_count", 0) == 0
+    # Not collected as a precondition (promoted before collection).
+    assert st.data.get("external_preconditions", []) == []
+
+
+def test_phase_reconcile_persists_empty_preconditions_when_none(pila, tmp_path):
+    """`external_preconditions` is always persisted (even as []) so
+    write_plan() has a consistent key to read from. Catches a regression
+    where st.save() is skipped on the empty path."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["a"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y", "requires": [_req("a")]}),
+    ]
+    st = _minimal_state(pila, tmp_path)
+    caps = {"max_total_workers": 40, "max_parallel": 4,
+            "confidence_rounds": 8}
+    asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+    assert st.data.get("external_preconditions") == []
