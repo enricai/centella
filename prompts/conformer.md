@@ -150,10 +150,10 @@ runner) the state is `ran: false`. Do not synthesize a command.
 ### 5. Score your own work (DESIGN §8 disciplines)
 
 Before reporting, score your conformance pass on a 1–10 axis
-`conformance` and run the same three honesty disciplines the implementer
-and planner apply:
+`conformance` and run the same three universal disciplines the
+implementer and planner apply:
 
-1. **Falsifier testing.** For each non-trivial claim in your output
+1. **Falsification.** For each non-trivial claim in your output
    (e.g. "the residual is unfixable without weakening the implementer's
    work", "lint passes", "no docs drift remains"), explicitly look for
    evidence that would *disprove* it: re-run the command, re-read the
