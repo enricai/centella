@@ -479,9 +479,50 @@ same state visible on the host so the same finalize code path runs.
 
 The run branch is pushed to `origin` and a pull request is opened
 via `gh pr create` against the working branch (the branch
-HEAD-at-run-start). The PR title is the run id; the body is generated
-deterministically from the run state — task, category, source-of-truth,
-wave count, worker count, run timestamps. Two flags control it:
+HEAD-at-run-start). The PR title and body are written by an LLM
+worker (`pr_writer`, defaults to Sonnet) that runs inside the
+container right before it exits — placed there because that is where
+`claude -p` is available and where the bind-mounted user repo is
+readable. The worker reads the target repo's PR template if one
+exists (canonical GitHub locations: `.github/pull_request_template.md`,
+`pull_request_template.md`, `docs/pull_request_template.md`, then any
+`PULL_REQUEST_TEMPLATE/` directory) and fills it out faithfully —
+preserving HTML comments, leaving checklists unticked unless the diff
+demonstrably satisfies them, honoring "delete if N/A" markers. When
+no template is present, the worker produces a default structure
+(Summary / What changed / Why / Run metadata) grounded in the run's
+actual commits.
+
+The worker's primary signal is the **commit log**
+(`git log --no-merges working_branch..run_branch`) — every implementer
+and conformer worker wrote those commit messages as it landed a
+subtask, so they already describe the work in domain language. A
+diff-stat, dirstat, and sampled hunks from the heaviest-changed files
+(capped to keep the prompt within budget) supplement the log.
+Subtask titles from the planner are passed through verbatim. The
+launcher prepends `pila: ` to the worker's title so pila-opened PRs
+stay easy to spot in lists.
+
+The worker writes its output to `run.json` (`pr_title`, `pr_body`,
+`pr_template_used`) — the same container→host handoff channel the
+launcher already uses for `finished_at` / `pushed_at` / `pr_url`.
+The host launcher reads those fields with `jq` and passes them to
+`gh pr create`. This is a **fail-open** path: any failure (worker
+error, schema mismatch, timeout, worker budget exhausted, oversized
+payload) is logged and swallowed; the launcher falls back to a
+deterministic body composed from `state.json` fields (the shape
+documented by `compose_pr_body` in `orchestrator/pila.py`).
+Generating a richer body must never block finalize success.
+
+When the target repo has multiple templates inside a
+`PULL_REQUEST_TEMPLATE/` directory, the alphabetically first `.md`
+wins by default. `--pr-template <name>` (also `PILA_PR_TEMPLATE`,
+`pr_template` in `pila.toml`) overrides the choice. A selector that
+does not match an existing template is **not fatal** — pila logs a
+warning and falls back to the alphabetical default rather than
+blocking finalize over a cosmetic preference.
+
+Two flags control push and PR independently of body composition:
 
 - `--no-push` skips both the push and the PR; the run completes with the
   run branch local-only. The user can inspect, push, or open a PR manually
