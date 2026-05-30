@@ -806,6 +806,7 @@ if [ "$RUNTIME" = "fly" ]; then
   PROVISION_SCRIPT="$PILA_REPO/scripts/remote/provision.sh"
   SEED_AUTH_SCRIPT="$PILA_REPO/scripts/remote/seed-auth.sh"
   SEED_SCRIPT="$PILA_REPO/scripts/remote/seed-repo.sh"
+  FETCH_SCRIPT="$PILA_REPO/scripts/remote/fetch-branch.sh"
   if [ ! -f "$PROVISION_SCRIPT" ]; then
     echo "pila: error: $PROVISION_SCRIPT not found" >&2
     container_rc=1
@@ -815,6 +816,9 @@ if [ "$RUNTIME" = "fly" ]; then
   elif [ ! -f "$SEED_SCRIPT" ]; then
     echo "pila: error: $SEED_SCRIPT not found" >&2
     container_rc=1
+  elif [ ! -f "$FETCH_SCRIPT" ]; then
+    echo "pila: error: $FETCH_SCRIPT not found" >&2
+    container_rc=1
   else
     # shellcheck disable=SC1090
     . "$PROVISION_SCRIPT"
@@ -822,13 +826,15 @@ if [ "$RUNTIME" = "fly" ]; then
     . "$SEED_AUTH_SCRIPT"
     # shellcheck disable=SC1090
     . "$SEED_SCRIPT"
+    # shellcheck disable=SC1090
+    . "$FETCH_SCRIPT"
 
     if provision_machine; then
       # Machine is running and reachable. Seed Claude config + git identity
       # so `claude -p` workers can authenticate and commit, then seed the
-      # working tree (git clone + rsync uncommitted delta). Both must succeed
-      # before orchestration runs inside the machine (handled by a subsequent
-      # feat-remote-* subtask).
+      # working tree (git clone + rsync uncommitted delta).  Then run the
+      # orchestrator inside the machine and stream the completed run branch
+      # back to the host for the host-side finalize (push + gh pr create).
       export USER_REPO
       if ! seed_auth; then
         echo "pila: error: seed_auth failed — aborting remote run" >&2
@@ -837,8 +843,37 @@ if [ "$RUNTIME" = "fly" ]; then
         echo "pila: error: repo seeding failed for machine $PILA_MACHINE_ID" >&2
         container_rc=1
       else
-        echo "[pila] remote: machine $PILA_MACHINE_ID seeded (auth + repo) — orchestration not yet implemented" >&2
-        container_rc=0
+        # Run the orchestrator inside the machine.  Pass all REWRITTEN_ARGS
+        # so the remote run receives the same flags as a local run (task,
+        # --runtime fly already there, --no-push if set, etc.).
+        # flyctl machine exec streams stdout/stderr back to this terminal.
+        # Note: --runtime fly flows through REWRITTEN_ARGS so the orchestrator
+        # inside the machine knows it is a remote run and adjusts accordingly.
+        echo "[pila] remote: machine $PILA_MACHINE_ID seeded — starting orchestrator" >&2
+        orch_rc=0
+        flyctl machine exec "$PILA_MACHINE_ID" \
+          --app "$FLY_APP" \
+          -- python3 /work/.pila-image/orchestrator/pila.py \
+               --no-push \
+               ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} \
+          || orch_rc=$?
+
+        if [ "$orch_rc" -ne 0 ]; then
+          # Propagate the orchestrator's exit code.  Non-zero means the run
+          # failed; do not attempt to fetch the branch (nothing useful there).
+          echo "pila: error: remote orchestrator exited $orch_rc" >&2
+          container_rc=$orch_rc
+        else
+          # Orchestration succeeded.  Stream the completed run branch and
+          # .pila/runs/<run-id>/ state back so the host-side finalize block
+          # (push + gh pr create) can run unchanged with host auth.
+          if ! fetch_branch; then
+            echo "pila: error: fetch_branch failed — run branch not fetched to host" >&2
+            container_rc=1
+          else
+            container_rc=0
+          fi
+        fi
       fi
     else
       container_rc=1

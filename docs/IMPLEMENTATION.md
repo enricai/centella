@@ -33,6 +33,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/remote/build-push.sh` | Build and push a self-contained pila image to Fly.io's registry. The baked source at `/work/.pila-image/` lets the image run on Fly Machines without any bind mount. |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `pila` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register destroy trap) and `destroy_machine()`. The destroy trap fires on EXIT, INT, and TERM so no machine is leaked by Ctrl-C or crash. |
 | `scripts/remote/seed-repo.sh` | Two-channel repo seeding helper (sourced by the `pila` launcher after `provision_machine()` succeeds). Exports `seed_repo()`: (1) `git clone --filter=blob:none` on the remote machine via `flyctl machine exec`; (2) computes the local dirty set via `git status --porcelain`, packs it as a tar stream, and pipes it to the remote via `flyctl machine exec tar`. After seeding, `/work` on the machine mirrors the developer's working tree. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by the `pila` launcher after remote orchestration succeeds). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.pila/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry; (2) creates a `git bundle` of `pila/runs/<run-id>` on the machine and pipes it to the host where `git fetch` materialises the branch; (3) tars `.pila/runs/<run-id>/` from the machine and extracts it on the host so the existing host-side finalize block (push + `gh pr create`) can run unchanged. |
 
 ### Python runtime — provisioned inside the container
 
@@ -445,8 +446,10 @@ pila/
 │       │                           provision_machine() returns); seed_auth() delivers
 │       │                           ~/.claude.json + ~/.claude/ + git identity to the machine
 │       │                           via flyctl machine exec tar-pipe and git config calls
-│       └── seed-repo.sh           two-channel repo seeding (sourced by launcher after provision);
-│                                   seed_repo(): git clone --filter=blob:none + rsync dirty set
+│       ├── seed-repo.sh           two-channel repo seeding (sourced by launcher after provision);
+│       │                           seed_repo(): git clone --filter=blob:none + rsync dirty set
+│       └── fetch-branch.sh        post-run stream-back (sourced by launcher after remote orch exits 0);
+│                                   fetch_branch(): git bundle pipe + state tar-pipe → host repo
 ├── commands/pila.md            thin plugin skill — launches the orchestrator
 ├── skills/
 │   ├── judge-llm-batch/SKILL.md  post-run judge skill — scores a batch of captured
@@ -1844,12 +1847,19 @@ Git-push auth (SSH keys, `.netrc`, `~/.config/gh`) is **not** seeded — that
 auth lives on the host per DESIGN §6 *Finalization* and is not needed inside
 the remote machine for `claude -p` worker authentication or `git commit`.
 
-Current state: machine lifecycle + auth/config seeding are implemented;
-repo seeding (git clone + rsync uncommitted delta) is implemented by
-`scripts/remote/seed-repo.sh` (see below). The exec-pila step is handled
-by a subsequent feat-remote-* subtask.
+After seeding completes the launcher runs the orchestrator inside the
+machine via `flyctl machine exec -- python3 /work/.pila-image/orchestrator/pila.py --no-push ...`,
+streaming its output back to the host terminal. `--no-push` is always
+injected so the remote orchestrator's `phase_finalize` does not attempt
+a push itself — push is always the host launcher's responsibility.
 
-Maps to `DESIGN.md`: §6 (container boundary / teardown), `remote-task-system.md`
+Once the remote orchestrator exits 0, `fetch_branch()` (from
+`scripts/remote/fetch-branch.sh`) streams the completed run branch and
+state directory back to the host (see §0 *Files table* and the
+`fetch-branch.sh` section below), after which the existing host-side
+finalize block (push + `gh pr create`) runs unchanged.
+
+Maps to `DESIGN.md`: §6 (container boundary / teardown / finalization), `remote-task-system.md`
 §"microVM = 1 Colima" (lines 163–206) and §"The hard problem is auth-crossing"
 (lines 232–253).
 
@@ -1885,6 +1895,44 @@ Environment variables consumed by `seed-repo.sh`:
 | `PILA_GIT_REMOTE` | `origin` | Git remote to clone from |
 
 Requires: `flyctl` on `PATH` (authenticated); `git`; `tar`.
+
+#### Run branch stream-back (`scripts/remote/fetch-branch.sh`)
+
+Two-channel stream-back (mirror of `seed-repo.sh`'s two-channel seed) that
+makes the completed run available on the host so the existing host-side
+finalize block can push it and open a PR:
+
+1. **Run branch** — discovers the completed run-id on the machine by scanning
+   `.pila/runs/*/run.json` for a `finished_at`-bearing, unpushed entry (same
+   criteria the host-side finalize uses when scanning the local `.pila/`).
+   Then runs `git -C /work bundle create - pila/runs/<run-id>` on the machine
+   and pipes the bundle to a host tempfile, which is then fetched via
+   `git fetch <bundle> +pila/runs/<run-id>:pila/runs/<run-id>` into the host
+   repo. The bundle resolves cleanly because both repos share the same origin
+   history.
+
+2. **Run state directory** — tars `/work/.pila/runs/<run-id>` on the machine
+   and extracts it under `$USER_REPO/.pila/runs/` on the host. After
+   extraction, `run.json` and `state.json` are present on the host exactly as
+   they would be after a local run.
+
+The script is **sourced** (not exec'd) by the launcher and exports
+`PILA_REMOTE_RUN_ID` on success (the discovered run-id, in case the caller
+needs it for diagnostics).
+
+Environment variables consumed by `fetch-branch.sh`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PILA_MACHINE_ID` | — | ID of the started Fly Machine (exported by `provision.sh`) |
+| `PILA_FLY_APP` | `pila` | Fly.io app name |
+| `USER_REPO` | — | Absolute path to the local git repo (set by launcher) |
+
+Exports: `PILA_REMOTE_RUN_ID` — the run-id of the completed run on the machine.
+
+Requires: `flyctl` on `PATH` (authenticated); `git`; `tar`; `python3` (on the machine — always present in the pila image).
+
+Maps to `DESIGN.md`: §6 *Finalization* (remote-finalize stream-back variant).
 
 ---
 
