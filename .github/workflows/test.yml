@@ -29,8 +29,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dev dependencies
-        run: pip install pytest pytest-cov
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
 
       - name: Syntax check (from CLAUDE.md task-completion checklist)
         run: python -c "import ast; ast.parse(open('orchestrator/pila.py').read())"
