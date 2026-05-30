@@ -174,6 +174,12 @@ STATE_FIELDS = (
     # RSS growth with the code path that produced it. Updated at each
     # phase_* entry. Empty string before phase 1.
     "current_phase",
+    # dropped_subtasks: subtasks soft-dropped by filter_offtree_subtasks
+    # because their files_likely_touched resolved off-tree (most commonly
+    # into an inspect-dir mount). Map of sid → {reasons: [str], files:
+    # [str]}. Empty/absent when no drop fired. Audit trail only — the
+    # run proceeds with the surviving subtasks.
+    "dropped_subtasks",
 )
 
 CATEGORIES = [
@@ -1387,6 +1393,31 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             )
     if st.run_dir.exists():
         shutil.rmtree(st.run_dir, ignore_errors=True)
+
+
+async def _reset_subtask_worktree(sid: str, pila_dir: Path, run_id: str) -> None:
+    """Remove the per-subtask worktree directory and branch so a corrective
+    retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
+    Without this, retrying after a `complete`-with-no-commits failure
+    re-runs the script against a still-registered worktree and an existing
+    branch — the second `git worktree add -b` fails with
+    `fatal: a branch ... already exists`, the WorkerError escapes
+    settle_subtask, and gather_or_cancel takes down the whole wave.
+
+    Tolerates either being absent: both `git worktree remove --force`
+    and `git branch -D` return nonzero when their target is missing,
+    and that is the expected idempotent case. Mirrors the rmtree
+    fallback in `_cleanup_on_abnormal_exit` for the case where git
+    administratively succeeded but left the directory behind."""
+    worktree = pila_dir / "worktrees" / sid
+    branch = f"pila/subtasks/{run_id}/{sid}"
+    await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
+    await run_proc(["git", "branch", "-D", branch])
+    if worktree.exists():
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def _parse_claude_version(version_output: str | None) -> tuple[int, int, int] | None:
@@ -2983,6 +3014,81 @@ def warn_cross_planner_file_overlap(plans: list[dict]) -> None:
     for f, owners in sorted(overlaps.items()):
         per = ", ".join(f"{d}({sid})" for d, sid in sorted(owners))
         log(f"     {f}: {per}")
+
+
+def _resolves_under(path_str: str, root: Path) -> bool:
+    """True iff `path_str` (relative or absolute) resolves under `root`.
+    Resolves symlinks so a planner cannot sneak a path through with a
+    symlinked decoy. Returns False on any OSError or ValueError —
+    treated by the caller as "not under root," which fails the check
+    and triggers a drop (the safe direction)."""
+    try:
+        candidate = Path(path_str)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        return candidate.resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
+                            inspect_dirs: list[str], st: "State") -> None:
+    """Mutate `plans` in place: drop any subtask whose `files_likely_touched`
+    contains a path that does not resolve under `repo_root`. Record drops
+    in `st.data["dropped_subtasks"]` and log a per-subtask warning. Soft
+    drop — the run continues with the surviving subtasks, `schedule()`
+    runs after this and sees a clean plan.
+
+    Motivation: cross-repo `--inspect-dir` runs let the planner read
+    files in mounts like `/inspect/api/...`, and the planner sometimes
+    names those paths in `files_likely_touched` for an implementer that
+    can only modify the run's primary worktree. The implementer either
+    fails outright or clones the inspected repo into `/tmp` and edits
+    there — those edits never reach the subtask branch, and
+    `check_branch_has_commits` correctly fails the subtask.
+
+    Why a soft drop and not `die()`: a hard fail here is unrecoverable
+    via `--resume`. The resume branch in `_run_phases` does not re-run
+    `phase_plan` or this filter, and `state.json["waves"]` is only
+    written by `write_plan` which runs after `schedule()`. Soft drop
+    matches the existing `warn_cross_planner_file_overlap` pattern at
+    the same pre-schedule layer."""
+    inspect_roots = [Path(d).resolve() for d in (inspect_dirs or [])]
+    dropped: dict[str, dict] = {}
+    for plan in plans:
+        survivors = []
+        for s in plan.get("subtasks", []):
+            sid = s.get("id", "?")
+            offtree_paths = [
+                f for f in (s.get("files_likely_touched") or [])
+                if not _resolves_under(f, repo_root)
+            ]
+            if not offtree_paths:
+                survivors.append(s)
+                continue
+            reasons = []
+            for f in offtree_paths:
+                leaked = next((str(r) for r in inspect_roots
+                               if _resolves_under(f, r)), None)
+                if leaked:
+                    reasons.append(
+                        f"{f!r} resolves under inspect-dir {leaked!r} "
+                        "(read-only; implementer cannot modify)")
+                else:
+                    reasons.append(
+                        f"{f!r} does not resolve under repo root "
+                        f"{str(repo_root)!r}")
+            dropped[sid] = {"reasons": reasons, "files": offtree_paths}
+        plan["subtasks"] = survivors
+    if not dropped:
+        return
+    log(f"⚠  filter_offtree_subtasks: dropped {len(dropped)} subtask(s) "
+        "with off-tree files_likely_touched:")
+    for sid, info in sorted(dropped.items()):
+        for r in info["reasons"]:
+            log(f"     {sid}: {r}")
+    st.data.setdefault("dropped_subtasks", {}).update(dropped)
+    st.save()
 
 
 def detect_test_runner() -> list[str] | None:
@@ -7873,10 +7979,17 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
     subtask_path = pila_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
 
-    def fail(reason: str) -> dict | None:
+    async def fail(reason: str) -> dict | None:
         """Record a failed attempt. Returns a terminal result dict if the
         subtask is done (non-retryable, or retry cap exhausted), or None if the
-        caller should loop for one more corrective attempt."""
+        caller should loop for one more corrective attempt.
+
+        On a retryable failure that will loop, `_reset_subtask_worktree`
+        clears the leftover worktree + branch so `new-worktree.sh`
+        reaches its "fresh subtask" path on the next iteration. Without
+        this reset, the retry hits `fatal: a branch ... already exists`
+        and the WorkerError escapes to `gather_or_cancel`, killing the
+        whole wave."""
         nonlocal retries, continuation, note
         res = {"subtask_id": sid, "status": "failed", "summary": reason}
         st.data.setdefault("subtask_status", {})[sid] = "failed"
@@ -7888,6 +8001,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         if retries > caps["failed_retries"]:
             log(f"  {sid}: retry cap reached — terminating")
             return res
+        await _reset_subtask_worktree(sid, pila_dir, st.run_id)
         continuation = False
         note = f"Previous attempt failed: {reason}"
         return None
@@ -7902,7 +8016,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         problem = validate_result(res, pila_dir)
         if problem:
             log(f"  result invariant violated for {sid}: {problem}")
-            done = fail(problem)
+            done = await fail(problem)
             if done is not None:
                 return done
             continue
@@ -7918,7 +8032,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
                 sid, worktree, compute_run_branch(st.run_id))
             if commit_err:
                 log(f"  branch check failed for {sid}: {commit_err}")
-                done = fail(commit_err)
+                done = await fail(commit_err)
                 if done is not None:
                     return done
                 continue
@@ -7928,8 +8042,8 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             dirty = [l for l in wt_status.stdout.splitlines()
                      if l and not l.startswith("??")]
             if dirty:
-                done = fail(f"{sid}: worktree has {len(dirty)} uncommitted "
-                            f"change(s) — changes will be lost on integration")
+                done = await fail(f"{sid}: worktree has {len(dirty)} uncommitted "
+                                  f"change(s) — changes will be lost on integration")
                 if done is not None:
                     return done
                 continue
@@ -7937,7 +8051,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
             scope_err = await check_diff_scope(sid, worktree, subtask, st)
             if scope_err:
-                done = fail(scope_err)
+                done = await fail(scope_err)
                 if done is not None:
                     return done
                 continue
@@ -8046,7 +8160,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         if status == "failed":
             # a worker that reported failure itself — treat its summary as the
             # reason and run it through the same retry policy
-            done = fail(res.get("summary") or "worker reported failure")
+            done = await fail(res.get("summary") or "worker reported failure")
             if done is not None:
                 return done
             continue
@@ -8414,6 +8528,13 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         # conflicts (yet); empirically these correlate strongly with
         # integrator design-conflict crashes downstream.
         warn_cross_planner_file_overlap(plans)
+        # Drop subtasks whose files_likely_touched leak into inspect-dir
+        # mounts (read-only) or other off-tree paths. Soft drop so the
+        # surviving subtasks proceed; the drop is recorded in
+        # state.data["dropped_subtasks"] for audit. Must run BEFORE
+        # schedule() so the resulting waves do not reference dropped sids.
+        filter_offtree_subtasks(plans, Path(os.getcwd()),
+                                st.data.get("inspect_dirs") or [], st)
         st.data["current_phase"] = "phase 3: scheduling"
         st.save()
         subtasks, waves = schedule(plans)

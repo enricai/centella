@@ -209,3 +209,11 @@ Rules:
   from `status: "blocked"` which means the gate could not clear.
 - Do not invent subtasks to look thorough. Every subtask must be real and
   necessary.
+- Every entry in `files_likely_touched` must be a path that exists in the
+  run's own worktree (your cwd, the run's primary repo). Paths under
+  inspect-dir mounts (`/inspect/<repo>/...`) are read-only — the
+  implementer cannot modify them, and the orchestrator soft-drops any
+  subtask that names one. If your subtask genuinely depends on a change in
+  an inspected repo, surface it in `investigation_notes` and add a
+  `requires` entry with `extent: "external"` naming the owning repo;
+  do not emit an implementable subtask for the cross-repo change.

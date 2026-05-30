@@ -176,6 +176,14 @@ Base layers (top-down):
   matching the host user. This is what makes files the container
   writes into `/work/.pila/` and the worktrees keep the host user's
   ownership.
+- `git config --global --add safe.directory '*'` is set for the `pila`
+  user. The container is single-tenant (one user) and `/work` is its
+  only repo, so blanket-allow is the standard mitigation — Colima/virtiofs
+  presents `/work`'s mount-root inode with a gid that does not match the
+  in-container `pila` user, which trips git's CVE-2022-24765 check on
+  worker bash tools that run `git -C <worktree-subdir> ...`. Without
+  the relaxation, those calls return non-zero with
+  `fatal: detected dubious ownership in repository at '/work/.pila/...'`.
 - `WORKDIR /work`, `ENTRYPOINT ["/work/.pila-image/scripts/container-entry.sh"]`.
 
 ### Registry publish path (fly.io / remote Machines)
@@ -1147,7 +1155,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 0 Clarify | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `pila.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
 | 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5). |
-| 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
+| 3 Schedule | `warn_cross_planner_file_overlap`, `filter_offtree_subtasks`, `schedule`, `validate_plan` | warn on cross-planner file overlap; **soft-drop subtasks whose `files_likely_touched` resolves outside the run's repo root (most commonly into an inspect-dir mount) — recorded in `state.data["dropped_subtasks"]`**; merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
 | 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `pila/runs/<run-id>` and its worktree (per-run, isolated from any other run) |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then run a deterministic conflict-marker scan on the integrated worktree. `settle_subtask` runs the **post-work conformance phase** (DESIGN §9 *Post-work conformance*) on the success path before returning — `discover_rules_files` → `run_conformer` loop (≤ `conformance_rounds`) → re-run the per-subtask mechanical-precondition gates (`check_branch_has_commits`, dirty-worktree, `check_diff_scope`) against the conformer's commits → attach `conformance_warnings` to the result. The phase is advisory: residuals, build/lint/test failures, gate violations on conformer commits, and `WorkerError` all surface as warnings, never as `failed`/`blocked`. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume`. There is no LLM wave-level re-validation; the §8 confidence gate is the load-bearing per-subtask signal, and `scan_conflict_markers` is the deterministic post-integration safety net |
 | 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh`; launcher then pushes on host | verify the run branch is non-empty; record `finished_at` in `run.json`; delete the per-subtask branches `pila/subtasks/<run-id>/*` (the run branch is **kept** as the PR head; state dir is kept as audit). **The push + PR step has moved to the host launcher** (DESIGN §6 *Finalization*) — `phase_finalize` writes the sentinel and exits; the launcher polls `run.json`, then runs `git push pila/runs/<run-id>` + `gh pr create` on the host using the host's own auth (no in-container forwarding of gh tokens, SSH keys, or agent sockets). The working branch is **not** modified locally — the PR is the proposed integration. |
@@ -1238,6 +1246,26 @@ instead of waiting for the integrator to crash mid-wave. The reconciler
 currently bridges capability-tag vocabulary drift but not file-claim
 conflicts — a future-work item is to extend its action vocabulary to
 resolve overlaps automatically.
+
+`filter_offtree_subtasks()` runs at the same layer (after
+`warn_cross_planner_file_overlap`, before `schedule()`) and **soft-drops
+any subtask whose `files_likely_touched` contains a path that does not
+resolve under the run's primary repo root** — the common case is a leak
+into an inspect-dir mount (`/inspect/<repo>/...`), where the planner
+named a file the implementer cannot modify because the mount is
+read-only. Drops are recorded in `state.data["dropped_subtasks"]` and
+logged per-subtask. The drop must run before `schedule()` because
+`phase_execute` iterates `state.data["waves"]` (not the in-memory
+`subtasks` dict), and `waves` is computed by `schedule()` — a drop
+after that point leaves `waves` referencing a sid with no spec on disk.
+A soft drop is the right shape because a `die()` here is unrecoverable:
+the resume branch in `_run_phases` does not re-run the planner pipeline
+and requires `state.data["waves"]` (only written by `write_plan` after
+this point). When a dropped subtask provides a tag a survivor requires,
+`validate_plan`'s existing unresolvable-requires check (above) catches
+it and dies with `<sid>: requires '<tag>' but nothing provides it —
+dependency is unresolvable and will be silently dropped` — the user
+sees both messages and re-frames the task.
 
 ### Per-subtask checks — in `settle_subtask`, every worker result
 | Check | Catches | On failure |
@@ -1542,6 +1570,16 @@ edit `_retryable_failure` and the check function in the same change.
 `settle_subtask` routes every failure through `_retryable_failure` via the
 `fail()` helper. Retryable consumes the retry cap; terminal ends the subtask on
 first occurrence.
+
+On a retryable failure that will loop, `fail()` calls
+`_reset_subtask_worktree(sid, pila_dir, run_id)` to remove the leftover
+per-subtask worktree directory and its branch
+(`pila/subtasks/<run-id>/<sid>`) so the retry's `new-worktree.sh` reaches its
+"fresh subtask" path on the next iteration. Without this reset the retry
+re-runs the script against a still-registered worktree and an existing branch
+— the second `git worktree add -b` fails with
+`fatal: a branch ... already exists`, the `WorkerError` escapes
+`settle_subtask`, and `gather_or_cancel` takes down the rest of the wave.
 
 ---
 
@@ -2320,6 +2358,7 @@ written somewhere in `orchestrator/pila.py`. The coupling test in
 | `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log) — keys are subtask ids, values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. Populated only on subtasks whose implementer reached `status: "complete"`. See DESIGN §9 *Post-work conformance* |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries, persisted for worker prompt injection — NOT executed by the orchestrator), `sh_hook_ran` (bool, set by `run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`), `override_file` (absolute path to a synthesized mise override when `phase_provision` had to bridge a polyglot Go repo; `None` otherwise — re-exported as `MISE_OVERRIDE_CONFIG_FILENAMES` on `--resume`). Read by `_format_provision_recipe_section()` so implementer/conformer prompts can inject the recipe as a `PROVISION_RECIPE:` advisory block. |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. Read by `write_plan()` and persisted as the `preconditions` section of `plan.json`. Empty list when no planner declared any external requirement (the common case). |
+| `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped by `filter_offtree_subtasks()` because their `files_likely_touched` resolved outside the run's repo root (most commonly into an inspect-dir mount). Each value is `{reasons: [str], files: [str]}` describing why each off-tree path failed the check. Absent when no drop fired. Audit trail only — the run proceeds with the surviving subtasks; no orchestrator code reads back from this field. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/pila.md`):

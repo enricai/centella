@@ -1432,6 +1432,11 @@ recurs everywhere in the design:
 - Every worker result is schema-validated before it is acted on (§7) — a worker
   that skipped its self-gate fields (§8) fails its own JSON validation before
   the orchestrator reads the payload.
+- The orchestrator does not trust a planner to keep `files_likely_touched`
+  scoped to the run's own repo when inspect-dir mounts are in play; it
+  computes path resolution itself and soft-drops any subtask whose paths
+  resolve under a read-only mount instead. The planner prompt documents
+  the constraint, but the soft-drop is the actual guarantee.
 
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**
